@@ -8,6 +8,11 @@ feeds its dashboard candidate list. The two copies are pinned to identical
 behaviour by savings_parity.json, committed to both repos — see the parity
 test. Change the math here and that test fails on both sides, which is the
 point: neither project has to import the other.
+
+The fixture covers estimate_savings_pct, bitrate_class and resolution_class,
+plus scan.py's MIN_LISTED_SAVED_PCT listing threshold — everything duplicated
+across the two repos. Anything you add here that the other copy also carries
+belongs in the fixture too, or it drifts unnoticed.
 """
 from typing import Optional
 
