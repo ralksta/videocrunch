@@ -297,7 +297,7 @@ def write_log(start_time, elapsed, encoder_name):
 
     with open(log_file, 'w', encoding='utf-8') as f:
         f.write("="*70 + "\n")
-        f.write("ARCADE BATCH ENCODER LOG\n")
+        f.write("VIDEOCRUNCH BATCH ENCODER LOG\n")
         f.write(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Encoder: {encoder_name}\n")
         f.write(f"Total Time: {format_time(elapsed)}\n")
