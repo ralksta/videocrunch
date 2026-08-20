@@ -344,12 +344,19 @@ def write_log(start_time, elapsed, encoder_name):
     return log_file
 
 
-def main():
+def build_parser():
+    """The CLI surface — see tests/test_cli_contract.py for the invocation contract."""
     parser = argparse.ArgumentParser(description='Batch Controller V2.0')
     parser.add_argument('--files', required=True, help='Comma-separated file paths')
-    parser.add_argument('--port', type=int, help='Server port')
+    parser.add_argument('--port', type=int,
+                        help='Notify a companion server on this port when a file is done, '
+                             'via GET /api/mark_optimized?path=<path>')
     parser.add_argument('--audio-mode', choices=['enhanced', 'standard'], default='enhanced')
-    args = parser.parse_args()
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
 
     files = [f.strip() for f in args.files.split(',') if f.strip()]
 
