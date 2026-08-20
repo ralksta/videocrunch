@@ -5,8 +5,17 @@ lets the user mark which ones to run. The ranking itself is
 optimization_advisor.build_candidates — covered by its own tests. What is
 tested here is the new glue: the folder walk, the ffprobe -> media dict
 mapping, and the selection parser.
+
+TestJsonOutput below is the exception to "no ffmpeg": it drives scan.py's
+`main()` as a real subprocess (real argparse, real ffprobe where available)
+to prove `--json` actually emits a parseable, colour-free document — the
+concrete failure mode being tested is "a real run redirected to a file
+produces valid JSON", which no amount of mocking `subprocess.run` can prove.
 """
 import json
+import re
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -22,6 +31,8 @@ from scan import (  # noqa: E402
     parse_selection,
     probe_to_media,
 )
+
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
 
 class TestParseSelection:
@@ -253,3 +264,79 @@ class TestRank:
         assert len(out["results"]) == 1
         assert out["results"][0]["source"] == "heuristic"
         assert out["summary"]["history_based"] == 0
+
+
+class TestJsonOutput:
+    """`scan.py FOLDER --json` — stdout must be exactly one JSON document.
+
+    Runs the real CLI as a subprocess rather than calling main() in-process:
+    that's the only way to actually observe what lands on stdout vs. stderr,
+    which is the entire point of --json (a shell redirect only ever sees
+    stdout).
+    """
+
+    SCAN_PY = REPO_ROOT / "scan.py"
+
+    def _run(self, folder, *extra_args):
+        return subprocess.run(
+            [sys.executable, str(self.SCAN_PY), str(folder), "--json", *extra_args],
+            capture_output=True, text=True, timeout=30,
+        )
+
+    def test_empty_folder_emits_parseable_json_with_both_keys(self, tmp_path):
+        # No video files at all — exercises main()'s early-return path, still
+        # through the real CLI, still must produce a valid document.
+        result = self._run(tmp_path)
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        assert "results" in payload
+        assert "summary" in payload
+        assert payload["results"] == []
+
+    def test_empty_folder_json_has_no_ansi_escapes(self, tmp_path):
+        result = self._run(tmp_path)
+        assert ANSI_ESCAPE_RE.search(result.stdout) is None
+
+    def test_empty_folder_stdout_is_only_the_json_line(self, tmp_path):
+        # No banner, no progress counter, no table — stdout must be nothing
+        # but the JSON document (plus its trailing newline from print()).
+        result = self._run(tmp_path)
+        assert result.stdout.strip().count("\n") == 0
+        json.loads(result.stdout)  # single document, not one-per-line noise
+
+    def test_json_implies_no_interactive_prompt(self, tmp_path):
+        # If --json ever tried to read a selection, this run would hang until
+        # the timeout instead of exiting — stdin is closed, so input() would
+        # raise EOFError if reached, but reaching it at all is the bug.
+        result = subprocess.run(
+            [sys.executable, str(self.SCAN_PY), str(tmp_path), "--json"],
+            capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
+        )
+        assert result.returncode == 0
+        json.loads(result.stdout)
+
+    @pytest.mark.skipif(
+        shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+        reason="ffmpeg/ffprobe not installed",
+    )
+    def test_real_probe_run_redirected_to_a_file_is_valid_json(self, tmp_path):
+        # Full real code path: a real encoded file, real ffprobe, real
+        # rank()/EncodeHistory, redirected to a file exactly as the README's
+        # example does — this is the scenario the review finding was about.
+        clip = tmp_path / "clip.mp4"
+        subprocess.run(
+            ["ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=duration=1:size=320x240:rate=24",
+             "-c:v", "libx264", "-preset", "ultrafast", str(clip)],
+            check=True, capture_output=True,
+        )
+        report = tmp_path / "report.json"
+        with open(report, "wb") as f:
+            result = subprocess.run(
+                [sys.executable, str(self.SCAN_PY), str(tmp_path), "--json"],
+                stdout=f, stderr=subprocess.PIPE, timeout=60,
+            )
+        assert result.returncode == 0
+        text = report.read_text()
+        payload = json.loads(text)
+        assert "results" in payload and "summary" in payload
+        assert ANSI_ESCAPE_RE.search(text) is None

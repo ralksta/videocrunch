@@ -72,7 +72,7 @@ search on the whole file).
 
 ```bash
 .venv/bin/python3 scan.py ~/Videos --no-encode --limit 20
-.venv/bin/python3 scan.py ~/Videos --codec av1 --limit 50 > report.json
+.venv/bin/python3 scan.py ~/Videos --codec av1 --limit 50 --json > report.json
 ```
 
 Walks the folder recursively, probes every video with `ffprobe` (a few
@@ -83,6 +83,13 @@ Enter for none) and hands the selection to `batch.py` for parallel encoding.
 Files that already have a `<name>_opt.mp4` sibling are skipped as done.
 Historical encodes (from `~/.videocrunch/logs/encode_history.jsonl`) are used
 to sharpen the estimate where available — the table marks those rows.
+
+`--json` prints the same `{"results": [...], "summary": {...}}` structure as
+machine-readable JSON on stdout instead — nothing else: no banner, no
+progress counter, no table, no colour codes, and it never prompts (all the
+human-facing chatter that normally goes to the terminal is routed to stderr
+instead, so `--json` output is always safe to redirect to a file exactly as
+above).
 
 `batch.py` itself (`--files a.mp4,b.mp4 --audio-mode enhanced`) runs the
 marked files in parallel with a live status table and a persistent log; you
@@ -140,13 +147,12 @@ reference bitrate for a clean encode at that resolution/codec, adjusted by a
 codec-efficiency table (e.g. HEVC needs roughly 65% of H.264's bitrate for
 the same perceived quality; AV1 roughly 55%).
 
-This is the same math used by the `arcade-video-scanner` dashboard's
-candidate list (`optimization_advisor.py` there) — the two copies are kept
-identical by `savings_parity.json`, a fixture of inputs/outputs committed to
-both repos and checked by `tests/test_savings_parity.py`. Changing the
-formula in one project without updating the fixture in both fails the test —
-by design, so the two tools never silently drift apart even though neither
-imports the other.
+This heuristic is kept in sync with a matching implementation used elsewhere
+by a shared test fixture, `savings_parity.json` — a fixed set of
+inputs/outputs checked by `tests/test_savings_parity.py`. Changing the
+formula without updating the fixture fails the test; the fixture itself
+should not be regenerated casually, since its whole purpose is pinning this
+math to a known-good set of numbers.
 
 ## macOS Finder Quick Action
 

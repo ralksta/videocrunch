@@ -340,19 +340,24 @@ def probe_file(path: Path) -> Optional[dict]:
         return None
 
 
-def probe_all(paths: list[Path]) -> list[dict]:
-    """Probe every file in parallel, with a progress counter."""
+def probe_all(paths: list[Path], quiet: bool = False) -> list[dict]:
+    """Probe every file in parallel, with a progress counter.
+
+    `quiet` routes the progress counter to stderr instead of stdout — used by
+    `--json`, where stdout must contain nothing but the final JSON document.
+    """
     entries: list[dict] = []
     done = 0
     total = len(paths)
+    out = sys.stderr if quiet else sys.stdout
     with ThreadPoolExecutor(max_workers=PROBE_WORKERS) as executor:
         for entry in executor.map(probe_file, paths):
             done += 1
-            sys.stdout.write(f"\r{Y}Lese Metadaten...{NC} {done}/{total}")
-            sys.stdout.flush()
+            out.write(f"\r{Y}Lese Metadaten...{NC} {done}/{total}")
+            out.flush()
             if entry is not None:
                 entries.append(entry)
-    sys.stdout.write("\r" + " " * 40 + "\r")
+    out.write("\r" + " " * 40 + "\r")
     return entries
 
 
@@ -408,27 +413,41 @@ def main() -> int:
     parser.add_argument('--port', type=int, help='Port of a running batch server')
     parser.add_argument('--no-encode', action='store_true',
                         help='Only print the ranking, never ask to encode')
+    parser.add_argument('--json', action='store_true',
+                        help='Print the ranking as JSON to stdout (no banner, no table, '
+                             'no colour, no prompt — implies --no-encode)')
     args = parser.parse_args()
+
+    # In --json mode stdout must be a valid JSON document and nothing else:
+    # every human-facing line below goes to stderr instead so a redirect
+    # (`scan.py folder --json > report.json`) produces parseable output.
+    log = (lambda msg: print(msg, file=sys.stderr)) if args.json else print
 
     root = Path(args.folder).expanduser()
     if not root.is_dir():
-        print(f"{R}Kein Ordner: {root}{NC}")
+        log(f"{R}Kein Ordner: {root}{NC}")
         return 1
 
-    print(f"{BG}═══════════════════════════════════════════{NC}")
-    print(f"{BG}  🔍 videocrunch Folder Scanner{NC}")
-    print(f"{BG}═══════════════════════════════════════════{NC}")
-    print(f"{G}Ordner:{NC} {root}")
+    log(f"{BG}═══════════════════════════════════════════{NC}")
+    log(f"{BG}  🔍 videocrunch Folder Scanner{NC}")
+    log(f"{BG}═══════════════════════════════════════════{NC}")
+    log(f"{G}Ordner:{NC} {root}")
 
     paths = find_videos(root)
     if not paths:
-        print(f"{Y}Keine Videodateien gefunden.{NC}")
+        if args.json:
+            print(json.dumps(rank([], args.codec, set(), EncodeHistory(), limit=args.limit)))
+        else:
+            log(f"{Y}Keine Videodateien gefunden.{NC}")
         return 0
-    print(f"{G}Gefunden:{NC} {len(paths)} Videodateien\n")
+    log(f"{G}Gefunden:{NC} {len(paths)} Videodateien\n")
 
-    entries = probe_all(paths)
+    entries = probe_all(paths, quiet=args.json)
     if not entries:
-        print(f"{R}Keine lesbaren Videodateien.{NC}")
+        if args.json:
+            print(json.dumps(rank([], args.codec, set(), EncodeHistory(), limit=args.limit)))
+        else:
+            log(f"{R}Keine lesbaren Videodateien.{NC}")
         return 1
 
     # Files that already have an _opt.mp4 next to them are done.
@@ -438,6 +457,10 @@ def main() -> int:
     # `results` is already truncated to `limit`; `summary` counts them all.
     candidates = result['results']
     summary = result['summary']
+
+    if args.json:
+        print(json.dumps(result))
+        return 0
 
     if not candidates:
         print(f"{Y}Kein Kandidat über der 10%-Schwelle — hier ist nichts zu holen.{NC}")
