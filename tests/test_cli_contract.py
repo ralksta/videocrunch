@@ -143,9 +143,11 @@ class TestProcessFileImportContract:
         """
         source = inspect.getsource(videocrunch.process_file)
         assignment = 'output_path = input_path.parent / f"{input_path.stem}_opt.mp4"'
-        assert assignment in source, (
-            "process_file no longer writes <stem>_opt.mp4 — remote workers "
-            "look for exactly that name and will report a bogus failure")
+        count = source.count(assignment)
+        assert count >= 2, (
+            "process_file must write <stem>_opt.mp4 in all non-trim-only branches "
+            "(is_trim and else branches); remote workers depend on this name and "
+            f"will report a bogus failure if it changes. Found {count} occurrence(s)")
 
     def test_encoder_profiles_expose_a_name(self):
         for key, profile in videocrunch.ENCODER_PROFILES.items():
