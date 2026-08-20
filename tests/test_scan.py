@@ -6,6 +6,7 @@ optimization_advisor.build_candidates — covered by its own tests. What is
 tested here is the new glue: the folder walk, the ffprobe -> media dict
 mapping, and the selection parser.
 """
+import json
 import sys
 from pathlib import Path
 
@@ -211,3 +212,44 @@ class TestRank:
         out = rank(media, "hevc", set(), EncodeHistory(Path("/nonexistent")), 2)
         assert len(out["results"]) == 2
         assert out["summary"]["total_files"] == 5
+
+    def _write_history(self, tmp_path, records):
+        path = tmp_path / "encode_history.jsonl"
+        with open(path, "w", encoding="utf-8") as f:
+            for rec in records:
+                f.write(json.dumps(rec) + "\n")
+        return path
+
+    def test_history_override_applies_for_a_different_codec_source(self, tmp_path):
+        from scan import EncodeHistory, rank
+        # Bucket must match the default _media(): h264, 1080p, 12.0 Mbit/s ->
+        # bitrate_class(12000) == "high", resolution_class(1080) == "1080".
+        history_path = self._write_history(tmp_path, [
+            {"height": 1080, "source_kbps": 12000, "codec": "hevc_nvenc", "saved_pct": 50.0},
+            {"height": 1080, "source_kbps": 12000, "codec": "hevc_nvenc", "saved_pct": 48.0},
+            {"height": 1080, "source_kbps": 12000, "codec": "hevc_nvenc", "saved_pct": 52.0},
+        ])
+        media = [self._media()]
+        out = rank(media, "hevc", set(), EncodeHistory(history_path), 10)
+        assert len(out["results"]) == 1
+        result = out["results"][0]
+        assert result["source"] == "history"
+        assert result["confidence"] == "high"
+        assert result["estimated_saved_pct"] == pytest.approx(50.0)
+        assert out["summary"]["history_based"] == 1
+
+    def test_same_codec_source_is_excluded_from_the_history_override(self, tmp_path):
+        from scan import EncodeHistory, rank
+        # Same bucket as above, but the source is already HEVC targeting HEVC:
+        # history carries no source codec, so a same-codec entry must not
+        # inherit the median of unrelated h264-source encodes in this bucket.
+        history_path = self._write_history(tmp_path, [
+            {"height": 1080, "source_kbps": 12000, "codec": "hevc_nvenc", "saved_pct": 50.0},
+            {"height": 1080, "source_kbps": 12000, "codec": "hevc_nvenc", "saved_pct": 48.0},
+            {"height": 1080, "source_kbps": 12000, "codec": "hevc_nvenc", "saved_pct": 52.0},
+        ])
+        media = [self._media(codec="hevc")]
+        out = rank(media, "hevc", set(), EncodeHistory(history_path), 10)
+        assert len(out["results"]) == 1
+        assert out["results"][0]["source"] == "heuristic"
+        assert out["summary"]["history_based"] == 0

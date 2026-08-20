@@ -22,7 +22,13 @@ from pathlib import Path
 from typing import Any, Optional
 
 from crunch_utils import DEFAULT_HISTORY_PATH
-from savings import bitrate_class, estimate_savings_pct, resolution_class
+from savings import (
+    _is_same_codec,
+    _reference_kbps,
+    bitrate_class,
+    estimate_savings_pct,
+    resolution_class,
+)
 
 # Extensions worth probing. Inlined from arcade-video-scanner's config; a
 # standalone tool should not need a config module for a constant list.
@@ -170,28 +176,9 @@ def _parse_index(token: str, count: int) -> int:
 # Ranking — ported from arcade-video-scanner's optimization advisor
 # ---------------------------------------------------------------------------
 
-_TARGET_ALIASES = {"hevc": {"hevc", "h265"}, "av1": {"av1"}}
 # History `codec` holds encoder-profile names (hevc_nvenc, libx265, av1_nvenc…);
 # match the requested target codec by substring.
 _TARGET_SUBSTRINGS = {"hevc": ("hevc", "265"), "av1": ("av1",)}
-
-# Reference bitrates (kbps) for a well-compressed HEVC encode at ~30 fps.
-_REF_KBPS = {"sd": 1500.0, "720": 2500.0, "1080": 4000.0, "1440": 8000.0, "2160": 12000.0}
-_AV1_REF_FACTOR = 0.85
-
-
-def _is_same_codec(source_codec: str, target_codec: str) -> bool:
-    src = (source_codec or "").lower()
-    return src in _TARGET_ALIASES.get(target_codec, {target_codec})
-
-
-def _reference_kbps(height: int, target_codec: str, fps: float) -> float:
-    ref = _REF_KBPS[resolution_class(height)]
-    if target_codec == "av1":
-        ref *= _AV1_REF_FACTOR
-    if fps > 0:
-        ref *= min(max(fps / 30.0, 0.5), 2.0)
-    return ref
 
 
 class EncodeHistory:
