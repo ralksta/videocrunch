@@ -179,3 +179,9 @@ Action you already have installed.
 .venv/bin/pytest
 .venv/bin/ruff check .
 ```
+
+## Further reading
+
+[`docs/technical-reference.md`](docs/technical-reference.md) — encoder
+profile internals, the binary search / SSIM verification machinery, staging
+& atomic replace, HDR handling, and the full CLI flag reference.
