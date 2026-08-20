@@ -307,7 +307,7 @@ usage: videocrunch.py [-h] [--encoder {auto,nvenc,videotoolbox,qsv,libx265}]
 | `--video-mode {compress,copy}` | compress (default) or passthrough |
 | `--q N` | Manual starting quality — searches linearly from there instead of binary search |
 | `--scale-height H` | Downscale to H pixels height (ignored if >= source height) |
-| `--port PORT` | Notifies a running Arcade server on this port, if any |
+| `--port PORT` | Notify a companion server on this port when a file is done, via `GET /api/mark_optimized?path=<path>` |
 | `--preset {fast,balanced,best}` | Encoder-specific speed/quality preset |
 | `--force` | Encode even when `savings.py` predicts it isn't worth it |
 | `--no-presearch` | Always run the full search on the whole file |

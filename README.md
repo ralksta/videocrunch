@@ -172,6 +172,15 @@ service — this is expected, Finder relaunches immediately, and it only adds
 its own `videocrunch.workflow` bundle without touching any other Quick
 Action you already have installed.
 
+To uninstall the Quick Action again:
+
+```bash
+rm -rf ~/Library/Services/videocrunch.workflow && killall Finder
+```
+
+That bundle is the installer's only footprint outside this repo — nothing
+else is written to the system.
+
 ## Tests
 
 ```bash
@@ -179,6 +188,10 @@ Action you already have installed.
 .venv/bin/pytest
 .venv/bin/ruff check .
 ```
+
+## License
+
+MIT — see [`LICENSE`](LICENSE). Free usage for everyone.
 
 ## Further reading
 
