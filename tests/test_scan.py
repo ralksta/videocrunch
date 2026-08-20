@@ -1,10 +1,10 @@
 """Unit tests for the folder scanner (pure logic, no ffmpeg).
 
 scan.py ranks a directory's videos by expected re-encode savings and
-lets the user mark which ones to run. The ranking itself is
-optimization_advisor.build_candidates — covered by its own tests. What is
-tested here is the new glue: the folder walk, the ffprobe -> media dict
-mapping, and the selection parser.
+lets the user mark which ones to run. Both halves are covered here:
+`rank()` itself in TestRank below (this is its only test), and the glue
+around it — the folder walk, the ffprobe -> media dict mapping, and the
+selection parser.
 
 TestJsonOutput below is the exception to "no ffmpeg": it drives scan.py's
 `main()` as a real subprocess (real argparse, real ffprobe where available)

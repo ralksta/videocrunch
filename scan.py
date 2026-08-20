@@ -4,9 +4,9 @@ Folder Scanner — ranks a directory's videos by expected re-encode savings.
 
 Answers "which of these 150 files is worth optimizing?" without encoding
 anything: ffprobe metadata only, a few seconds for a large folder. The ranking
-itself is `rank()` below — the same math behind arcade-video-scanner's
-dashboard candidate list, ported to plain dicts so videocrunch stays free of
-extra dependencies. History is read from ~/.videocrunch/logs/encode_history.jsonl.
+itself is `rank()` below — the same math a companion dashboard uses to build
+its candidate list, kept in sync via savings_parity.json and ported to plain
+dicts so videocrunch stays free of extra dependencies. History is read from ~/.videocrunch/logs/encode_history.jsonl.
 
 Mark the entries you want (e.g. `1,3,7-10`) and they are handed to batch.py,
 which runs the encodes in parallel.
@@ -30,8 +30,8 @@ from savings import (
     resolution_class,
 )
 
-# Extensions worth probing. Inlined from arcade-video-scanner's config; a
-# standalone tool should not need a config module for a constant list.
+# Extensions worth probing. Deliberately inlined: a standalone tool should not
+# need a config module for a constant list.
 VIDEO_EXTENSIONS = frozenset({
     '.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v',
     '.mpg', '.mpeg', '.ts',
@@ -173,7 +173,7 @@ def _parse_index(token: str, count: int) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Ranking — ported from arcade-video-scanner's optimization advisor
+# Ranking — savings heuristic from savings.py, plus encode-history overrides
 # ---------------------------------------------------------------------------
 
 # History `codec` holds encoder-profile names (hevc_nvenc, libx265, av1_nvenc…);
@@ -410,7 +410,8 @@ def main() -> int:
                         help='Show at most N candidates (default: 30)')
     parser.add_argument('--audio-mode', choices=['enhanced', 'standard'],
                         default='enhanced', help='Audio mode for the encode run')
-    parser.add_argument('--port', type=int, help='Port of a running batch server')
+    parser.add_argument('--port', type=int,
+                        help='Port passed through to batch.py, which notifies a companion server there when a file is done')
     parser.add_argument('--no-encode', action='store_true',
                         help='Only print the ranking, never ask to encode')
     parser.add_argument('--json', action='store_true',

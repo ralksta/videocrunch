@@ -10,9 +10,8 @@ error or returns something other than the ('libx264', [...]) fallback pair,
 which would raise a TypeError on any caller doing
 ``codec, args = detect_h264_encoder()``.
 
-Ported from arcade-video-scanner's tests/test_video_processor.py
-(TestDetectHwEncoder), which covered this scenario before the encoder moved
-into this repo.
+Ported from the test suite of the project this encoder was extracted from,
+which covered this scenario before the encoder moved into its own repo.
 """
 import sys
 from pathlib import Path

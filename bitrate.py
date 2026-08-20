@@ -4,7 +4,8 @@ Bitrate Analyzer for videocrunch
 Analyzes input video files using ffprobe to determine their bitrate characteristics,
 then generates appropriate encoding parameters that never exceed source quality.
 
-Integrates with the existing encoder detection system (detect_hw_encoder / get_best_encoder).
+Integrates with the encoder detection in encoders.py (detect_h264_encoder /
+get_best_h264_encoder).
 """
 
 import json
@@ -350,8 +351,8 @@ def calculate_encoding_params(
 
     Args:
         profile:         Output of analyze_bitrate().
-        encoder_name:    e.g. "h264_nvenc", "libx264" — from get_best_encoder().
-        encoder_options: Encoder-specific flags       — from get_best_encoder().
+        encoder_name:    e.g. "h264_nvenc", "libx264" — from get_best_h264_encoder().
+        encoder_options: Encoder-specific flags       — from get_best_h264_encoder().
         target_codec:    Target codec name (e.g. "h264", "hevc").
                          Auto-derived from encoder_name if None.
         headroom_pct:    Percentage below source average to target (0.05 = 5%).

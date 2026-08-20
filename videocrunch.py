@@ -2024,7 +2024,8 @@ def write_encode_log(filename, status, encoder_name, quality=None, ssim=None,
     return log_file
 
 
-def main():
+def build_parser():
+    """The CLI surface — see tests/test_cli_contract.py for the invocation contract."""
     parser = argparse.ArgumentParser(description='Multi-Platform Video Optimizer V2.1')
     parser.add_argument('files', nargs='*', help='Video files to optimize')
     parser.add_argument('--encoder', choices=['auto', 'nvenc', 'videotoolbox', 'qsv', 'libx265'], default='auto',
@@ -2045,14 +2046,19 @@ def main():
     parser.add_argument('--scale-height', type=int, metavar='H',
                         help='Downscale video to H pixels height, keeping the source aspect '
                              'ratio (e.g. 1080). Ignored when >= source height.')
-    parser.add_argument('--port', type=int, help='Port of the running Arcade Server to notify')
+    parser.add_argument('--port', type=int,
+                        help='Notify a companion server on this port when a file is done, via GET /api/mark_optimized?path=<path>')
     parser.add_argument('--preset', choices=['fast', 'balanced', 'best'], default='balanced',
                         help='Encoding quality preset: fast (speed), balanced (default), best (quality/size)')
     parser.add_argument('--force', action='store_true',
                         help='Encode even when the savings heuristic predicts it is not worth it')
     parser.add_argument('--no-presearch', action='store_true',
                         help='Skip the sample-clip quality pre-search (always run the full binary search)')
-    args = parser.parse_args()
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
 
     if args.port:
         print(f"🔌 Notification Port: {args.port}")
