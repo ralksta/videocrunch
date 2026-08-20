@@ -1,0 +1,2 @@
+# videocrunch has no runtime dependencies beyond the Python standard library.
+# ffmpeg and ffprobe (8.1+) must be on PATH.

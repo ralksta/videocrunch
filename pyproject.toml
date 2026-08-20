@@ -1,0 +1,11 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+# Same rule set as arcade-video-scanner, but declared under [tool.ruff.lint]
+# rather than top-level — the top-level form is deprecated and warns on every run.
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
