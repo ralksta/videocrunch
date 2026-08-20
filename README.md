@@ -60,7 +60,7 @@ bash crunch.sh ~/Videos/clip.mp4 --codec av1 --preset best
 ```
 
 Key flags: `--codec {hevc,av1}` (default hevc), `--encoder
-{auto,nvenc,videotoolbox,qsv,libx265}` (default auto-detect), `--preset
+{auto,av1_nvenc,av1_software,libx265,nvenc,qsv,vaapi,videotoolbox}` (default auto-detect), `--preset
 {fast,balanced,best}`, `--audio-mode {enhanced,moderate,standard}`, `--q N`
 (force a starting quality and search linearly from there instead of via
 binary search), `--scale-height H` (downscale before encoding), `--ss`/`--to`

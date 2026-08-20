@@ -2028,7 +2028,11 @@ def build_parser():
     """The CLI surface — see tests/test_cli_contract.py for the invocation contract."""
     parser = argparse.ArgumentParser(description='Multi-Platform Video Optimizer V2.1')
     parser.add_argument('files', nargs='*', help='Video files to optimize')
-    parser.add_argument('--encoder', choices=['auto', 'nvenc', 'videotoolbox', 'qsv', 'libx265'], default='auto',
+    # Derived from ENCODER_PROFILES rather than hardcoded: a profile the parser
+    # rejects is unreachable on purpose-built hardware — auto-detection may pick
+    # it, but the user cannot force it or override a wrong guess. VAAPI sat in
+    # exactly that state. tests/test_cli_contract.py pins the two lists together.
+    parser.add_argument('--encoder', choices=['auto'] + sorted(ENCODER_PROFILES), default='auto',
                         help='Encoder to use (default: auto-detect)')
     parser.add_argument('--codec', choices=['hevc', 'av1'], default='hevc',
                         help='Target codec: hevc (default) or av1 (experimental, requires modern GPU)')
@@ -2077,7 +2081,10 @@ def main():
             'videotoolbox': 'av1_software',
             'nvenc': 'av1_nvenc',
         }
-        av1_key = av1_map.get(encoder_key)
+        # An explicitly chosen AV1 profile needs no mapping — without this,
+        # `--encoder av1_nvenc --codec av1` would fall into the else branch and
+        # print "AV1 not supported for encoder 'av1_nvenc'".
+        av1_key = encoder_key if encoder_key.startswith('av1_') else av1_map.get(encoder_key)
         if av1_key and av1_key in ENCODER_PROFILES:
             print(f"{Y}🧪 AV1 Experimental: switching from {encoder_key} → {av1_key}{NC}")
             encoder_key = av1_key

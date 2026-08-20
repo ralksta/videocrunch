@@ -31,6 +31,32 @@ import batch  # noqa: E402
 import videocrunch  # noqa: E402
 
 
+class TestEncoderChoices:
+    """Every encoder profile must be selectable by name.
+
+    A profile that `--encoder` rejects is unreachable on purpose-built
+    hardware: auto-detection may pick it, but the user cannot force it, and
+    cannot override a wrong guess. VAAPI was in exactly that state.
+    """
+
+    def test_every_profile_is_an_accepted_encoder_choice(self):
+        parser = videocrunch.build_parser()
+        action = next(a for a in parser._actions if a.dest == "encoder")
+        missing = set(videocrunch.ENCODER_PROFILES) - set(action.choices)
+        assert not missing, f"profiles unreachable via --encoder: {sorted(missing)}"
+
+    def test_auto_stays_available(self):
+        parser = videocrunch.build_parser()
+        action = next(a for a in parser._actions if a.dest == "encoder")
+        assert "auto" in action.choices
+        assert parser.parse_args(["/videos/a.mp4"]).encoder == "auto"
+
+    def test_each_profile_name_round_trips(self):
+        for key in videocrunch.ENCODER_PROFILES:
+            args = videocrunch.build_parser().parse_args(["/videos/a.mp4", "--encoder", key])
+            assert args.encoder == key
+
+
 class TestSingleFileInvocation:
     """`videocrunch.py FILE --port … --audio-mode … --video-mode … --preset … --codec …`"""
 

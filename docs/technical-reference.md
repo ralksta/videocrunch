@@ -285,7 +285,8 @@ All tuning constants live at the top of `videocrunch.py`:
 ## CLI Reference
 
 ```
-usage: videocrunch.py [-h] [--encoder {auto,nvenc,videotoolbox,qsv,libx265}]
+usage: videocrunch.py [-h]
+                      [--encoder {auto,av1_nvenc,av1_software,libx265,nvenc,qsv,vaapi,videotoolbox}]
                        [--codec {hevc,av1}] [--min-size MIN_SIZE]
                        [--copy-audio]
                        [--audio-mode {enhanced,moderate,standard}] [--ss SS]
