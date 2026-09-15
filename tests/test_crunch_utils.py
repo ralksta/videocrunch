@@ -21,12 +21,15 @@ from crunch_utils import (  # noqa: E402
     build_audio_filter_chain,
     build_stream_args,
     clamp_maxrate_to_pass,
+    estimate_runtime_sec,
+    history_throughput,
     is_hdr_or_10bit,
     is_within_schedule,
     narrow_quality_window,
     nearest_quality_index,
     parse_loudnorm_json,
     parse_schedule,
+    read_encode_history,
     resolution_class,
     select_top_windows,
     suggest_q_from_history,
@@ -368,3 +371,81 @@ class TestStreamMapping:
             [self.VIDEO, self._audio(), {"codec_type": "data", "codec_name": "bin_data"}],
             copy_audio=False, audio_filters=None)
         assert not any(a.startswith("0:d") for a in args)
+
+
+class TestRuntimeEstimate:
+    """How long a batch will take, from what past runs actually took.
+
+    A wizard that asks "start 40 files?" without saying whether that is four
+    minutes or four hours is asking the user to guess.
+    """
+
+    RECORDS = [
+        {"size_mb": 100.0, "duration": 50.0},   # 2 MB/s
+        {"size_mb": 200.0, "duration": 50.0},   # 4 MB/s
+        {"size_mb": 300.0, "duration": 100.0},  # 3 MB/s
+    ]
+
+    def test_throughput_is_measured_per_resolution_class(self):
+        # 4K and 480p move very different amounts of data per second. Mixing
+        # them produced an estimate seven times off on the first real run.
+        records = [
+            {"size_mb": 100.0, "duration": 10.0, "height": 480},
+            {"size_mb": 100.0, "duration": 10.0, "height": 480},
+            {"size_mb": 100.0, "duration": 10.0, "height": 480},
+            {"size_mb": 100.0, "duration": 100.0, "height": 2160},
+            {"size_mb": 100.0, "duration": 100.0, "height": 2160},
+            {"size_mb": 100.0, "duration": 100.0, "height": 2160},
+        ]
+        assert history_throughput(records, height=480) == 10.0
+        assert history_throughput(records, height=2160) == 1.0
+
+    def test_a_class_without_history_gets_no_estimate(self):
+        # Falling back to the overall median is how the wrong number appeared
+        # in the first place.
+        records = [{"size_mb": 100.0, "duration": 10.0, "height": 480}] * 3
+        assert history_throughput(records, height=2160) is None
+
+    def test_throughput_is_the_median_of_past_runs(self):
+        assert history_throughput(self.RECORDS) == 3.0
+
+    def test_too_few_samples_means_no_estimate(self):
+        # Two runs are not a basis for a number the user will plan around.
+        assert history_throughput(self.RECORDS[:2]) is None
+
+    def test_records_without_timing_are_ignored(self):
+        mixed = self.RECORDS + [{"size_mb": 10.0}, {"duration": 5.0}, {}]
+        assert history_throughput(mixed) == 3.0
+
+    def test_a_zero_duration_never_becomes_infinite_speed(self):
+        assert history_throughput(self.RECORDS + [{"size_mb": 10.0, "duration": 0.0}]) == 3.0
+
+    def test_runtime_follows_the_total_size(self):
+        assert estimate_runtime_sec(300.0, 3.0) == 100.0
+
+    def test_no_throughput_means_no_runtime(self):
+        assert estimate_runtime_sec(300.0, None) is None
+
+
+class TestReadEncodeHistory:
+    """The raw history records, for callers that need more than one bucket."""
+
+    def test_reads_back_what_was_written(self, tmp_path):
+        path = tmp_path / "history.jsonl"
+        append_encode_history({"file": "a.mp4", "size_mb": 100.0, "duration": 50.0}, path)
+        append_encode_history({"file": "b.mp4", "size_mb": 200.0, "duration": 80.0}, path)
+        records = read_encode_history(path)
+        assert [r["file"] for r in records] == ["a.mp4", "b.mp4"]
+
+    def test_a_damaged_line_does_not_lose_the_rest(self, tmp_path):
+        # A half-written line from a killed run must not hide every record
+        # written before it.
+        path = tmp_path / "history.jsonl"
+        append_encode_history({"file": "a.mp4"}, path)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("{not json\n")
+        append_encode_history({"file": "c.mp4"}, path)
+        assert [r["file"] for r in read_encode_history(path)] == ["a.mp4", "c.mp4"]
+
+    def test_a_missing_history_is_simply_empty(self, tmp_path):
+        assert read_encode_history(tmp_path / "nothing.jsonl") == []

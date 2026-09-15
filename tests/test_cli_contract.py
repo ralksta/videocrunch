@@ -332,6 +332,30 @@ class TestAbortKeepsWork:
             ["a._staging_q65.mp4"], is_interactive=True, ask=interrupted) is False
 
 
+class TestBatchResultsForTheWizard:
+    """After the batch, the wizard needs to know how it actually went.
+
+    Until now it learned only an exit code, so it could neither hold its own
+    estimate against the result nor offer to retry what fell under the quality
+    floor — even though the per-file measurements existed all along.
+    """
+
+    def test_batch_writes_every_file_result(self, tmp_path):
+        target = tmp_path / "batch.json"
+        results = [{"filename": "a.mp4", "status": "success", "saved_bytes": 100},
+                   {"filename": "b.mp4", "status": "failed", "ssim": 0.87}]
+        batch.write_batch_results(target, results)
+        payload = json.loads(target.read_text())
+        assert [r["filename"] for r in payload["results"]] == ["a.mp4", "b.mp4"]
+
+    def test_flag_parses(self, tmp_path):
+        args = batch.build_parser().parse_args(["--files=/a.mp4", f"--json-out={tmp_path}/r.json"])
+        assert args.json_out == f"{tmp_path}/r.json"
+
+    def test_an_unwritable_target_does_not_take_the_batch_down(self, tmp_path):
+        assert batch.write_batch_results(tmp_path / "nope" / "r.json", []) is False
+
+
 class TestJsonResult:
     """`--json-out PATH` — the machine-readable result of a run.
 
@@ -442,6 +466,21 @@ class TestBatchQualityFloorForwarding:
         cmd = batch.build_optimizer_command("/a.mp4", port=8000,
                                             audio_mode="standard", min_ssim=None)
         assert "--min-ssim" not in cmd
+
+    def test_downscale_reaches_the_per_file_command(self):
+        cmd = batch.build_optimizer_command("/a.mp4", port=None, audio_mode="standard",
+                                            scale_height=1080)
+        assert cmd[cmd.index("--scale-height") + 1] == "1080"
+
+    def test_replace_reaches_the_per_file_command(self):
+        cmd = batch.build_optimizer_command("/a.mp4", port=None, audio_mode="standard",
+                                            replace=True)
+        assert "--replace" in cmd
+
+    def test_neither_appears_unless_asked_for(self):
+        cmd = batch.build_optimizer_command("/a.mp4", port=None, audio_mode="standard")
+        assert "--scale-height" not in cmd
+        assert "--replace" not in cmd
 
     def test_command_still_carries_the_documented_basics(self):
         cmd = batch.build_optimizer_command("/a.mp4", port=8000,

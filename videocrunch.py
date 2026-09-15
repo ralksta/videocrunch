@@ -300,6 +300,7 @@ last_encode_result = {
     'reason': None,
     'height': None,       # source height (for encode history bucketing)
     'source_kbps': None,  # source avg bitrate (for encode history bucketing)
+    'size_mb': None,      # source size (with duration: throughput for estimates)
 }
 
 
@@ -1309,6 +1310,7 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
     effective_height = scale_height or info['height']
     last_encode_result['height'] = effective_height
     last_encode_result['source_kbps'] = (size_before * 8) / (info['duration'] * 1000)
+    last_encode_result['size_mb'] = size_before / (1024 * 1024)
 
     # --- PRE-FLIGHT GATE ---
     # Ask the savings heuristic BEFORE burning encode time. A file that is
@@ -2614,6 +2616,10 @@ def main():
                     'q': last_encode_result['quality'],
                     'ssim': last_encode_result['ssim'],
                     'saved_pct': last_encode_result['saved_pct'],
+                    # Source size and wall clock: together they are the only
+                    # basis for telling someone how long a batch will take.
+                    'size_mb': last_encode_result.get('size_mb'),
+                    'duration': last_encode_result.get('duration'),
                 })
 
         run_results.append(dict(last_encode_result))
