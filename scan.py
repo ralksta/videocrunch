@@ -78,8 +78,9 @@ def has_optimized_sibling(path: Path) -> bool:
 def find_videos(root: Path) -> list[Path]:
     """All video files under `root`, minus the optimizer's own output.
 
-    `_opt.mp4` results and `._staging_q*` leftovers are skipped: offering to
-    re-encode them would just compress an encode of an encode.
+    `_opt.mp4` results, `_rejected.mp4` candidates kept from a failed run, and
+    `._staging_q*` leftovers are skipped: offering to re-encode them would
+    just compress an encode of an encode.
     """
     found = []
     for path in root.rglob("*"):
@@ -87,7 +88,7 @@ def find_videos(root: Path) -> list[Path]:
             continue
         if path.suffix.lower() not in VIDEO_EXTENSIONS:
             continue
-        if path.stem.endswith("_opt") or "._staging_q" in path.name:
+        if path.stem.endswith(("_opt", "_rejected")) or "._staging_q" in path.name:
             continue
         found.append(path)
     return sorted(found)

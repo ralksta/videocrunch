@@ -157,6 +157,14 @@ class TestFindVideos:
         (tmp_path / "a_opt._staging_q65.mp4").touch()
         assert [p.name for p in find_videos(tmp_path)] == ["a.mp4"]
 
+    def test_skips_rejected_candidates(self, tmp_path):
+        # A failed run keeps its best encode as _rejected.mp4 for inspection.
+        # Offering it as a re-encode candidate would compress an encode of an
+        # encode — and the source it came from is right next to it.
+        (tmp_path / "a.mp4").touch()
+        (tmp_path / "a_rejected.mp4").touch()
+        assert [p.name for p in find_videos(tmp_path)] == ["a.mp4"]
+
     def test_returns_sorted_paths(self, tmp_path):
         for name in ("c.mp4", "a.mp4", "b.mp4"):
             (tmp_path / name).touch()

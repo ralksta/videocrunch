@@ -19,6 +19,7 @@ from crunch_utils import (  # noqa: E402
     battery_from_pmset,
     bitrate_class,
     build_audio_filter_chain,
+    build_stream_args,
     clamp_maxrate_to_pass,
     is_hdr_or_10bit,
     is_within_schedule,
@@ -296,3 +297,74 @@ class TestClampMaxrateToPass:
         caps = [clamp_maxrate_to_pass(2346.0, 4692.0, t)[0] for t in (749, 632, 514, 397)]
         assert len(set(caps)) == 4
         assert caps == sorted(caps, reverse=True)
+
+
+class TestStreamMapping:
+    """Which input streams survive the encode, and how.
+
+    ffmpeg's default stream selection keeps exactly one audio track and drops
+    everything else — silently. For a tool that re-encodes whole libraries
+    that means second language tracks, commentary and subtitles disappear
+    without a word. Every stream is either carried over or named in the notes.
+    """
+
+    VIDEO = {"codec_type": "video", "codec_name": "hevc"}
+
+    def _audio(self, codec="aac"):
+        return {"codec_type": "audio", "codec_name": codec}
+
+    def test_every_audio_track_is_mapped(self):
+        args, _ = build_stream_args(
+            [self.VIDEO, self._audio(), self._audio()],
+            copy_audio=False, audio_filters=None)
+        assert "0:a:0" in args and "0:a:1" in args
+
+    def test_only_the_first_audio_track_gets_the_filter_chain(self):
+        # The two-pass loudnorm measurement is taken from the first track
+        # only; applying its numbers to a second track would normalize it
+        # against the wrong signal.
+        args, _ = build_stream_args(
+            [self.VIDEO, self._audio(), self._audio()],
+            copy_audio=False, audio_filters="loudnorm=I=-19")
+        assert "-filter:a:0" in args
+        assert "-filter:a:1" not in args
+        assert "-af" not in args
+
+    def test_undecodable_track_is_skipped_and_named(self):
+        # Apple's spatial audio (apple_apac) has no decoder and no mp4 tag:
+        # mapping it blindly fails the whole encode.
+        args, skipped = build_stream_args(
+            [self.VIDEO, self._audio(), self._audio("apple_apac")],
+            copy_audio=False, audio_filters=None, decodable={"aac"})
+        assert "0:a:1" not in args
+        assert any("apple_apac" in note for note in skipped)
+
+    def test_copy_mode_skips_tracks_mp4_cannot_hold(self):
+        args, skipped = build_stream_args(
+            [self.VIDEO, self._audio(), self._audio("apple_apac")],
+            copy_audio=True, audio_filters=None)
+        assert "-c:a" in args and args[args.index("-c:a") + 1] == "copy"
+        assert "0:a:1" not in args
+        assert any("apple_apac" in note for note in skipped)
+
+    def test_text_subtitles_are_converted_for_mp4(self):
+        args, _ = build_stream_args(
+            [self.VIDEO, self._audio(), {"codec_type": "subtitle", "codec_name": "subrip"}],
+            copy_audio=False, audio_filters=None)
+        assert "0:s:0" in args
+        assert args[args.index("-c:s") + 1] == "mov_text"
+
+    def test_image_subtitles_are_skipped_and_named(self):
+        args, skipped = build_stream_args(
+            [self.VIDEO, self._audio(), {"codec_type": "subtitle", "codec_name": "hdmv_pgs_subtitle"}],
+            copy_audio=False, audio_filters=None)
+        assert "0:s:0" not in args
+        assert any("hdmv_pgs_subtitle" in note for note in skipped)
+
+    def test_data_streams_are_never_mapped(self):
+        # iPhone clips carry timecode and metadata tracks the mp4 muxer
+        # rejects; they are dropped on purpose, not by accident.
+        args, _ = build_stream_args(
+            [self.VIDEO, self._audio(), {"codec_type": "data", "codec_name": "bin_data"}],
+            copy_audio=False, audio_filters=None)
+        assert not any(a.startswith("0:d") for a in args)

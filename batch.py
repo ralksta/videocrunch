@@ -5,9 +5,12 @@ Shows a live-updating status table for all parallel encodes.
 Writes detailed results to a persistent log file.
 """
 import argparse
+import json
+import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -20,6 +23,7 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 from encoders import get_best_h264_encoder as get_best_encoder  # noqa: E402
 from encoders import get_optimal_workers  # noqa: E402
+from videocrunch import quality_floor  # noqa: E402
 
 # --- COLORS ---
 G = '\033[0;32m'
@@ -125,11 +129,62 @@ def terminal_verdict(line: str) -> tuple:
     return (None, None)
 
 
+def read_worker_result(path) -> dict | None:
+    """The worker's own verdict, or None if it did not leave one.
+
+    Falling back to stdout parsing keeps older call paths working — and a
+    worker killed mid-run leaves no file, which is exactly when the scraped
+    output is all there is.
+    """
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        results = payload.get("results") or []
+        return results[0] if results else None
+    except (OSError, ValueError, TypeError, KeyError, IndexError):
+        return None
+
+
+def merge_worker_result(result: dict, data: dict | None) -> bool:
+    """Let the worker's own verdict replace what was scraped off its output.
+
+    Returns False when there is no verdict to merge, leaving the scraped
+    values in place. Scraping reads rounded, human-facing numbers; the worker
+    reports the real ones.
+    """
+    if not data:
+        return False
+    for key in ("status", "quality", "ssim", "saved_pct", "saved_bytes", "reason"):
+        if key in data:
+            result[key] = data[key]
+    return True
+
+
+def build_optimizer_command(file_path, port, audio_mode, min_ssim=None, json_out=None):
+    """The per-file `videocrunch.py` invocation — see tests/test_cli_contract.py.
+
+    Every batch-level option a caller sets has to appear here; anything the
+    controller accepts but does not forward silently leaves the per-file
+    encode on its defaults.
+    """
+    cmd = [
+        sys.executable,
+        str(Path(__file__).parent / "videocrunch.py"),
+        str(file_path),
+        "--audio-mode", audio_mode,
+    ]
+    if port:
+        cmd.extend(["--port", str(port)])
+    if min_ssim:
+        cmd.extend(["--min-ssim", str(min_ssim)])
+    if json_out:
+        cmd.extend(["--json-out", str(json_out)])
+    return cmd
+
+
 def run_optimizer(args_tuple):
     """Worker function - captures output and updates shared state. Returns detailed results for logging."""
-    file_path, port, audio_mode, worker_id = args_tuple
+    file_path, port, audio_mode, min_ssim, worker_id = args_tuple
 
-    optimizer_path = Path(__file__).parent / "videocrunch.py"
     filename = Path(file_path).name
     file_start = time.time()
 
@@ -149,14 +204,9 @@ def run_optimizer(args_tuple):
     with display_lock:
         worker_status[worker_id] = {"file": filename, "status": "encoding", "progress": 0, "q": 75}
 
-    cmd = [
-        sys.executable,
-        str(optimizer_path),
-        file_path,
-        "--audio-mode", audio_mode,
-    ]
-    if port:
-        cmd.extend(["--port", str(port)])
+    # The worker writes its verdict here; stdout stays the live progress feed.
+    result_file = Path(tempfile.gettempdir()) / f"videocrunch_w{worker_id}_{os.getpid()}.json"
+    cmd = build_optimizer_command(file_path, port, audio_mode, min_ssim, json_out=result_file)
 
     try:
         process = subprocess.Popen(
@@ -240,24 +290,31 @@ def run_optimizer(args_tuple):
         process.wait()
         result["duration"] = time.time() - file_start
 
+        # The worker's own verdict outranks anything scraped from its output.
+        scraped = {"status": "success" if (success and not failed) else "failed",
+                   "quality": last_quality, "ssim": last_ssim,
+                   "saved_pct": last_saved_pct, "saved_bytes": last_saved_bytes,
+                   "reason": failure_reason}
+        from_worker = read_worker_result(result_file)
+        try:
+            result_file.unlink()
+        except OSError:
+            pass
+        merge_worker_result(scraped, from_worker)
+        result.update({k: v for k, v in scraped.items() if k != "status"})
+        succeeded = scraped["status"] == "success"
+
         with display_lock:
-            # Only mark as success if explicit SUCCESS marker was found AND no failure detected
-            if success and not failed:
+            if succeeded:
                 worker_status[worker_id]["status"] = "done"
                 worker_status[worker_id]["progress"] = 100
                 result["status"] = "success"
-                result["quality"] = last_quality
-                result["ssim"] = last_ssim
-                result["saved_pct"] = last_saved_pct
-                result["saved_bytes"] = last_saved_bytes
                 file_results.append(result)
                 return (file_path, True, result)
             else:
-                worker_status[worker_id]["status"] = "failed"
-                result["status"] = "failed"
-                result["quality"] = last_quality
-                result["ssim"] = last_ssim
-                result["reason"] = failure_reason or "Encoding failed"
+                worker_status[worker_id]["status"] = scraped["status"]
+                result["status"] = scraped["status"]
+                result["reason"] = scraped.get("reason") or "Encoding failed"
                 file_results.append(result)
                 return (file_path, False, result)
 
@@ -352,6 +409,9 @@ def build_parser():
                         help='Notify a companion server on this port when a file is done, '
                              'via GET /api/mark_optimized?path=<path>')
     parser.add_argument('--audio-mode', choices=['enhanced', 'standard'], default='enhanced')
+    parser.add_argument('--min-ssim', type=quality_floor, metavar='S',
+                        help='Override the hard quality floor for every file in this batch '
+                             '(0 < S <= 1). Forwarded to videocrunch.py per file.')
     return parser
 
 
@@ -383,7 +443,8 @@ def main():
     display_thread.start()
 
     # Prepare work items
-    work_items = [(f, args.port, args.audio_mode, (i % max_workers) + 1) for i, f in enumerate(files)]
+    work_items = [(f, args.port, args.audio_mode, args.min_ssim, (i % max_workers) + 1)
+                  for i, f in enumerate(files)]
 
     # Process files
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
