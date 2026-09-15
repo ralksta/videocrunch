@@ -215,6 +215,83 @@ def build_audio_filter_chain(audio_mode: str, measured: dict | None = None) -> s
 
 
 # ---------------------------------------------------------------------------
+# Stream selection
+# ---------------------------------------------------------------------------
+
+# Audio codecs the mp4 muxer can hold as-is. Apple's spatial audio
+# (apple_apac) is deliberately absent: it has neither an mp4 tag nor a
+# decoder in ffmpeg, so mapping it aborts the whole encode.
+MP4_MUXABLE_AUDIO = {
+    "aac", "ac3", "eac3", "mp3", "mp2", "alac", "flac", "opus",
+}
+
+# Text subtitle codecs that survive conversion to mov_text. Image-based subs
+# (PGS, VobSub) cannot be converted and would abort the encode.
+MOV_TEXT_SUBTITLES = {"subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text"}
+
+
+def build_stream_args(streams: list[dict], copy_audio: bool,
+                      audio_filters: str | None,
+                      decodable: set[str] | None = None) -> tuple[list[str], list[str]]:
+    """Map every usable input stream into the output, explicitly.
+
+    Without `-map`, ffmpeg keeps one video and one audio stream and silently
+    discards the rest — second language tracks, commentary, subtitles. This
+    builds the mapping instead, and returns a note for every stream it had to
+    leave behind so the loss is announced rather than hidden.
+
+    Returns (ffmpeg args, notes about skipped streams).
+
+    `decodable` is the set of codec names ffmpeg can decode here; None means
+    "assume it can". Data streams (iPhone timecode/metadata tracks) are never
+    mapped: the mp4 muxer rejects most of them.
+    """
+    args: list[str] = ["-map", "0:v:0"]
+    skipped: list[str] = []
+
+    audio = [s for s in streams if s.get("codec_type") == "audio"]
+    subs = [s for s in streams if s.get("codec_type") == "subtitle"]
+
+    mapped_audio = 0
+    for i, stream in enumerate(audio):
+        codec = str(stream.get("codec_name") or "")
+        if copy_audio:
+            usable = codec in MP4_MUXABLE_AUDIO
+            why = "mp4 cannot hold it"
+        else:
+            usable = decodable is None or codec in decodable
+            why = "no decoder available"
+        if not usable:
+            skipped.append(f"audio track {i} ({codec or 'unknown'}): {why}")
+            continue
+        args.extend(["-map", f"0:a:{i}"])
+        mapped_audio += 1
+
+    mapped_subs = 0
+    for i, stream in enumerate(subs):
+        codec = str(stream.get("codec_name") or "")
+        if codec not in MOV_TEXT_SUBTITLES:
+            skipped.append(f"subtitle track {i} ({codec or 'unknown'}): not convertible to mov_text")
+            continue
+        args.extend(["-map", f"0:s:{i}"])
+        mapped_subs += 1
+
+    if mapped_audio:
+        if copy_audio:
+            args.extend(["-c:a", "copy"])
+        else:
+            args.extend(["-c:a", "aac", "-b:a", "192k", "-ar", "48000"])
+            if audio_filters:
+                # Output stream 0, not input: the filter chain belongs to the
+                # primary track, and that is whichever track was mapped first.
+                args.extend(["-filter:a:0", audio_filters])
+    if mapped_subs:
+        args.extend(["-c:s", "mov_text"])
+
+    return (args, skipped)
+
+
+# ---------------------------------------------------------------------------
 # Scene-aware SSIM sample selection
 # ---------------------------------------------------------------------------
 

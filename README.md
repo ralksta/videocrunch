@@ -65,8 +65,12 @@ Key flags: `--codec {hevc,av1}` (default hevc), `--encoder
 (force a starting quality and search linearly from there instead of via
 binary search), `--scale-height H` (downscale before encoding), `--ss`/`--to`
 (trim), `--force` (encode even if the savings heuristic says it's not worth
-it), `--no-presearch` (skip the sample-clip pre-search, always run the full
-search on the whole file).
+it), `--min-ssim S` (move the hard quality floor for this run — fine-grained
+real footage can look perfect and still score below the default 0.940),
+`--no-presearch` (skip the sample-clip pre-search, always run the full
+search on the whole file), `--json-out PATH` (write the result as JSON — status,
+quality, SSIM, savings, in and out paths — whatever the outcome), `--replace`
+(put the result in the source's place; the original goes to the trash).
 
 ### 3. `scan.py` — rank a folder without encoding anything
 
@@ -93,7 +97,10 @@ above).
 
 `batch.py` itself (`--files a.mp4,b.mp4 --audio-mode enhanced`) runs the
 marked files in parallel with a live status table and a persistent log; you
-normally reach it through `scan.py`, not directly.
+normally reach it through `scan.py`, not directly. It also takes
+`--min-ssim S` and forwards it to every per-file encode, and reads each
+worker's verdict from its `--json-out` file rather than from its console
+output.
 
 ## How the quality search works
 
@@ -112,6 +119,12 @@ candidate pass:
    cut from the file's bitrate *hotspots* — the hardest material to compress
    — so the full-file pass only runs once the search has narrowed in).
 3. Measures **SSIM** against the source to check the pass didn't go too far.
+   Sample windows are cut by frame index, not by timestamp: a source and its
+   encode carry different timebases (an iPhone 120 fps clip 1/2400, the encode
+   1/15360) and their grids drift apart over the file, so the same timestamp
+   lands on different pictures. Comparing frame N against frame N+2 of fast
+   motion dropped a measured 0.943 to 0.716 and failed encodes that were
+   visually perfect.
 4. Compares the result's savings % and SSIM against the thresholds below,
    and narrows the search range up (more compression) or down (better
    quality) accordingly — with an early exit once a pass is already
@@ -134,6 +147,28 @@ Tune these at the top of `videocrunch.py` if your material or standards
 differ — e.g. lower `MIN_QUALITY` for casual footage where a bit more
 softness is an acceptable trade for extra savings, or raise `SSIM_MIN` if
 you're archiving something you never want visibly degraded.
+
+## When a run comes up short
+
+A run whose best encode stays under the quality floor keeps that encode as
+`<name>_rejected.mp4` and tells you what it measured and which flag would
+accept it — rather than deleting minutes of work and leaving you to guess.
+Fine-grained real footage (sand, water, film grain) routinely scores well
+below the floor while looking untouched, so this is a question only your eyes
+can settle.
+
+Interrupting a run with Ctrl-C asks whether to keep the passes that already
+finished; the next run reuses them instead of encoding them again.
+
+## What comes across into the output
+
+Every audio track, every text subtitle track, and the container metadata —
+capture date, GPS coordinates, camera model — are carried over explicitly.
+ffmpeg's default behaviour keeps one audio track and no metadata, which for a
+video library means silent data loss. Two things genuinely cannot come along:
+Apple's spatial audio (`apple_apac`, no decoder and no mp4 tag) and
+image-based subtitles (PGS/VobSub, not convertible to `mov_text`). Both are
+reported on stdout as `Stream dropped: …` rather than disappearing quietly.
 
 ## How the savings estimate works
 

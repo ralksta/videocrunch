@@ -19,9 +19,13 @@ algorithm, encoder profiles, and quality-verification machinery.
 7. [Sample-Clip Pre-Search](#sample-clip-pre-search)
 8. [HDR / 10-bit Safety](#hdr--10-bit-safety)
 9. [Two-Pass Linear Loudnorm](#two-pass-linear-loudnorm)
-10. [Output Integrity Verification](#output-integrity-verification)
-11. [Configuration Constants](#configuration-constants)
-12. [CLI Reference](#cli-reference)
+10. [Stream & Metadata Preservation](#stream--metadata-preservation)
+11. [Output Integrity Verification](#output-integrity-verification)
+12. [Replacing the Source](#replacing-the-source)
+13. [Interrupted Runs](#interrupted-runs)
+14. [Machine-Readable Result](#machine-readable-result)
+15. [Configuration Constants](#configuration-constants)
+16. [CLI Reference](#cli-reference)
 
 ---
 
@@ -139,6 +143,14 @@ every encoder.
 | ≥ `SSIM_MIN` | any | Not useful — discard, try next step |
 | < `SSIM_MIN` | any | Hard abort — rescue the best fallback if one exists |
 
+A run that ends with nothing above the floor keeps its closest miss as
+`<name>_rejected.mp4` instead of deleting it, and reports the measurement plus
+the exact flag that would accept it (`rejection_hint()`). The numbers alone
+cannot say whether an encode is usable — fine-grained real footage scores far
+below the floor while looking untouched — and re-running to find out costs as
+much as the original run did. `scan.py` skips `_rejected.mp4` files the same
+way it skips `_opt.mp4`.
+
 Without fallback tracking, a search that never clears the strict `MIN_QUALITY`
 bar fails outright and the original is kept untouched, 0 bytes saved. With
 it, the best pass that cleared `SSIM_ACCEPTABLE` is promoted instead.
@@ -154,6 +166,16 @@ along the video in a **single FFmpeg `filter_complex` pass** — trimming and
 concatenating both the source and candidate clips before comparing once,
 rather than running three separate FFmpeg processes (each of which would
 re-seek and re-decode from the start, tripling the time cost).
+
+Windows are cut by **frame index**, not by timestamp, and both branches are
+re-stamped onto one timebase (`settb=AVTB,setpts=N/fps/TB`) before the
+comparison. A time-based trim picks the first frame whose timestamp reaches
+the mark — and the two files' timestamp grids drift apart (an iPhone 120 fps
+source carries a 1/2400 timebase, the encode a 1/15360 one), so the same mark
+lands on different pictures and the filter ends up comparing frame N with
+frame N+2. On fast motion that alone dropped a measured 0.943 to 0.716 and
+failed encodes that were visually fine. When the source fps cannot be
+determined, sampling falls back to timestamp trims.
 
 ### MS-SSIM vs SSIM Auto-Detection
 
@@ -251,12 +273,120 @@ mode.
 
 ---
 
+## Stream & Metadata Preservation
+
+Left to its own devices, ffmpeg keeps one video and one audio stream and
+discards everything else, and it copies no container metadata at all. For a
+tool pointed at someone's video library that is silent data loss: second
+language tracks, commentary, subtitles, and — on phone recordings — the
+capture date, GPS coordinates and camera model.
+
+`probe_stream_inventory()` reads the source's stream list once per file, and
+`build_stream_args()` (`crunch_utils.py`) turns it into an explicit mapping:
+
+| Stream | Treatment |
+|:---|:---|
+| Video | `-map 0:v:0` |
+| Audio | every track mapped; the first gets the loudnorm chain (`-filter:a:0`), the rest are re-encoded flat. `--copy-audio` copies instead |
+| Subtitles | text-based (`subrip`, `ass`, `webvtt`, …) converted to `mov_text` |
+| Data | never mapped — the mp4 muxer rejects most of them (iPhone timecode/metadata tracks) |
+
+A track that cannot come along is **named on stdout** (`Stream dropped: …`)
+rather than vanishing. Two cases exist in practice: Apple's spatial audio
+(`apple_apac`) has neither an mp4 tag nor a decoder in ffmpeg, and image-based
+subtitles (PGS, VobSub) cannot be converted to `mov_text`. Mapping either one
+blindly aborts the whole encode, so both are skipped deliberately.
+`available_decoders()` answers the decodability question from
+`ffmpeg -decoders` at runtime instead of a hardcoded list.
+
+Container metadata is carried by `-map_metadata 0` plus
+`-movflags +use_metadata_tags`; without the latter the muxer writes only the
+handful of tags it knows and QuickTime keys are lost. The source's own
+container brands are blanked (`-metadata major_brand=` …) so they are not
+written next to the muxer's own. One cosmetic side effect remains: the
+capture date ends up in both the `mvhd` atom and a `udta` key, so
+`ffprobe -show_entries format_tags=creation_time` reports the same value
+twice, joined by a semicolon. Players read `mvhd`, Photos reads
+`com.apple.quicktime.creationdate`; both are correct.
+
+---
+
 ## Output Integrity Verification
 
 Before any staging file is promoted (`promote_staging()`), it must pass
 `verify_output_integrity()`: an ffprobe duration match within 1.5 seconds,
-plus a full error-strict video decode. This catches truncated moov atoms and
-encoder/driver corruption that 3-window SSIM sampling alone can miss.
+a full error-strict video decode, and an audio track count at least as high
+as the encode planned to carry over. This catches truncated moov atoms and
+encoder/driver corruption that 3-window SSIM sampling alone can miss — and
+stops a regression in stream mapping from quietly shipping files with tracks
+missing. The expectation comes from the mapping itself, so a deliberately
+skipped track (see above) does not count as a loss.
+
+---
+
+## Replacing the Source
+
+By default a run leaves `<name>_opt.mp4` next to the source, so a library gets
+*bigger* until someone tidies up by hand. `--replace` closes that loop: after
+the output passes `verify_output_integrity()`, the original is moved to the
+trash and the result takes its name.
+
+- **The extension follows the container.** `IMG_1438.mov` becomes
+  `IMG_1438.mp4`, because that is what the file now is. References to the old
+  name break — that is the trade the flag makes.
+- **Refused rather than guessed.** If `IMG_1438.mp4` already exists next to
+  `IMG_1438.mov`, they are two different videos; the run keeps the original
+  and says so.
+- **Never for trims or copy mode** (`should_replace()`): `--ss`/`--to` produce
+  an excerpt, and copy mode exists to produce a second file. Replacing the
+  source with either destroys what was not in the output.
+- **The trash, not `unlink()`.** The file is moved into `~/.Trash`, or into
+  the volume's own `.Trashes/<uid>` when it lives elsewhere — a rename either
+  way, so a 4K source costs nothing to trash. Asking the Finder to delete it
+  would have been shorter, but the Finder reports success even where it
+  bypasses the trash; moving the file ourselves is the only way to know where
+  it went. The cost is that macOS "Put Back" is not available for these files.
+- A failure to reach the trash leaves the original in place. "Kept" is always
+  a safe outcome; "deleted without a copy" never is.
+
+---
+
+## Interrupted Runs
+
+Each quality pass encodes to `<stem>._staging_q<N>.mp4`. Interrupting used to
+delete all of them, so a run stopped between two 4K passes paid for them again
+next time. Now Ctrl-C asks whether to keep the finished ones — but only when
+someone is at the terminal (`keep_stagings_after_abort()`); an unattended
+script that dies leaves the folder as it found it.
+
+On the next run, `reusable_staging()` checks each leftover against the full
+integrity check (duration, decode, track count). One that passes is a finished
+pass: the encode is skipped and only the quality measurement runs. A file
+killed mid-write has no moov atom — with `+delay_moov` it cannot be mistaken
+for a complete encode — and is re-encoded normally.
+
+---
+
+## Machine-Readable Result
+
+`--json-out PATH` writes one JSON object per run:
+
+```json
+{"videocrunch": 1, "results": [{"filename": "clip.mp4", "input_path": "/abs/clip.mp4",
+  "output_path": "/abs/clip_opt.mp4", "status": "success", "quality": 60,
+  "ssim": 0.996051, "saved_pct": 25.6, "saved_bytes": 514507, "duration": 2.7,
+  "reason": null, "height": 480, "source_kbps": 2678.09}]}
+```
+
+It is written whatever the outcome — `success`, `failed`, `skipped` — and the
+paths are absolute, since consumers run from their own working directory. The
+list wraps even a single file so a run over several has the same shape.
+
+`batch.py` hands every worker its own result file and takes the verdict from
+it, falling back to scraping stdout when the file is missing (an aborted
+worker leaves none). That fallback is why the shape is pinned in
+`tests/test_cli_contract.py`: output lines are human-facing and get reworded,
+which is exactly what made scraping them fragile in the first place.
 
 ---
 
@@ -269,7 +399,7 @@ All tuning constants live at the top of `videocrunch.py`:
 | `MIN_SAVINGS` | `20.0` | Minimum % savings a pass must hit to be accepted |
 | `MIN_QUALITY` | `0.960` | Minimum SSIM for a strict accept |
 | `SSIM_ACCEPTABLE` | `0.945` | SSIM floor for a fallback accept |
-| `SSIM_MIN` | `0.940` | Hard lower bound — reject below this regardless of savings |
+| `SSIM_MIN` | `0.940` | Hard lower bound — reject below this regardless of savings (`--min-ssim` overrides per run) |
 | `SAMPLE_DURATION` | `3` | Seconds per sample window for SSIM |
 | `EXCELLENT_SAVINGS_PCT` | `50.0` | Early-exit threshold in the binary search |
 | `EARLY_ABORT_RATIO` | `0.95` | Abort mid-encode once output reaches this fraction of source size |
@@ -293,6 +423,7 @@ usage: videocrunch.py [-h]
                        [--to TO] [--video-mode {compress,copy}] [--q Q]
                        [--scale-height H] [--port PORT]
                        [--preset {fast,balanced,best}] [--force]
+                       [--min-ssim S] [--replace] [--json-out PATH]
                        [--no-presearch]
                        [files ...]
 ```
@@ -311,6 +442,9 @@ usage: videocrunch.py [-h]
 | `--port PORT` | Notify a companion server on this port when a file is done, via `GET /api/mark_optimized?path=<path>` |
 | `--preset {fast,balanced,best}` | Encoder-specific speed/quality preset |
 | `--force` | Encode even when `savings.py` predicts it isn't worth it |
+| `--min-ssim S` | Move the hard quality floor for this run (0 < S ≤ 1, default `SSIM_MIN`); `batch.py` accepts it too and forwards it per file |
+| `--replace` | Put the result in the source's place; the original goes to the trash |
+| `--json-out PATH` | Write the run's machine-readable result to PATH (see below) |
 | `--no-presearch` | Always run the full search on the whole file |
 
 Examples:

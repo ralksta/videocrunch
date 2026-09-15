@@ -7,6 +7,7 @@ New in V2.4: Bitrate analyzer integration ensures output never exceeds source bi
 """
 import argparse
 import json
+import math
 import os
 import queue
 import re
@@ -27,6 +28,7 @@ from crunch_utils import (
     append_encode_history,
     apply_hdr_adjustments,
     build_audio_filter_chain,
+    build_stream_args,
     clamp_maxrate_to_pass,
     is_hdr_or_10bit,
     narrow_quality_window,
@@ -287,6 +289,8 @@ batch_stats = {
 # --- LAST ENCODE RESULT (for logging) ---
 last_encode_result = {
     'filename': None,
+    'input_path': None,
+    'output_path': None,
     'status': None,
     'quality': None,
     'ssim': None,
@@ -342,7 +346,7 @@ def get_video_info(file_path: Path) -> Optional[Dict[str, Any]]:
     """Get video duration and stream info using ffprobe."""
     cmd = [
         'ffprobe', '-v', 'error',
-        '-show_entries', 'format=duration:stream=codec_type,width,height,codec_name,r_frame_rate,pix_fmt,color_transfer,color_primaries',
+        '-show_entries', 'format=duration:stream=codec_type,width,height,codec_name,r_frame_rate,pix_fmt,color_transfer,color_primaries:stream_tags=rotate:stream_side_data=rotation',
         '-of', 'json', str(file_path)
     ]
     try:
@@ -356,6 +360,28 @@ def get_video_info(file_path: Path) -> Optional[Dict[str, Any]]:
         height = int(video_stream.get('height', 0))
         codec = video_stream.get('codec_name', 'unknown')
         fps = video_stream.get('r_frame_rate', '0/0')
+
+        # Determine rotation (from side_data or stream tags)
+        rotation = 0
+        for sd in video_stream.get('side_data_list', []):
+            if 'rotation' in sd:
+                try:
+                    rotation = int(float(sd['rotation']))
+                    break
+                except (ValueError, TypeError):
+                    pass
+        if not rotation:
+            rot_tag = video_stream.get('tags', {}).get('rotate')
+            if rot_tag:
+                try:
+                    rotation = int(float(rot_tag))
+                except (ValueError, TypeError):
+                    pass
+
+        # Normalize rotation angle to [0, 360)
+        norm_rotation = abs(rotation) % 360
+        if norm_rotation in (90, 270):
+            width, height = height, width
 
         if '/' in fps:
             n, d = map(int, fps.split('/'))
@@ -372,16 +398,22 @@ def get_video_info(file_path: Path) -> Optional[Dict[str, Any]]:
             'pix_fmt': video_stream.get('pix_fmt', ''),
             'color_transfer': video_stream.get('color_transfer', ''),
             'color_primaries': video_stream.get('color_primaries', ''),
+            'rotation': rotation,
         }
     except (subprocess.CalledProcessError, json.JSONDecodeError, ValueError, OSError) as e:
         print(f"{R}Error probing {file_path}: {e}{NC}")
         return None
 
-def verify_output_integrity(path: Path, expected_duration: float, tolerance: float = 1.5) -> Tuple[bool, str]:
+def verify_output_integrity(path: Path, expected_duration: float, tolerance: float = 1.5,
+                            expected_audio: Optional[int] = None) -> Tuple[bool, str]:
     """Cheap insurance before the atomic replace: correct duration + clean decode.
 
     Protects against truncated moov atoms and encoder/driver hiccups that SSIM
     sampling can miss (it only looks at 3 short windows).
+
+    expected_audio: how many audio tracks the encode planned to carry over. An
+    output with fewer lost tracks on the way — duration and decode alone would
+    wave that through, which is how the loss went unnoticed before.
     """
     try:
         probe = subprocess.run(
@@ -394,6 +426,11 @@ def verify_output_integrity(path: Path, expected_duration: float, tolerance: flo
         return (False, f"ffprobe failed: {e}")
     if expected_duration > 0 and abs(out_duration - expected_duration) > tolerance:
         return (False, f"duration mismatch: {out_duration:.1f}s vs expected {expected_duration:.1f}s")
+    if expected_audio is not None:
+        found = sum(1 for st in probe_stream_inventory(path)
+                    if st.get('codec_type') == 'audio')
+        if found < expected_audio:
+            return (False, f"audio tracks missing: {found} of {expected_audio}")
     try:
         decode = subprocess.run(
             ['ffmpeg', '-v', 'error', '-xerror', '-i', str(path),
@@ -407,14 +444,56 @@ def verify_output_integrity(path: Path, expected_duration: float, tolerance: flo
     return (True, "ok")
 
 
-def promote_staging(staging: Path, output_path: Path, expected_duration: float) -> bool:
+def keep_stagings_after_abort(stagings: list, is_interactive: bool, ask=None) -> bool:
+    """Whether an interrupted run should leave its finished passes on disk.
+
+    Only ever asked when someone is at the terminal to answer: an unattended
+    script that dies should leave the folder as it found it, not scatter
+    hundreds of megabytes of staging files nobody expects. No answer — closed
+    stdin, a second Ctrl-C — means clean up.
+    """
+    if not stagings or not is_interactive:
+        return False
+    print(f"{Y}   {len(stagings)} finished pass(es) on disk. "
+          f"Keep them so the next run can reuse them? [j/N]: {NC}", end='', flush=True)
+    try:
+        answer = (ask or input)()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return str(answer).strip().lower() in ('j', 'y')
+
+
+def reusable_staging(path: Path, expected_duration: float,
+                     expected_audio: Optional[int] = None) -> bool:
+    """Whether a leftover staging file is a finished pass worth reusing.
+
+    An interrupted run leaves the passes it already completed on disk; at
+    minutes per 4K pass, re-encoding them is the most expensive thing the tool
+    can do for nothing. A half-written file must never qualify: with
+    `+delay_moov` it has no moov atom, and judging it would compare a fraction
+    of the video against the whole source.
+    """
+    path = Path(path)
+    try:
+        if not path.is_file() or path.stat().st_size == 0:
+            return False
+    except OSError:
+        return False
+    ok, _reason = verify_output_integrity(path, expected_duration,
+                                          expected_audio=expected_audio)
+    return ok
+
+
+def promote_staging(staging: Path, output_path: Path, expected_duration: float,
+                    expected_audio: Optional[int] = None) -> bool:
     """Verify a staging file end-to-end, then atomically promote it.
 
     Returns False (staging deleted) if the file fails integrity checks —
     the original must never be replaced by a corrupt encode.
     """
     print(f" {Y}-> Verifying output integrity...{NC}", end='', flush=True)
-    ok, reason = verify_output_integrity(staging, expected_duration)
+    ok, reason = verify_output_integrity(staging, expected_duration,
+                                         expected_audio=expected_audio)
     if not ok:
         print(f"\r\033[2K {R}-> Output failed integrity check: {reason}. Discarding.{NC}")
         try:
@@ -489,12 +568,30 @@ def get_multi_ssim(
 
     ref_scale = f",scale={int(ref_size[0])}:{int(ref_size[1])}:flags=bicubic" if ref_size else ""
 
+    # Frame-accurate sampling. A time-based trim picks the first frame whose
+    # timestamp reaches the mark — and the two files' timestamp grids drift
+    # apart (iPhone 120 fps: 1/2400 source timebase vs. 1/15360 in the encode),
+    # so the same mark lands on different pictures. Selecting by frame index
+    # and re-stamping both branches onto one timebase makes the filter compare
+    # frame N with frame N. Falls back to time trims when fps is unknown.
+    src_info = get_video_info(original)
+    fps = (src_info or {}).get('fps') or 0
+
+    def _seg(stream: int, start: float, tail: str, label: str) -> str:
+        if fps > 0:
+            sf = int(round(start * fps))
+            ef = sf + int(round(duration * fps))
+            cut = f"trim=start_frame={sf}:end_frame={ef},settb=AVTB,setpts=N/{fps}/TB"
+        else:
+            cut = f"trim=start={start:.3f}:end={start + duration:.3f},setpts=PTS-STARTPTS"
+        return f"[{stream}:v]{cut}{tail}[{label}]"
+
     # Build filter_complex: trim segments, concat pairs, compare once
     fc: list = []
     for i, s in enumerate(orig_starts):
-        fc.append(f"[0:v]trim=start={s:.3f}:end={s + duration:.3f},setpts=PTS-STARTPTS{ref_scale}[oa{i}]")
+        fc.append(_seg(0, s, ref_scale, f"oa{i}"))
     for i, s in enumerate(opt_starts):
-        fc.append(f"[1:v]trim=start={s:.3f}:end={s + duration:.3f},setpts=PTS-STARTPTS[na{i}]")
+        fc.append(_seg(1, s, "", f"na{i}"))
     fc.append(''.join(f'[oa{i}]' for i in range(n)) + f"concat=n={n}:v=1:a=0[ocat]")
     fc.append(''.join(f'[na{i}]' for i in range(n)) + f"concat=n={n}:v=1:a=0[ncat]")
     fc.append(f"[ocat][ncat]{quality_filter}")
@@ -697,6 +794,42 @@ def apply_scale_to_filter(video_filter: str, target_height: int) -> str:
     return re.sub(r'(^|,)scale=[^,]+', rf'\g<1>scale=-2:{h}', video_filter, count=1)
 
 
+def probe_stream_inventory(path) -> list:
+    """Every stream of a file as {codec_type, codec_name}, in container order."""
+    try:
+        result = subprocess.run(
+            ['ffprobe', '-v', 'error', '-show_entries', 'stream=codec_type,codec_name',
+             '-of', 'json', str(path)],
+            capture_output=True, text=True, check=True, timeout=60,
+        )
+        return json.loads(result.stdout).get('streams', [])
+    except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
+        return []
+
+
+_DECODERS: Optional[set] = None
+
+
+def available_decoders() -> set:
+    """Codec names this ffmpeg build can decode (cached once per run)."""
+    global _DECODERS
+    if _DECODERS is not None:
+        return _DECODERS
+    names = set()
+    try:
+        result = subprocess.run(['ffmpeg', '-hide_banner', '-decoders'],
+                                capture_output=True, text=True, timeout=10)
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            # " V....D hevc   HEVC (High Efficiency Video Coding)"
+            if len(parts) >= 2 and len(parts[0]) == 6 and parts[0][0] in 'VAS':
+                names.add(parts[1])
+    except (subprocess.SubprocessError, OSError):
+        pass
+    _DECODERS = names
+    return names
+
+
 def probe_ref_size(path) -> Optional[Tuple[int, int]]:
     """Actual (width, height) of an encoded file — used to match the SSIM reference."""
     out_info = get_video_info(path)
@@ -705,7 +838,7 @@ def probe_ref_size(path) -> Optional[Tuple[int, int]]:
     return (out_info['width'], out_info['height'])
 
 
-def build_ffmpeg_command(input_path, output_path, profile, quality_value, copy_audio=False, audio_mode='enhanced', ss=None, to=None, video_mode='compress', maxrate_kbps=None, bufsize_kbps=None, target_bitrate_kbps=None, color_args=None, loudnorm_measured=None, scale_height=None):
+def build_ffmpeg_command(input_path, output_path, profile, quality_value, copy_audio=False, audio_mode='enhanced', ss=None, to=None, video_mode='compress', maxrate_kbps=None, bufsize_kbps=None, target_bitrate_kbps=None, color_args=None, loudnorm_measured=None, scale_height=None, streams=None):
     """Build the ffmpeg command based on encoder profile.
 
     Args:
@@ -718,6 +851,9 @@ def build_ffmpeg_command(input_path, output_path, profile, quality_value, copy_a
         color_args: Optional color metadata args (HDR passthrough). Default: BT.709 trio.
         scale_height: Optional target height; the encode is downscaled to it while
             keeping the source aspect ratio (width = -2).
+        streams: Optional stream inventory (probe_stream_inventory). Given one,
+            every usable track is mapped explicitly instead of letting ffmpeg
+            keep just one audio stream and drop the rest.
     """
     cmd = ['ffmpeg', '-y']
 
@@ -772,23 +908,22 @@ def build_ffmpeg_command(input_path, output_path, profile, quality_value, copy_a
     # Audio settings
     # moderate = -19 LUFS (gentle midpoint), enhanced = -16 LUFS (streaming target).
     # With a loudness measurement (two-pass), loudnorm runs in linear mode.
-    if copy_audio:
+    audio_filters = None
+    if not copy_audio:
+        audio_filters = build_audio_filter_chain(audio_mode, measured=loudnorm_measured)
+
+    if streams:
+        # Explicit mapping: keep every usable track, not just the one ffmpeg
+        # would pick by default.
+        stream_args, _ = build_stream_args(streams, copy_audio, audio_filters,
+                                           decodable=available_decoders())
+        cmd.extend(stream_args)
+    elif copy_audio:
         cmd.extend(['-c:a', 'copy'])
     else:
-        if OPTIMIZER_UTILS_AVAILABLE:
-            audio_filters = build_audio_filter_chain(audio_mode, measured=loudnorm_measured)
-        elif audio_mode == 'standard':
-            audio_filters = None
-        else:
-            target_i = -19 if audio_mode == 'moderate' else -16
-            audio_filters = ('aformat=channel_layouts=stereo,highpass=f=100,'
-                             'agate=threshold=-55dB:range=0.05:ratio=2,'
-                             f'loudnorm=I={target_i}:TP=-1.5:LRA=11')
+        cmd.extend(['-c:a', 'aac', '-b:a', '192k', '-ar', '48000'])
         if audio_filters:
-            cmd.extend(['-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-af', audio_filters])
-        else:
-            # Standard AAC re-encode without normalization (flat)
-            cmd.extend(['-c:a', 'aac', '-b:a', '192k', '-ar', '48000'])
+            cmd.extend(['-af', audio_filters])
 
     codec_name = profile.get('codec', '')
     is_av1 = 'av1' in codec_name
@@ -797,8 +932,19 @@ def build_ffmpeg_command(input_path, output_path, profile, quality_value, copy_a
 
     cmd.extend([
         '-tag:v', tag,
-        '-movflags', '+faststart+delay_moov',  # delay_moov: prevents partial/corrupt moov on aborted encodes
+        # delay_moov: prevents partial/corrupt moov on aborted encodes.
+        # use_metadata_tags: carries QuickTime keys (GPS, capture date with
+        # timezone, camera model) through — without it the mp4 muxer writes
+        # only the handful of tags it knows and an iPhone clip loses where and
+        # when it was shot.
+        '-movflags', '+faststart+delay_moov+use_metadata_tags',
         '-fps_mode', 'vfr',                    # Preserve source timestamps; no dup/drop (any VFR source)
+        '-map_metadata', '0',                  # Container metadata is NOT copied by default
+        # The source's own container brands would otherwise be written next to
+        # the muxer's, producing 'isom;qt  ' style values.
+        '-metadata', 'major_brand=',
+        '-metadata', 'minor_version=',
+        '-metadata', 'compatible_brands=',
     ])
     if video_mode != 'copy':
         # Explicit color metadata - ensures correct rendering in browsers/players.
@@ -871,7 +1017,8 @@ def extract_probe_clip(input_path, sample_starts, segment_sec, work_dir):
 
 def estimate_optimal_q(input_path, profile, quality_values, bitrate_values,
                        sample_starts, audio_mode, work_dir, scale_height=None,
-                       source_avg_kbps=None, maxrate_kbps=None, bufsize_kbps=None):
+                       source_avg_kbps=None, maxrate_kbps=None, bufsize_kbps=None,
+                       min_ssim=SSIM_MIN):
     """Binary-search Q on a short probe clip instead of the full file.
 
     Full-file binary search encodes the whole video per pass; probing on a
@@ -948,7 +1095,7 @@ def estimate_optimal_q(input_path, profile, quality_values, bitrate_values,
                 out.unlink()
             except OSError:
                 pass
-            if ssim >= SSIM_MIN and size_ok:
+            if ssim >= min_ssim and size_ok:
                 best_q = q          # passes -> try more compression
                 low = mid + 1
             else:
@@ -968,7 +1115,120 @@ def estimate_optimal_q(input_path, profile, quality_values, bitrate_values,
             except OSError:
                 pass
 
-def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None, audio_mode='enhanced', ss=None, to=None, video_mode='compress', q_override=None, presearch=True, scale_height=None, force=False, progress_callback=None):
+def should_replace(replace: bool, video_mode: str, is_trim: bool) -> bool:
+    """Whether this run may put its result in the source's place.
+
+    Only a plain re-encode produces the same video in a smaller file. A trim
+    is an excerpt and copy mode exists to produce a second file — replacing
+    the source with either destroys what was not in the output.
+    """
+    return bool(replace) and video_mode == 'compress' and not is_trim
+
+
+def plan_replacement(original: Path) -> Tuple[Optional[Path], Optional[str]]:
+    """Where the finished encode would live if it replaced its source.
+
+    The output is always mp4, so a `.mov` source is replaced by a `.mp4` file
+    of the same stem. Returns (None, reason) when that name is already taken
+    by a different file — `IMG_1438.mov` and `IMG_1438.mp4` side by side are
+    two different videos, and replacing one must not destroy the other.
+    """
+    original = Path(original)
+    target = original.with_suffix('.mp4')
+    if target != original and target.exists():
+        return (None, f"{target.name} already exists and is a different file")
+    return (target, None)
+
+
+def trash_root_for(path: Path) -> Optional[Path]:
+    """The trash directory that serves this file's volume, or None.
+
+    Files on the home volume go to ~/.Trash; files elsewhere go to that
+    volume's own .Trashes/<uid>, which is what the Finder uses too. Both are a
+    rename away, so moving a large file costs nothing — copying it across a
+    volume boundary to ~/.Trash would take minutes for a 4K source.
+    """
+    home_trash = Path.home() / '.Trash'
+    try:
+        if not home_trash.is_dir():
+            return None
+        if path.stat().st_dev == home_trash.stat().st_dev:
+            return home_trash
+    except OSError:
+        return None
+    # Different volume: walk up to its mount point and use its own trash.
+    try:
+        current = path.resolve()
+        while current != current.parent and current.stat().st_dev == path.stat().st_dev:
+            current = current.parent
+        volume_trash = current / '.Trashes' / str(os.getuid())
+        volume_trash.mkdir(parents=True, exist_ok=True)
+        return volume_trash
+    except OSError:
+        return None
+
+
+def move_to_trash(path: Path, trash_root: Optional[Path] = None) -> Optional[Path]:
+    """Move a file into the trash; return where it landed, or None on failure.
+
+    Done by hand rather than through the Finder: asking the Finder to delete a
+    file reports success even when it bypasses the trash and deletes outright
+    (it does exactly that for files under /private/tmp, among others). A
+    failure here must leave the original in place — "kept" is always a safe
+    outcome, "deleted without a copy" never is.
+    """
+    path = Path(path)
+    root = Path(trash_root) if trash_root is not None else trash_root_for(path)
+    if root is None or not root.is_dir():
+        return None
+    target = root / path.name
+    counter = 1
+    while target.exists():
+        target = root / f"{path.stem} {counter}{path.suffix}"
+        counter += 1
+    try:
+        path.rename(target)
+    except OSError:
+        return None
+    return target
+
+
+def suggested_floor(score: float) -> float:
+    """A floor the measured score would clear, rounded DOWN to two decimals.
+
+    Rounding up would send the user into a second run that fails exactly like
+    the first — the suggestion has to be a value the result already beats.
+    """
+    return math.floor(score * 100) / 100
+
+
+def rejection_hint(quality: int, ssim: float, floor: float,
+                   saved_pct: float, path: Path) -> str:
+    """What to tell someone whose encode came in under the quality floor.
+
+    Names the measurement, the file it is kept in, and the exact command that
+    accepts it — the run already cost minutes; learning its outcome should not
+    cost another one.
+    """
+    return (f"Best result: Q={quality}, {saved_pct:.1f}% saved, "
+            f"{_detect_quality_filter().upper()} {ssim:.4f} (floor {floor:.3f}).\n"
+            f"   Kept for inspection: {path.name}\n"
+            f"   Accept it with: --min-ssim {suggested_floor(ssim):.2f}")
+
+
+def retention_floor(min_ssim: Optional[float]) -> float:
+    """Lowest score a pass may have and still be kept as a fallback result.
+
+    Without an override the linear search keeps only passes clearing
+    SSIM_ACCEPTABLE. An explicit --min-ssim replaces that tuning: the user
+    moved the hard floor, so passes down to the new floor must stay eligible.
+    Otherwise lowering the floor deletes exactly the passes it was meant to
+    rescue — they now clear the floor, so the interactive rescue never fires.
+    """
+    return min_ssim if min_ssim else SSIM_ACCEPTABLE
+
+
+def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None, audio_mode='enhanced', ss=None, to=None, video_mode='compress', q_override=None, presearch=True, scale_height=None, force=False, min_ssim=None, replace=False, progress_callback=None):
     """Process a single video file. Returns (success, bytes_saved).
 
     `progress_callback(done_seconds, total_seconds, label)` is called while
@@ -980,6 +1240,14 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
     """
     input_path = Path(input_path)
     is_trim = ss is not None or to is not None
+    # Absolute: consumers of the result file run from their own working
+    # directory, where a relative path points at nothing.
+    last_encode_result['input_path'] = str(input_path.resolve())
+    last_encode_result['output_path'] = None
+    # Hard quality floor for this run: the caller's override, else the
+    # built-in default (see --min-ssim).
+    ssim_min = min_ssim or SSIM_MIN
+    fallback_floor = retention_floor(min_ssim)
 
     if not input_path.exists():
         return (False, 0)
@@ -1013,7 +1281,10 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
             last_encode_result['status'] = 'skipped'
             last_encode_result['reason'] = 'Output file already exists'
             last_encode_result['duration'] = 0
+            last_encode_result['output_path'] = str(output_path.resolve())
             return (False, 0)
+
+    last_encode_result['output_path'] = str(output_path.resolve())
 
     size_before = input_path.stat().st_size
     size_mb = size_before / (1024 * 1024)
@@ -1082,6 +1353,21 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
             return (False, 0)
         profile = hdr_profile
         print(f"{Y}HDR/10-bit source:{NC} main10 encode with color passthrough ({info.get('color_transfer') or '10-bit SDR'})")
+
+    # --- STREAM INVENTORY ---
+    # Probed once per file: every usable track is mapped explicitly, and
+    # anything that cannot come along is named rather than dropped in silence.
+    # audio_filters plays no part in the skip decision, so passing None here
+    # yields exactly the notes the real encode produces.
+    source_streams = probe_stream_inventory(input_path)
+    _stream_map, skipped_streams = build_stream_args(source_streams, copy_audio, None,
+                                                     decodable=available_decoders())
+    for note in skipped_streams:
+        print(f"{Y}Stream dropped:{NC} {note}")
+    # What the integrity check holds the finished file to — derived from the
+    # same plan that drives the encode, so a deliberately skipped track is not
+    # counted as a loss.
+    expected_audio_tracks = sum(1 for a in _stream_map if a.startswith('0:a:'))
 
     # --- BITRATE ANALYSIS for maxrate caps ---
     maxrate_kbps = None
@@ -1265,7 +1551,7 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
         print(f"{BG}>>> COPY MODE: Skipping re-encode logic.{NC}")
         file_start_time = time.time()
 
-        cmd = build_ffmpeg_command(input_path, output_path, profile, quality, copy_audio, audio_mode, ss, to, video_mode='copy')
+        cmd = build_ffmpeg_command(input_path, output_path, profile, quality, copy_audio, audio_mode, ss, to, video_mode='copy', streams=source_streams)
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
         # Simple progress loop (copy/trim tends to be fast but we still want feedback)
@@ -1356,6 +1642,33 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
             except OSError:
                 pass
 
+    def _replace_source_if_asked():
+        """Put the finished encode in the source's place, if this run may.
+
+        Runs only after promote_staging() verified the output, so the source
+        is never traded for a file that failed its integrity check. The
+        original goes to the trash, not to unlink(): this is the one step the
+        tool cannot undo by itself.
+        """
+        if not should_replace(replace, video_mode, is_trim):
+            return
+        target, reason = plan_replacement(input_path)
+        if target is None:
+            print(f"{Y}Kept original:{NC} {reason}")
+            return
+        trashed = move_to_trash(input_path)
+        if trashed is None:
+            print(f"{Y}Kept original:{NC} could not move {input_path.name} to the trash")
+            return
+        try:
+            output_path.rename(target)
+        except OSError as e:
+            print(f"{R}Replacement failed after trashing the original: {e}{NC}")
+            return
+        last_encode_result['output_path'] = str(target.resolve())
+        print(f"{G}Replaced:{NC} {input_path.name} → {target.name} "
+              f"(original moved to {trashed.parent})")
+
     # Shared failure path when a finished encode fails the integrity check
     def _fail_integrity():
         _cleanup_staging()
@@ -1368,6 +1681,47 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
         return (False, 0)
 
     # Helper function to run a single encode pass
+    def _evaluate_pass(effective_out, quality_val):
+        """Judge a finished encode: size first, then quality on the samples.
+
+        Split out from the encode so a pass left behind by an interrupted run
+        can be judged without encoding it again.
+        """
+        size_after = effective_out.stat().st_size
+
+        if size_after >= size_to_compare:
+            print(f" {R}-> File larger ({format_size(size_after)} > {format_size(size_to_compare)}).{NC}")
+            if effective_out != output_path and effective_out.exists():
+                effective_out.unlink()
+            return (False, size_after, 0, 'too_large')
+
+        # Early savings check: skip SSIM if compression is not worth it
+        saved_bytes_pre = size_to_compare - size_after
+        saved_pct_pre = saved_bytes_pre * 100 / size_to_compare
+        MIN_SAVINGS_FOR_SSIM = 10.0  # Only run SSIM if we saved at least 10%
+        if saved_pct_pre < MIN_SAVINGS_FOR_SSIM:
+            print(f" {Y}-> Saved only {saved_pct_pre:.2f}% – skipping SSIM (below {MIN_SAVINGS_FOR_SSIM:.0f}% threshold). Not optimal.{NC}")
+            if effective_out != output_path and effective_out.exists():
+                effective_out.unlink()
+            return (False, size_after, 0.0, 'poor_savings')
+
+        # Quality verification: single ffmpeg pass over the pre-computed
+        # sample windows (scene-aware hotspots, or 25/50/75% fallback)
+        opt_starts = sample_starts
+        orig_starts = [start_offset + s for s in opt_starts]
+
+        ssim = get_multi_ssim(
+            input_path, effective_out, orig_starts, opt_starts, SAMPLE_DURATION,
+            ref_size=probe_ref_size(effective_out) if scale_height else None,
+        )
+        quality_label = _detect_quality_filter().upper()
+
+        saved_bytes = size_to_compare - size_after
+        saved_pct = saved_bytes * 100 / size_to_compare
+        print(f" {G}-> Result:{NC} Q={quality_val} | Saved: {saved_pct:.2f}% | {quality_label}: {ssim:.4f}")
+
+        return (True, size_after, ssim, None)
+
     def run_encode_pass(quality_val, out_path=None, target_bitrate_kbps=None):
         """Run a single encode pass and return (success, size_after, ssim, error_reason, overshoot_ratio)."""
         effective_out = out_path or output_path
@@ -1379,9 +1733,14 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
             maxrate_kbps, bufsize_kbps, target_bitrate_kbps)
         br_info = f", target={target_bitrate_kbps:.0f}k" if target_bitrate_kbps else ""
         maxrate_info = f" (maxrate={pass_maxrate:.0f}k{br_info})" if pass_maxrate else (f" (target={target_bitrate_kbps:.0f}k)" if target_bitrate_kbps else "")
+        if reusable_staging(effective_out, expected_out_duration, expected_audio_tracks):
+            print(f"{G}Pass:{NC} Q={quality_val} — reusing the finished encode "
+                  f"an interrupted run left behind")
+            return _evaluate_pass(effective_out, quality_val)
+
         print(f"{G}Pass:{NC} Q={quality_val}{maxrate_info}")
 
-        cmd = build_ffmpeg_command(input_path, effective_out, profile, quality_val, copy_audio, audio_mode, ss, to, video_mode='compress', maxrate_kbps=pass_maxrate, bufsize_kbps=pass_bufsize, target_bitrate_kbps=target_bitrate_kbps, color_args=profile.get('color_args'), loudnorm_measured=loudnorm_measured, scale_height=scale_height)
+        cmd = build_ffmpeg_command(input_path, effective_out, profile, quality_val, copy_audio, audio_mode, ss, to, video_mode='compress', maxrate_kbps=pass_maxrate, bufsize_kbps=pass_bufsize, target_bitrate_kbps=target_bitrate_kbps, color_args=profile.get('color_args'), loudnorm_measured=loudnorm_measured, scale_height=scale_height, streams=source_streams)
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
         cur_stats = {"bitrate": "0kb/s", "speed": "0x"}
@@ -1503,48 +1862,55 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
                     effective_out.unlink()
                 return (False, 0, 0, 'ffmpeg_error')
 
-            size_after = effective_out.stat().st_size
-
-            if size_after >= size_to_compare:
-                print(f" {R}-> File larger ({format_size(size_after)} > {format_size(size_to_compare)}).{NC}")
-                if effective_out != output_path and effective_out.exists():
-                    effective_out.unlink()
-                return (False, size_after, 0, 'too_large')
-
-            # Early savings check: skip SSIM if compression is not worth it
-            saved_bytes_pre = size_to_compare - size_after
-            saved_pct_pre = saved_bytes_pre * 100 / size_to_compare
-            MIN_SAVINGS_FOR_SSIM = 10.0  # Only run SSIM if we saved at least 10%
-            if saved_pct_pre < MIN_SAVINGS_FOR_SSIM:
-                print(f" {Y}-> Saved only {saved_pct_pre:.2f}% – skipping SSIM (below {MIN_SAVINGS_FOR_SSIM:.0f}% threshold). Not optimal.{NC}")
-                if effective_out != output_path and effective_out.exists():
-                    effective_out.unlink()
-                return (False, size_after, 0.0, 'poor_savings')
-
-            # Quality verification: single ffmpeg pass over the pre-computed
-            # sample windows (scene-aware hotspots, or 25/50/75% fallback)
-            opt_starts = sample_starts
-            orig_starts = [start_offset + s for s in opt_starts]
-
-            ssim = get_multi_ssim(
-                input_path, effective_out, orig_starts, opt_starts, SAMPLE_DURATION,
-                ref_size=probe_ref_size(effective_out) if scale_height else None,
-            )
-            quality_label = _detect_quality_filter().upper()
-
-            saved_bytes = size_to_compare - size_after
-            saved_pct = saved_bytes * 100 / size_to_compare
-            print(f" {G}-> Result:{NC} Q={quality_val} | Saved: {saved_pct:.2f}% | {quality_label}: {ssim:.4f}")
-
-            return (True, size_after, ssim, None)
+            return _evaluate_pass(effective_out, quality_val)
 
         except KeyboardInterrupt:
-            print(f"\n{R}>>> Abort. Cleaning up...{NC}")
+            print(f"\n{R}>>> Abort.{NC}")
             process.terminate()
+            # This pass died mid-write and is unusable whatever the answer.
             if effective_out.exists():
                 effective_out.unlink()
-            _cleanup_staging()
+            finished = [p for p in output_path.parent.glob(
+                f"{output_path.stem}._staging_q*{output_path.suffix}")]
+            if keep_stagings_after_abort(finished, sys.stdin.isatty()):
+                print(f"{Y}   Kept for the next run: {len(finished)} file(s) "
+                      f"next to {output_path.name}{NC}")
+            else:
+                _cleanup_staging()
             sys.exit(1)
+
+    # The best pass that came in UNDER the quality floor. A failed run keeps
+    # it instead of deleting minutes of encoding: the numbers alone cannot say
+    # whether the result is usable, and re-running to look at it costs as much
+    # as the original run did.
+    best_rejected = None          # (quality, ssim, saved_pct)
+    best_rejected_path: 'Path | None' = None
+
+    def _remember_rejected(quality_val, ssim_val, saved_pct_val, staging_path):
+        """Keep this pass if it is the closest miss so far; drop it otherwise."""
+        nonlocal best_rejected, best_rejected_path
+        if best_rejected is None or ssim_val > best_rejected[1]:
+            if best_rejected_path and best_rejected_path != staging_path and best_rejected_path.exists():
+                best_rejected_path.unlink()
+            best_rejected = (quality_val, ssim_val, saved_pct_val)
+            best_rejected_path = staging_path
+        elif staging_path.exists():
+            staging_path.unlink()
+
+    def _keep_rejected_for_inspection() -> Optional[str]:
+        """Promote the closest miss to <stem>_rejected.mp4; return how to accept it.
+
+        The hint is returned rather than printed so the caller can put it
+        AFTER the verdict — the outcome comes first, then what to do about it.
+        """
+        if not (best_rejected and best_rejected_path and best_rejected_path.exists()):
+            return None
+        keep_path = output_path.with_name(f"{input_path.stem}_rejected.mp4")
+        _q, _ssim, _saved = best_rejected
+        if not promote_staging(best_rejected_path, keep_path, expected_out_duration,
+                               expected_audio_tracks):
+            return None
+        return rejection_hint(_q, _ssim, ssim_min, _saved, keep_path)
 
     # Binary search for optimal quality
     if use_binary_search and len(quality_values) > 1:
@@ -1563,7 +1929,8 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
                 input_path, profile, quality_values, bitrate_values,
                 sample_starts, audio_mode, input_path.parent, scale_height=scale_height,
                 source_avg_kbps=_source_avg_kbps,
-                maxrate_kbps=maxrate_kbps, bufsize_kbps=bufsize_kbps)
+                maxrate_kbps=maxrate_kbps, bufsize_kbps=bufsize_kbps,
+                min_ssim=ssim_min)
             if predicted_q is not None:
                 idx = nearest_quality_index(quality_values, predicted_q)
                 low, high = narrow_quality_window(len(quality_values), idx, radius=1)
@@ -1654,12 +2021,13 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
                 continue
 
             # Check SSIM threshold
-            if ssim < SSIM_MIN:
+            if ssim < ssim_min:
                 print(f" {R}   -> Quality too low for this level.{NC}")
                 # Need better quality (less compression) → move towards index 0 (best quality).
                 high = mid - 1
-                if staging.exists():
-                    staging.unlink()
+                _saved_pct_rejected = ((size_to_compare - size_after) * 100 / size_to_compare
+                                       if size_to_compare else 0.0)
+                _remember_rejected(quality, ssim, _saved_pct_rejected, staging)
                 continue
 
             saved_bytes = size_to_compare - size_after
@@ -1677,7 +2045,7 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
             # deleted and the whole file reported as failed.
             # Ranking still PREFERS results clearing SSIM_ACCEPTABLE; the dead
             # zone only wins when nothing better exists.
-            if ssim >= SSIM_MIN and saved_pct > 0:
+            if ssim >= ssim_min and saved_pct > 0:
                 _rank = (ssim >= SSIM_ACCEPTABLE, saved_pct)
                 _best_rank = ((best_acceptable[2] >= SSIM_ACCEPTABLE, best_acceptable[4])
                               if best_acceptable else None)
@@ -1735,8 +2103,9 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
                 print(f"\n{BG}>>> Finalizing: re-using cached encode Q={quality}{NC}")
 
             # Promote staging file to final output path (no re-encode!)
-            if not promote_staging(final_path, output_path, expected_out_duration):
+            if not promote_staging(final_path, output_path, expected_out_duration, expected_audio_tracks):
                 return _fail_integrity()
+            _replace_source_if_asked()
 
             # Clean up any remaining staging files
             _cleanup_staging()
@@ -1761,7 +2130,8 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
 
             return (True, saved_bytes)
 
-        # Binary search found nothing usable – clean up any staging leftovers
+        # Binary search found nothing usable — keep the closest miss, then sweep
+        _hint = _keep_rejected_for_inspection()
         _cleanup_staging()
         batch_stats['failed'] += 1
         file_time = time.time() - file_start_time
@@ -1769,10 +2139,18 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
         last_encode_result['status'] = 'failed'
         if best_acceptable:
             last_encode_result['reason'] = f'Best result (Q={best_acceptable[0]}) had {best_acceptable[4]:.1f}% savings, SSIM {best_acceptable[2]:.4f} - did not meet targets'
+        elif best_rejected:
+            # Name the number the run actually produced: a bare "nothing was
+            # acceptable" tells the reader nothing about how close it came.
+            last_encode_result['reason'] = (
+                f'Best result (Q={best_rejected[0]}) scored {best_rejected[1]:.4f}, '
+                f'below the {ssim_min:.3f} floor')
         else:
             last_encode_result['reason'] = 'Binary search: no quality level produced acceptable results'
         last_encode_result['duration'] = file_time
         print(f" {R}>>> FAILED: {last_encode_result['reason']}{NC}")
+        if _hint:
+            print(f" {Y}   {_hint}{NC}")
         return (False, 0)
 
     # Fallback: Linear search (used when q_override is set or only 1 quality value)
@@ -1824,15 +2202,16 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
             quality += step
             continue
 
-        if ssim < SSIM_MIN:
+        if ssim < ssim_min:
             print(f" {R}   -> Quality too low. Aborting.{NC}")
 
             # Rescue best acceptable result found in previous passes
             if linear_best_acceptable and linear_best_acceptable_path and linear_best_acceptable_path.exists():
                 _ba_quality, _ba_size, _ba_ssim, _ba_saved_pct = linear_best_acceptable
                 _ba_saved_bytes = size_to_compare - _ba_size
-                if not promote_staging(linear_best_acceptable_path, output_path, expected_out_duration):
+                if not promote_staging(linear_best_acceptable_path, output_path, expected_out_duration, expected_audio_tracks):
                     return _fail_integrity()
+                _replace_source_if_asked()
                 _cleanup_staging()
                 file_time = time.time() - file_start_time
                 print(f" {Y}   -> Using best acceptable result: Q={_ba_quality} | "
@@ -1866,8 +2245,9 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
                 except (EOFError, KeyboardInterrupt):
                     answer = ''
                 if answer in ('j', 'y'):
-                    if not promote_staging(staging, output_path, expected_out_duration):
+                    if not promote_staging(staging, output_path, expected_out_duration, expected_audio_tracks):
                         return _fail_integrity()
+                    _replace_source_if_asked()
                     _cleanup_staging()
                     file_time = time.time() - file_start_time
                     print(f" {Y}>>> Ergebnis übernommen (manuell bestätigt). "
@@ -1884,8 +2264,10 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
                     if port:
                         notify_server(port, input_path)
                     return (True, saved_bytes_preview)
-            if staging.exists():
-                staging.unlink()
+            _saved_pct_rejected = ((size_to_compare - size_after) * 100 / size_to_compare
+                                   if size_to_compare else 0.0)
+            _remember_rejected(quality, ssim, _saved_pct_rejected, staging)
+            _hint = _keep_rejected_for_inspection()
             _cleanup_staging()
             batch_stats['failed'] += 1
             file_time = time.time() - file_start_time
@@ -1893,8 +2275,10 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
             last_encode_result['status'] = 'failed'
             last_encode_result['quality'] = quality
             last_encode_result['ssim'] = ssim
-            last_encode_result['reason'] = f'Quality too low (SSIM {ssim:.4f} < {SSIM_MIN:.3f})'
+            last_encode_result['reason'] = f'Quality too low (SSIM {ssim:.4f} < {ssim_min:.3f})'
             last_encode_result['duration'] = file_time
+            if _hint:
+                print(f" {Y}   {_hint}{NC}")
             return (False, 0)
 
         saved_bytes = size_to_compare - size_after
@@ -1906,8 +2290,9 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
             # Discard any previously saved fallback
             if linear_best_acceptable_path and linear_best_acceptable_path.exists():
                 linear_best_acceptable_path.unlink()
-            if not promote_staging(staging, output_path, expected_out_duration):
+            if not promote_staging(staging, output_path, expected_out_duration, expected_audio_tracks):
                 return _fail_integrity()
+            _replace_source_if_asked()
             _cleanup_staging()
             file_time = time.time() - file_start_time
             print(f" {BG}>>> SUCCESS! {format_size(saved_bytes)} ({saved_bytes*100/size_to_compare:.1f}%) saved in {format_time(file_time)}.{NC}")
@@ -1930,7 +2315,7 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
             return (True, saved_bytes)
 
         # Not ideal, but worth keeping as a fallback?
-        if saved_pct >= MIN_SAVINGS and ssim >= SSIM_ACCEPTABLE:
+        if saved_pct >= MIN_SAVINGS and ssim >= fallback_floor:
             # Save this as the best fallback so far
             if linear_best_acceptable_path and linear_best_acceptable_path.exists():
                 linear_best_acceptable_path.unlink()  # discard older, worse fallback
@@ -1947,8 +2332,9 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
     if linear_best_acceptable and linear_best_acceptable_path and linear_best_acceptable_path.exists():
         _ba_quality, _ba_size, _ba_ssim, _ba_saved_pct = linear_best_acceptable
         _ba_saved_bytes = size_to_compare - _ba_size
-        if not promote_staging(linear_best_acceptable_path, output_path, expected_out_duration):
+        if not promote_staging(linear_best_acceptable_path, output_path, expected_out_duration, expected_audio_tracks):
             return _fail_integrity()
+        _replace_source_if_asked()
         _cleanup_staging()
         file_time = time.time() - file_start_time
         print(f" {Y}   -> Using best acceptable result: Q={_ba_quality} | "
@@ -1970,6 +2356,7 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
 
     if linear_best_acceptable_path and linear_best_acceptable_path.exists():
         linear_best_acceptable_path.unlink()
+    _hint = _keep_rejected_for_inspection()
     _cleanup_staging()
     batch_stats['failed'] += 1
     file_time = time.time() - file_start_time
@@ -1977,6 +2364,8 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
     last_encode_result['status'] = 'failed'
     last_encode_result['reason'] = 'Exhausted all quality levels without meeting targets'
     last_encode_result['duration'] = file_time
+    if _hint:
+        print(f" {Y}   {_hint}{NC}")
     return (False, 0)
 
 def print_batch_summary():
@@ -2024,6 +2413,39 @@ def write_encode_log(filename, status, encoder_name, quality=None, ssim=None,
     return log_file
 
 
+def quality_floor(value: str) -> float:
+    """argparse type for --min-ssim: a usable SSIM floor lies in (0, 1].
+
+    A floor outside that range fails silently rather than loudly: above 1 no
+    encode can ever pass, at or below 0 every encode passes unchecked.
+    """
+    try:
+        f = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {value!r}")
+    if not 0 < f <= 1:
+        raise argparse.ArgumentTypeError(f"must be within (0, 1], got {f}")
+    return f
+
+
+def write_json_result(path, results: list) -> bool:
+    """Write the run's results as one JSON object. Never raises.
+
+    The object is versioned and wraps a list, so a run over several files has
+    one shape rather than two — a caller always reads `results`, and a single
+    file is simply a list of one. A result file the caller cannot receive must
+    not take down an encode that already succeeded, so failures are reported
+    and swallowed.
+    """
+    payload = {'videocrunch': 1, 'results': results}
+    try:
+        Path(path).write_text(json.dumps(payload, indent=2), encoding='utf-8')
+        return True
+    except (OSError, TypeError, ValueError) as e:
+        print(f"{Y}Could not write result file {path}: {e}{NC}")
+        return False
+
+
 def build_parser():
     """The CLI surface — see tests/test_cli_contract.py for the invocation contract."""
     parser = argparse.ArgumentParser(description='Multi-Platform Video Optimizer V2.1')
@@ -2056,6 +2478,17 @@ def build_parser():
                         help='Encoding quality preset: fast (speed), balanced (default), best (quality/size)')
     parser.add_argument('--force', action='store_true',
                         help='Encode even when the savings heuristic predicts it is not worth it')
+    parser.add_argument('--min-ssim', type=quality_floor, metavar='S',
+                        help=f'Override the hard quality floor for this run (0 < S <= 1, '
+                             f'default: {SSIM_MIN}). Material the default was not calibrated '
+                             f'for can look fine and still score below it.')
+    parser.add_argument('--replace', action='store_true',
+                        help='Replace the source with the finished encode (original goes to '
+                             'the macOS trash, recoverable). Without this the result is left '
+                             'next to the source as <name>_opt.mp4.')
+    parser.add_argument('--json-out', metavar='PATH',
+                        help='Write the machine-readable result of this run to PATH '
+                             '(JSON). Written whatever the outcome, including failures.')
     parser.add_argument('--no-presearch', action='store_true',
                         help='Skip the sample-clip quality pre-search (always run the full binary search)')
     return parser
@@ -2133,6 +2566,7 @@ def main():
     # Filter out flags from files
     files = [f for f in files if not f.startswith('-')]
 
+    run_results: list = []
     for f in files:
         batch_stats['processed'] += 1
         success, saved_bytes = process_file(
@@ -2147,7 +2581,9 @@ def main():
             q_override=args.q,
             presearch=not args.no_presearch,
             scale_height=args.scale_height,
-            force=args.force
+            force=args.force,
+            min_ssim=args.min_ssim,
+            replace=args.replace
         )
 
         # Write to encode log (for both batch controller and single-file calls)
@@ -2179,6 +2615,11 @@ def main():
                     'ssim': last_encode_result['ssim'],
                     'saved_pct': last_encode_result['saved_pct'],
                 })
+
+        run_results.append(dict(last_encode_result))
+
+    if args.json_out:
+        write_json_result(args.json_out, run_results)
 
     # Print batch summary if multiple files
     if len(files) > 1:
