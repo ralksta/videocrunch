@@ -28,6 +28,7 @@ fi
 echo -e "${BG}═══════════════════════════════════════════${NC}"
 echo -e "${BG}  🎬 videocrunch${NC}"
 echo -e "${BG}═══════════════════════════════════════════${NC}"
+# The Python tools print their own, more specific header from here on.
 
 if [[ -d "$TARGET" ]]; then
     exec "$PYTHON" "$SCRIPT_DIR/scan.py" "$TARGET" "$@"

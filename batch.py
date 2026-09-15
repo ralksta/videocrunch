@@ -144,6 +144,23 @@ def read_worker_result(path) -> dict | None:
         return None
 
 
+def write_batch_results(path, results: list) -> bool:
+    """Write every file's result as one JSON object. Never raises.
+
+    The caller that started this batch — usually the wizard in scan.py — only
+    ever learned an exit code, so it could not hold its own estimate against
+    what was actually saved, nor offer to retry what fell under the quality
+    floor. The measurements existed all along; they just had no way out.
+    """
+    payload = {"videocrunch": 1, "results": results}
+    try:
+        Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return True
+    except (OSError, TypeError, ValueError) as e:
+        print(f"{Y}Could not write batch result file {path}: {e}{NC}")
+        return False
+
+
 def merge_worker_result(result: dict, data: dict | None) -> bool:
     """Let the worker's own verdict replace what was scraped off its output.
 
@@ -159,7 +176,8 @@ def merge_worker_result(result: dict, data: dict | None) -> bool:
     return True
 
 
-def build_optimizer_command(file_path, port, audio_mode, min_ssim=None, json_out=None):
+def build_optimizer_command(file_path, port, audio_mode, min_ssim=None, json_out=None,
+                            scale_height=None, replace=False):
     """The per-file `videocrunch.py` invocation — see tests/test_cli_contract.py.
 
     Every batch-level option a caller sets has to appear here; anything the
@@ -178,12 +196,16 @@ def build_optimizer_command(file_path, port, audio_mode, min_ssim=None, json_out
         cmd.extend(["--min-ssim", str(min_ssim)])
     if json_out:
         cmd.extend(["--json-out", str(json_out)])
+    if scale_height:
+        cmd.extend(["--scale-height", str(scale_height)])
+    if replace:
+        cmd.append("--replace")
     return cmd
 
 
 def run_optimizer(args_tuple):
     """Worker function - captures output and updates shared state. Returns detailed results for logging."""
-    file_path, port, audio_mode, min_ssim, worker_id = args_tuple
+    file_path, port, audio_mode, min_ssim, scale_height, replace, worker_id = args_tuple
 
     filename = Path(file_path).name
     file_start = time.time()
@@ -206,7 +228,9 @@ def run_optimizer(args_tuple):
 
     # The worker writes its verdict here; stdout stays the live progress feed.
     result_file = Path(tempfile.gettempdir()) / f"videocrunch_w{worker_id}_{os.getpid()}.json"
-    cmd = build_optimizer_command(file_path, port, audio_mode, min_ssim, json_out=result_file)
+    cmd = build_optimizer_command(file_path, port, audio_mode, min_ssim,
+                                  json_out=result_file, scale_height=scale_height,
+                                  replace=replace)
 
     try:
         process = subprocess.Popen(
@@ -409,6 +433,12 @@ def build_parser():
                         help='Notify a companion server on this port when a file is done, '
                              'via GET /api/mark_optimized?path=<path>')
     parser.add_argument('--audio-mode', choices=['enhanced', 'standard'], default='enhanced')
+    parser.add_argument('--json-out', metavar='PATH',
+                        help='Write every file result to PATH (JSON) when the batch ends')
+    parser.add_argument('--scale-height', type=int, metavar='H',
+                        help='Downscale every file to H pixels height (forwarded per file)')
+    parser.add_argument('--replace', action='store_true',
+                        help='Replace each source with its encode (original to the trash)')
     parser.add_argument('--min-ssim', type=quality_floor, metavar='S',
                         help='Override the hard quality floor for every file in this batch '
                              '(0 < S <= 1). Forwarded to videocrunch.py per file.')
@@ -443,7 +473,8 @@ def main():
     display_thread.start()
 
     # Prepare work items
-    work_items = [(f, args.port, args.audio_mode, args.min_ssim, (i % max_workers) + 1)
+    work_items = [(f, args.port, args.audio_mode, args.min_ssim, args.scale_height,
+                   args.replace, (i % max_workers) + 1)
                   for i, f in enumerate(files)]
 
     # Process files
@@ -480,6 +511,9 @@ def main():
     # Write detailed log file
     log_file = write_log(start_time, elapsed, encoder)
     print(f"\n{G}📝 Log saved:{NC} {log_file}")
+
+    if args.json_out:
+        write_batch_results(args.json_out, file_results)
 
     print(f"\n{Y}Window will close in 10 seconds (Ctrl+C to close now)...{NC}")
     try:

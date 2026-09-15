@@ -77,6 +77,66 @@ def suggest_q_from_history(encoder_key: str, height: int, source_kbps: float,
         return None
 
 
+def _as_int_or_zero(value) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def read_encode_history(history_path: Path = DEFAULT_HISTORY_PATH) -> list:
+    """Every readable record in the encode history, oldest first.
+
+    A damaged line — the tail of a run that was killed mid-write — is skipped
+    rather than taken as the end of the file: the records before and after it
+    are still good.
+    """
+    records = []
+    try:
+        with open(history_path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        return []
+    return records
+
+
+def history_throughput(records: list, height: int | None = None,
+                       min_samples: int = 3) -> float | None:
+    """Median encode throughput in MB of source per second, or None.
+
+    Measured per resolution class when `height` is given: 4K and 480p move
+    very different amounts of data per second, and pooling them produced an
+    estimate seven times off. A class with too little history gets None — a
+    made-up number is worse than no number, because the user plans around it.
+    """
+    want_class = resolution_class(height) if height else None
+    rates = []
+    for rec in records:
+        if want_class and resolution_class(_as_int_or_zero(rec.get("height"))) != want_class:
+            continue
+        try:
+            size_mb = float(rec.get("size_mb") or 0)
+            duration = float(rec.get("duration") or 0)
+        except (TypeError, ValueError):
+            continue
+        if size_mb > 0 and duration > 0:
+            rates.append(size_mb / duration)
+    if len(rates) < min_samples:
+        return None
+    return statistics.median(rates)
+
+
+def estimate_runtime_sec(total_mb: float, throughput: float | None) -> float | None:
+    """Seconds a batch of this size should take at that throughput."""
+    if not throughput or throughput <= 0:
+        return None
+    return total_mb / throughput
+
+
 def nearest_quality_index(quality_values: list[int], q: int) -> int:
     return min(range(len(quality_values)), key=lambda i: abs(quality_values[i] - q))
 

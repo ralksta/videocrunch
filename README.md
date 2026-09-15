@@ -82,9 +82,25 @@ quality, SSIM, savings, in and out paths — whatever the outcome), `--replace`
 Walks the folder recursively, probes every video with `ffprobe` (a few
 seconds even for large libraries — no encoding happens), and prints a table
 ranked by expected savings in MB. `--no-encode` stops after printing the
-table; otherwise it asks which entries to encode (`1,3,7-10`, `a` for all,
-Enter for none) and hands the selection to `batch.py` for parallel encoding.
-Files that already have a `<name>_opt.mp4` sibling are skipped as done.
+table; otherwise it walks you through the run and hands the selection to
+`batch.py` for parallel encoding. Files that already have a
+`<name>_opt.mp4` sibling are skipped as done.
+
+Picking files takes `1,3,7-10`, `a` for all, `a -3` for all but one, or a
+name — `Urlaub` selects everything under that folder. Rows are identified by
+their path relative to the scanned folder, because `IMG_1234.mov` in three
+import folders is three different videos.
+
+After the selection it asks only what the selection makes relevant:
+downscaling is offered when something taller than 1080p is in it, replacing
+the originals is always offered, and the start is confirmed with the expected
+savings and — once your history holds enough comparable runs — how long it
+should take. Piping a selection in skips the questions entirely and starts
+the run, as it always did.
+
+When the batch is done, the estimate is held against what was actually saved,
+and anything that failed on quality can be retried right away at a floor that
+clears it.
 Historical encodes (from `~/.videocrunch/logs/encode_history.jsonl`) are used
 to sharpen the estimate where available — the table marks those rows.
 
@@ -98,9 +114,10 @@ above).
 `batch.py` itself (`--files a.mp4,b.mp4 --audio-mode enhanced`) runs the
 marked files in parallel with a live status table and a persistent log; you
 normally reach it through `scan.py`, not directly. It also takes
-`--min-ssim S` and forwards it to every per-file encode, and reads each
-worker's verdict from its `--json-out` file rather than from its console
-output.
+`--min-ssim S`, `--scale-height H` and `--replace` and forwards them to every
+per-file encode, reads each worker's verdict from its `--json-out` file
+rather than from its console output, and can write the whole batch's results
+with its own `--json-out`.
 
 ## How the quality search works
 

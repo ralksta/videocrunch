@@ -13,15 +13,22 @@ which runs the encodes in parallel.
 """
 import argparse
 import json
+import os
 import statistics
 import subprocess
 import sys
+import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Optional
 
-from crunch_utils import DEFAULT_HISTORY_PATH
+from crunch_utils import (
+    DEFAULT_HISTORY_PATH,
+    estimate_runtime_sec,
+    history_throughput,
+    read_encode_history,
+)
 from savings import (
     _is_same_codec,
     _reference_kbps,
@@ -29,6 +36,7 @@ from savings import (
     estimate_savings_pct,
     resolution_class,
 )
+from videocrunch import suggested_floor
 
 # Extensions worth probing. Deliberately inlined: a standalone tool should not
 # need a config module for a constant list.
@@ -161,6 +169,76 @@ def parse_selection(text: str, count: int) -> list[int]:
         else:
             selected.add(_parse_index(token, count))
     return sorted(selected)
+
+
+DOWNSCALE_TARGET = 1080
+
+
+def ask_yes_no(question: str, default: bool, ask=None) -> bool:
+    """One yes/no question. No answer means no — whatever the default is.
+
+    A closed stdin or a Ctrl-C at the prompt must not start an encode run the
+    user never confirmed, so an unanswerable question is a "no" even where
+    Enter would have meant yes.
+    """
+    suffix = "[J/n]" if default else "[j/N]"
+    print(f"  {Y}{question}{NC} {suffix}: ", end="", flush=True)
+    try:
+        answer = (ask or input)().strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    if not answer:
+        return default
+    return answer in ("j", "y", "ja", "yes")
+
+
+def downscale_candidates(entries: list, target: int = DOWNSCALE_TARGET) -> int:
+    """How many of these are taller than the downscale target.
+
+    Downscaling is the single biggest lever on phone 4K, and it was reachable
+    only via --scale-height. Asking makes sense only when the selection holds
+    material it would apply to.
+    """
+    return sum(1 for e in entries if (e.get("height") or 0) > target)
+
+
+def select_candidates(text: str, names: list) -> list:
+    """Resolve a selection line against the listed candidates.
+
+    On top of `1,3,7-10` and `a`:
+      * `a -3,5`   — everything except those (also `1-4 -2`)
+      * `Urlaub`   — everything whose listed name contains that text
+
+    Counting rows to express "all but two" is exactly the kind of chore that
+    produces the wrong number. A name that matches nothing raises rather than
+    selecting nothing quietly: that is a typo, not a change of mind.
+    """
+    count = len(names)
+    include_tokens, exclude_tokens = [], []
+    for token in text.strip().split():
+        (exclude_tokens if token.startswith("-") else include_tokens).append(
+            token.lstrip("-") if token.startswith("-") else token)
+
+    include_text = " ".join(include_tokens).strip()
+    if not include_text:
+        return []
+
+    lowered = include_text.lower()
+    if lowered in ("a", "all", "alle"):
+        selected = list(range(1, count + 1))
+    elif any(ch.isalpha() for ch in lowered):
+        selected = [i for i, name in enumerate(names, start=1)
+                    if lowered in str(name).lower()]
+        if not selected:
+            raise ValueError(f"Kein Treffer für '{include_text}'")
+    else:
+        selected = parse_selection(include_text, count)
+
+    if exclude_tokens:
+        excluded = set(parse_selection(",".join(exclude_tokens), count))
+        selected = [i for i in selected if i not in excluded]
+    return selected
 
 
 def _parse_index(token: str, count: int) -> int:
@@ -366,34 +444,188 @@ def probe_all(paths: list[Path], quiet: bool = False) -> list[dict]:
 # Output
 # ---------------------------------------------------------------------------
 
+def format_duration(seconds: float) -> str:
+    """A runtime estimate as someone would say it out loud."""
+    if seconds < 60:
+        return "unter 1 min"
+    minutes = int(round(seconds / 60))
+    if minutes < 60:
+        return f"{minutes} min"
+    hours, rest = divmod(minutes, 60)
+    return f"{hours} h {rest} min" if rest else f"{hours} h"
+
+
 def _files(n: int) -> str:
     return "Datei" if n == 1 else "Dateien"
 
 
 def format_size(mb: float) -> str:
-    return f"{mb/1024:.1f} GB" if mb >= 1024 else f"{mb:.0f} MB"
+    if mb >= 1024:
+        return f"{mb/1024:.1f} GB"
+    if 0 < mb < 1:
+        # "0 MB" reads as "nothing to gain" and makes the row look like a bug.
+        return "<1 MB"
+    return f"{mb:.0f} MB"
 
 
-def print_table(candidates: list[dict], name_width: int = 46) -> None:
+# Columns spent on number, savings, percent and the info text.
+TABLE_FIXED_COLUMNS = 40
+
+
+# Anything narrower than this is not a terminal we can lay out for — a pty
+# with no window size set reports 0 columns, and taking that literally elides
+# every path down to a stub.
+MIN_PLAUSIBLE_COLUMNS = 52
+FALLBACK_COLUMNS = 86
+
+
+def table_name_width(term_cols: int) -> int:
+    """Width of the file column for a terminal this wide.
+
+    A fixed width wrapped the table in an 80-column terminal, which is the
+    default almost everywhere.
+    """
+    if term_cols < MIN_PLAUSIBLE_COLUMNS:
+        term_cols = FALLBACK_COLUMNS
+    return max(12, min(46, term_cols - TABLE_FIXED_COLUMNS))
+
+
+def display_name(path: Path, root: Path, width: int) -> str:
+    """How a candidate is identified in the table.
+
+    The bare filename is ambiguous the moment a tree repeats names — the
+    normal case for phone imports. Overlong paths lose their FRONT: the tail
+    holds the filename, which is the part that identifies the file.
+    """
+    try:
+        shown = str(Path(path).relative_to(root))
+    except ValueError:
+        shown = Path(path).name
+    if len(shown) > width:
+        shown = "…" + shown[-(width - 1):]
+    return shown
+
+
+def summary_lines(shown: list, summary: dict, hidden_below: int, excluded: int) -> list:
+    """The lines under the table — describing what the table actually offers.
+
+    The totals used to count every candidate found, including those `--limit`
+    cut away, so the sum promised savings the user could not select and
+    `a = alle` quietly meant "all of the visible ones".
+    """
+    lines = []
+    shown_mb = round(sum(c["estimated_saved_mb"] for c in shown), 1)
+    n = len(shown)
+    lines.append(f"{n} {_files(n)} gelistet, zusammen ~{format_size(shown_mb)} "
+                 f"Ersparnis erwartet.")
+    not_listed = summary.get("total_files", n) - n
+    if not_listed > 0:
+        lines.append(f"{not_listed} weitere Kandidaten nicht gezeigt (--limit) — "
+                     f"Auswahl bezieht sich nur auf die Liste.")
+    if hidden_below > 0:
+        lines.append(f"{hidden_below} {_files(hidden_below)} unter "
+                     f"{MIN_LISTED_SAVED_PCT:.0f}% erwarteter Ersparnis ausgeblendet.")
+    if excluded > 0:
+        lines.append(f"{excluded} {_files(excluded)} "
+                     f"{'hat' if excluded == 1 else 'haben'} bereits ein _opt.mp4.")
+    if summary.get("history_based"):
+        lines.append(f"{summary['history_based']} Schätzungen beruhen auf echten "
+                     f"früheren Encodes (grün), der Rest ist Heuristik.")
+    return lines
+
+
+def print_table(candidates: list[dict], root: Path, name_width: int = 46) -> None:
     print(f"\n{BG}{'#':>3}  {'Ersparnis':>10}  {'%':>4}  "
           f"{'Datei':<{name_width}}  Info{NC}")
-    print(DIM + "─" * (name_width + 40) + NC)
+    print(DIM + "─" * (name_width + TABLE_FIXED_COLUMNS) + NC)
     for i, c in enumerate(candidates, start=1):
-        name = Path(c['file_path']).name
-        if len(name) > name_width:
-            name = name[:name_width - 1] + "…"
+        name = display_name(Path(c['file_path']), root, name_width)
         conf = {"high": G, "medium": Y, "low": DIM}.get(c['confidence'], NC)
         print(f"{CYAN}{i:>3}{NC}  {G}{format_size(c['estimated_saved_mb']):>10}{NC}  "
               f"{c['estimated_saved_pct']:>3.0f}%  {name:<{name_width}}  "
               f"{conf}{c['reason']}{NC}")
 
 
-def run_batch(paths: list, audio_mode: str, port=None) -> int:
+def retry_floor(results: list) -> float | None:
+    """A quality floor that every measured failure in this batch would clear.
+
+    Follows the LOWEST score, so one retry covers them all, and rounds down —
+    a floor the result does not actually beat sends the user into a second
+    run that fails exactly like the first. None when nothing failed on
+    quality: an ffmpeg error is not fixed by moving the bar.
+    """
+    scores = [r["ssim"] for r in results
+              if r.get("status") == "failed" and r.get("ssim")]
+    if not scores:
+        return None
+    return suggested_floor(min(scores))
+
+
+def batch_runtime_sec(entries: list, records: list) -> float | None:
+    """Seconds the selected files should take, each in its own class.
+
+    A single file whose resolution class has no history makes the whole
+    estimate unavailable: a number that covers only part of the batch is not
+    the number the user is about to plan around.
+    """
+    total = 0.0
+    for entry in entries:
+        throughput = history_throughput(records, height=entry.get("height") or 0)
+        seconds = estimate_runtime_sec(entry.get("size_mb") or 0.0, throughput)
+        if seconds is None:
+            return None
+        total += seconds
+    return total if entries else None
+
+
+def retry_paths(results: list) -> list:
+    """Sources worth re-running with a lower floor.
+
+    Only the files that failed on QUALITY: moving the bar does not fix an
+    ffmpeg error. `batch.py` names the source "path" and `videocrunch.py`
+    names it "input_path" — reading only one of them retries nothing at all.
+    """
+    return [p for p in (r.get("path") or r.get("input_path") for r in results
+                        if r.get("status") == "failed" and r.get("ssim")) if p]
+
+
+def outcome_lines(estimated_mb: float, results: list) -> list:
+    """What the run actually delivered, against what was promised."""
+    lines = []
+    saved_bytes = sum(r.get("saved_bytes") or 0 for r in results
+                      if r.get("status") == "success")
+    actual_mb = saved_bytes / (1024 * 1024)
+    lines.append(f"Erwartet ~{format_size(estimated_mb)}, "
+                 f"tatsächlich {format_size(actual_mb)} gespart.")
+    failed = [r for r in results if r.get("status") == "failed"]
+    if failed:
+        lines.append(f"{len(failed)} {_files(len(failed))} nicht encodiert.")
+    return lines
+
+
+def read_batch_results(path) -> list:
+    """The batch's per-file results, or an empty list if it left none."""
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8")).get("results") or []
+    except (OSError, ValueError, TypeError, AttributeError):
+        return []
+
+
+def run_batch(paths: list, audio_mode: str, port=None, scale_height=None,
+              replace: bool = False, results_file=None, min_ssim=None) -> int:
     """Hand the marked files to batch.py for parallel encoding."""
     cmd = [sys.executable, str(Path(__file__).parent / "batch.py"),
            '--files', ",".join(paths), '--audio-mode', audio_mode]
+    if results_file:
+        cmd.extend(['--json-out', str(results_file)])
+    if min_ssim:
+        cmd.extend(['--min-ssim', str(min_ssim)])
     if port:
         cmd.extend(['--port', str(port)])
+    if scale_height:
+        cmd.extend(['--scale-height', str(scale_height)])
+    if replace:
+        cmd.append('--replace')
     return subprocess.run(cmd).returncode
 
 
@@ -430,9 +662,6 @@ def main() -> int:
         log(f"{R}Kein Ordner: {root}{NC}")
         return 1
 
-    log(f"{BG}═══════════════════════════════════════════{NC}")
-    log(f"{BG}  🔍 videocrunch Folder Scanner{NC}")
-    log(f"{BG}═══════════════════════════════════════════{NC}")
     log(f"{G}Ordner:{NC} {root}")
 
     paths = find_videos(root)
@@ -468,29 +697,26 @@ def main() -> int:
         print(f"{Y}Kein Kandidat über der 10%-Schwelle — hier ist nichts zu holen.{NC}")
         return 0
 
-    print_table(candidates)
+    try:
+        term_cols = os.get_terminal_size().columns
+    except OSError:
+        term_cols = 86
+    print_table(candidates, root, table_name_width(term_cols))
 
     hidden = len(entries) - len(exclude) - summary['total_files']
-    print(DIM + f"\n{summary['total_files']} Kandidaten, zusammen ~"
-          f"{format_size(summary['total_estimated_saved_mb'])} Ersparnis erwartet."
-          + NC)
-    if hidden > 0:
-        print(DIM + f"{hidden} {_files(hidden)} unter 10% erwarteter Ersparnis "
-              f"ausgeblendet." + NC)
-    if exclude:
-        n = len(exclude)
-        print(DIM + f"{n} {_files(n)} {'hat' if n == 1 else 'haben'} bereits "
-              f"ein _opt.mp4." + NC)
-    if summary.get('history_based'):
-        print(DIM + f"{summary['history_based']} Schätzungen beruhen auf echten "
-              f"früheren Encodes (grün), der Rest ist Heuristik." + NC)
+    print()
+    for line in summary_lines(candidates, summary, hidden_below=hidden,
+                              excluded=len(exclude)):
+        print(DIM + line + NC)
 
     if args.no_encode:
         return 0
 
     shown = candidates
+    names = [display_name(Path(c['file_path']), root, 999) for c in shown]
     print(f"\n{Y}Welche encodieren?{NC} z.B. {CYAN}1,3,7-10{NC} · "
-          f"{CYAN}a{NC} = alle · {CYAN}Enter{NC} = keine")
+          f"{CYAN}a{NC} = alle · {CYAN}a -3{NC} = alle außer 3 · "
+          f"{CYAN}Urlaub{NC} = nach Name · {CYAN}Enter{NC} = keine")
     try:
         raw = input("  Auswahl: ")
     except (EOFError, KeyboardInterrupt):
@@ -498,7 +724,7 @@ def main() -> int:
         return 0
 
     try:
-        picked = parse_selection(raw, len(shown))
+        picked = select_candidates(raw, names)
     except ValueError as e:
         print(f"{R}{e}{NC}")
         return 1
@@ -511,10 +737,63 @@ def main() -> int:
     total_mb = sum(shown[i - 1]['estimated_saved_mb'] for i in picked)
     print(f"\n{G}{len(selected)} {_files(len(selected))}{NC}, erwartete Ersparnis "
           f"~{format_size(total_mb)}:")
-    for path in selected:
-        print(f"  {DIM}·{NC} {Path(path).name}")
+    for i in picked:
+        # Same identification as the table: two files of the same name from
+        # different folders must not read as one entry listed twice.
+        print(f"  {DIM}·{NC} {names[i - 1]}")
 
-    return run_batch(selected, args.audio_mode, args.port)
+    # Questions only make sense with someone there to answer them: piping a
+    # selection in has always started the run, and must keep doing so.
+    interactive = sys.stdin.isatty()
+    chosen = [shown[i - 1] for i in picked]
+    scale_height = None
+    replace = False
+
+    if interactive:
+        print()
+        tall = downscale_candidates(chosen)
+        if tall:
+            n_label = "Datei ist" if tall == 1 else "Dateien sind"
+            if ask_yes_no(f"{tall} {n_label} höher als {DOWNSCALE_TARGET}p. "
+                          f"Auf {DOWNSCALE_TARGET}p verkleinern? Das spart meist am meisten.",
+                          default=False):
+                scale_height = DOWNSCALE_TARGET
+        replace = ask_yes_no("Originale nach geprüftem Encode in den Papierkorb legen?",
+                             default=False)
+
+        runtime = batch_runtime_sec(chosen, read_encode_history())
+        eta = f", geschätzt ~{format_duration(runtime)}" if runtime else ""
+        if not ask_yes_no(f"Start? {len(selected)} {_files(len(selected))}, "
+                          f"~{format_size(total_mb)} erwartet{eta}", default=True):
+            print(f"{Y}Abgebrochen.{NC}")
+            return 0
+
+    with tempfile.TemporaryDirectory(prefix="videocrunch_scan_") as tmp:
+        results_file = Path(tmp) / "batch.json"
+        code = run_batch(selected, args.audio_mode, args.port, scale_height, replace,
+                         results_file)
+        results = read_batch_results(results_file)
+
+    if not results:
+        return code
+
+    print()
+    for line in outcome_lines(total_mb, results):
+        print(f"{G}{line}{NC}")
+
+    floor = retry_floor(results)
+    if floor and interactive:
+        failed = [r for r in results if r.get("status") == "failed" and r.get("ssim")]
+        print(DIM + "   Die Qualitätsmessung bestraft feinkörniges Material härter, "
+              "als das Auge es sieht." + NC)
+        if ask_yes_no(f"{len(failed)} {_files(len(failed))} mit --min-ssim {floor:.2f} "
+                      f"erneut versuchen?", default=False):
+            retry = retry_paths(results)
+            if retry:
+                return run_batch(retry, args.audio_mode, args.port, scale_height,
+                                 replace, min_ssim=floor)
+            print(f"{Y}Keine Pfade in den Ergebnissen — bitte manuell wiederholen.{NC}")
+    return code
 
 
 if __name__ == "__main__":

@@ -384,7 +384,10 @@ list wraps even a single file so a run over several has the same shape.
 
 `batch.py` hands every worker its own result file and takes the verdict from
 it, falling back to scraping stdout when the file is missing (an aborted
-worker leaves none). That fallback is why the shape is pinned in
+worker leaves none). It writes the whole batch in the same shape through its
+own `--json-out`, which is how `scan.py` learns what a run delivered: without
+it the wizard saw an exit code and nothing else, so it could neither check
+its own estimate nor offer to retry what fell under the quality floor. That fallback is why the shape is pinned in
 `tests/test_cli_contract.py`: output lines are human-facing and get reworded,
 which is exactly what made scraping them fragile in the first place.
 

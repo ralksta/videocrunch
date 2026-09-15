@@ -26,10 +26,21 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scan import (  # noqa: E402
+    ask_yes_no,
+    batch_runtime_sec,
+    display_name,
+    downscale_candidates,
     find_videos,
+    format_duration,
     has_optimized_sibling,
+    outcome_lines,
     parse_selection,
     probe_to_media,
+    retry_floor,
+    retry_paths,
+    select_candidates,
+    summary_lines,
+    table_name_width,
 )
 
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
@@ -348,3 +359,237 @@ class TestJsonOutput:
         payload = json.loads(text)
         assert "results" in payload and "summary" in payload
         assert ANSI_ESCAPE_RE.search(text) is None
+
+
+class TestDisplayName:
+    """What the table calls a file.
+
+    Showing the bare filename makes two candidates indistinguishable whenever
+    a folder tree repeats names — which is the normal case for phone imports
+    (IMG_1234.mov in every import folder).
+    """
+
+    def test_file_in_the_scanned_folder_shows_its_name(self):
+        assert display_name(Path("/v/clip.mp4"), Path("/v"), 40) == "clip.mp4"
+
+    def test_file_in_a_subfolder_shows_the_path(self):
+        assert display_name(Path("/v/Urlaub/strand.mp4"), Path("/v"), 40) == "Urlaub/strand.mp4"
+
+    def test_long_paths_lose_their_front_not_their_filename(self):
+        # Truncating the end would hide the one part that identifies the file.
+        shown = display_name(Path("/v/a/very/deeply/nested/folder/strand.mp4"), Path("/v"), 20)
+        assert len(shown) <= 20
+        assert shown.endswith("strand.mp4")
+
+    def test_a_path_outside_the_scanned_folder_falls_back_to_its_name(self):
+        assert display_name(Path("/elsewhere/clip.mp4"), Path("/v"), 40) == "clip.mp4"
+
+
+class TestTableWidth:
+    """The table has to fit the terminal it is printed into."""
+
+    def test_wide_terminal_gets_a_wide_name_column(self):
+        assert table_name_width(200) > table_name_width(80)
+
+    def test_narrow_terminal_still_leaves_a_usable_column(self):
+        assert table_name_width(60) >= 12
+
+    def test_an_implausible_width_falls_back_instead_of_shrinking(self):
+        # A pty with no window size set reports 0 columns. Taken literally
+        # that leaves a 12-character name column and every path is elided.
+        assert table_name_width(0) == table_name_width(86)
+        assert table_name_width(10) == table_name_width(86)
+
+    def test_the_table_stays_inside_the_terminal(self):
+        # 40 columns are spent on number, savings, percent and info.
+        for cols in (60, 80, 120, 200):
+            assert table_name_width(cols) + 40 <= cols
+
+
+class TestSummaryLines:
+    """The numbers under the table must describe what the table shows.
+
+    With --limit in play the summary used to count candidates the user cannot
+    select: "5 candidates, ~71 MB" under a table offering two of them worth
+    61 MB, and `a = alle` meaning the two.
+    """
+
+    SHOWN = [{"estimated_saved_mb": 38.0}, {"estimated_saved_mb": 23.0}]
+    SUMMARY = {"total_files": 5, "total_estimated_saved_mb": 71.0, "history_based": 0}
+
+    def _joined(self, **kwargs):
+        return " ".join(summary_lines(self.SHOWN, self.SUMMARY, **kwargs))
+
+    def test_totals_describe_the_listed_candidates(self):
+        text = self._joined(hidden_below=0, excluded=0)
+        assert "61" in text
+        assert "71" not in text
+
+    def test_truncation_is_stated(self):
+        text = self._joined(hidden_below=0, excluded=0)
+        assert "3" in text  # 5 candidates, 2 listed
+
+    def test_nothing_is_said_about_truncation_when_all_are_listed(self):
+        summary = {"total_files": 2, "total_estimated_saved_mb": 61.0, "history_based": 0}
+        text = " ".join(summary_lines(self.SHOWN, summary, hidden_below=0, excluded=0))
+        assert "limit" not in text.lower()
+
+
+class TestSelectCandidates:
+    """The selection line, resolved against the listed candidates.
+
+    Numbers alone force counting rows: "encode everything except the two I
+    already did" is a common wish and was only expressible by typing out every
+    other number. So is "just the holiday folder".
+    """
+
+    NAMES = ["gross.mp4", "Urlaub/strand.mp4", "Urlaub/sonne.mp4",
+             "Clips/kurz.mp4", "Clips/strand.mp4"]
+
+    def test_numbers_work_as_before(self):
+        assert select_candidates("1,3", self.NAMES) == [1, 3]
+
+    def test_all_except(self):
+        assert select_candidates("a -3", self.NAMES) == [1, 2, 4, 5]
+
+    def test_all_except_several(self):
+        assert select_candidates("a -3,5", self.NAMES) == [1, 2, 4]
+
+    def test_exclusion_applies_to_a_range_too(self):
+        assert select_candidates("1-4 -2", self.NAMES) == [1, 3, 4]
+
+    def test_a_name_selects_what_matches_it(self):
+        assert select_candidates("Urlaub", self.NAMES) == [2, 3]
+
+    def test_matching_ignores_case(self):
+        assert select_candidates("urlaub", self.NAMES) == [2, 3]
+
+    def test_a_name_can_be_narrowed_by_exclusion(self):
+        assert select_candidates("strand -5", self.NAMES) == [2]
+
+    def test_a_name_nothing_matches_is_an_error(self):
+        # Silently selecting nothing would look like the user changed their
+        # mind, not like a typo.
+        with pytest.raises(ValueError, match="Treffer"):
+            select_candidates("berge", self.NAMES)
+
+    def test_empty_still_means_nothing(self):
+        assert select_candidates("", self.NAMES) == []
+
+
+class TestWizardQuestions:
+    """What the wizard asks after the files are picked.
+
+    It used to ask exactly one thing — which files — while the choices with
+    the largest effect (downscaling 4K, replacing the originals) were
+    reachable only as command-line flags, by people who chose the guided path
+    precisely because they do not know the flags.
+    """
+
+    def test_yes_and_no_are_taken_literally(self):
+        assert ask_yes_no("?", default=False, ask=lambda: "j") is True
+        assert ask_yes_no("?", default=True, ask=lambda: "n") is False
+
+    def test_enter_takes_the_default(self):
+        assert ask_yes_no("?", default=True, ask=lambda: "") is True
+        assert ask_yes_no("?", default=False, ask=lambda: "") is False
+
+    def test_an_unanswerable_question_never_starts_anything(self):
+        # Closed stdin or Ctrl-C: doing nothing is the safe reading, whatever
+        # the default would have been.
+        def interrupted():
+            raise EOFError
+        assert ask_yes_no("?", default=True, ask=interrupted) is False
+
+    def test_downscale_is_offered_only_for_taller_material(self):
+        entries = [{"height": 2160}, {"height": 1080}, {"height": 3840}]
+        assert downscale_candidates(entries, 1080) == 2
+
+    def test_nothing_to_downscale_means_no_question(self):
+        entries = [{"height": 1080}, {"height": 720}]
+        assert downscale_candidates(entries, 1080) == 0
+
+
+class TestFormatDuration:
+    """Runtime estimates are read at a glance, so they round to something human."""
+
+    def test_short_runs_say_so_rather_than_counting_seconds(self):
+        assert format_duration(35) == "unter 1 min"
+
+    def test_minutes(self):
+        assert format_duration(100) == "2 min"
+
+    def test_hours_and_minutes(self):
+        assert format_duration(4020) == "1 h 7 min"
+
+    def test_whole_hours_drop_the_minutes(self):
+        assert format_duration(7200) == "2 h"
+
+
+class TestOutcome:
+    """What the wizard says once the batch is done.
+
+    It used to say nothing: the run ended and the estimate it had shown was
+    never held against the result. Files that came in under the quality floor
+    were simply gone from view, although the measurement that would let the
+    user accept them was right there.
+    """
+
+    def test_the_estimate_is_held_against_the_result(self):
+        text = " ".join(outcome_lines(estimated_mb=65.0, results=[
+            {"status": "success", "saved_bytes": 71 * 1024 * 1024},
+        ]))
+        assert "65" in text and "71" in text
+
+    def test_failures_are_counted(self):
+        text = " ".join(outcome_lines(estimated_mb=10.0, results=[
+            {"status": "success", "saved_bytes": 1024 * 1024},
+            {"status": "failed", "ssim": 0.87},
+            {"status": "failed", "ssim": 0.91},
+        ]))
+        assert "2" in text
+
+    def test_retry_floor_clears_the_worst_failure(self):
+        # One floor has to satisfy every file the user wants to retry, so it
+        # follows the lowest score - and rounds down, or the retry fails too.
+        assert retry_floor([{"status": "failed", "ssim": 0.8712},
+                            {"status": "failed", "ssim": 0.9134}]) == 0.87
+
+    def test_retry_uses_the_paths_the_batch_reports(self):
+        # batch.py calls the source "path"; videocrunch.py calls it
+        # "input_path". Reading only one of them silently retries nothing.
+        assert retry_paths([{"status": "failed", "ssim": 0.87, "path": "/v/a.mp4"}]) == ["/v/a.mp4"]
+        assert retry_paths([{"status": "failed", "ssim": 0.87,
+                             "input_path": "/v/b.mp4"}]) == ["/v/b.mp4"]
+
+    def test_only_quality_failures_are_retried(self):
+        # Moving the floor does not fix an ffmpeg error.
+        assert retry_paths([{"status": "failed", "reason": "ffmpeg", "path": "/v/a.mp4"},
+                            {"status": "success", "path": "/v/b.mp4"}]) == []
+
+    def test_no_measured_failure_means_nothing_to_retry(self):
+        assert retry_floor([{"status": "failed", "reason": "ffmpeg error"}]) is None
+        assert retry_floor([{"status": "success", "ssim": 0.99}]) is None
+
+
+class TestBatchRuntime:
+    """How long the selected files will take, added up per file.
+
+    One throughput figure for a mixed selection is meaningless: a 4K clip and
+    a 480p clip differ by an order of magnitude. Each file is estimated in its
+    own resolution class, and a single file without a basis makes the whole
+    estimate unavailable rather than wrong.
+    """
+
+    RECORDS = [{"size_mb": 100.0, "duration": 10.0, "height": 1080}] * 3
+
+    def test_sums_the_files(self):
+        entries = [{"size_mb": 50.0, "height": 1080}, {"size_mb": 50.0, "height": 1080}]
+        assert batch_runtime_sec(entries, self.RECORDS) == 10.0
+
+    def test_one_unknown_class_withholds_the_estimate(self):
+        entries = [{"size_mb": 50.0, "height": 1080}, {"size_mb": 50.0, "height": 2160}]
+        assert batch_runtime_sec(entries, self.RECORDS) is None
+
+    def test_no_history_at_all_means_no_estimate(self):
+        assert batch_runtime_sec([{"size_mb": 50.0, "height": 1080}], []) is None
