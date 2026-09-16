@@ -104,6 +104,22 @@ def read_encode_history(history_path: Path = DEFAULT_HISTORY_PATH) -> list:
     return records
 
 
+# A pass writes its staging file while the best earlier pass is still on
+# disk, and both can approach the size of the source.
+STAGING_COPIES_PER_FILE = 2
+
+
+def disk_headroom_needed(source_bytes: int, files: int = 1) -> int:
+    """Bytes that must be free before encoding may start.
+
+    Running out of space mid-encode yields a truncated file: the integrity
+    check rejects it, so nothing is lost — but the user sees a row of
+    unexplained failures instead of the one sentence that explains them.
+    Workers run in parallel, so a batch needs room for every file at once.
+    """
+    return int(source_bytes) * STAGING_COPIES_PER_FILE * max(1, int(files))
+
+
 def history_throughput(records: list, height: int | None = None,
                        min_samples: int = 3) -> float | None:
     """Median encode throughput in MB of source per second, or None.

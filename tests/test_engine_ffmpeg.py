@@ -304,6 +304,100 @@ class TestResumableStaging:
         assert reusable_staging(empty, expected_duration=2.0, expected_audio=1) is False
 
 
+class TestProcessFileEndToEnd:
+    """What a full run does, pinned before the function is taken apart.
+
+    `process_file` had grown past a thousand lines with almost nothing
+    exercising it end to end — every test around it covered a helper. These
+    tests describe the behaviour that must survive any restructuring.
+    """
+
+    def _run(self, clip, **kwargs):
+        from videocrunch import ENCODER_PROFILES, last_encode_result, process_file
+        last_encode_result.update({k: None for k in last_encode_result})
+        ok, saved = process_file(clip, ENCODER_PROFILES["libx265"], **kwargs)
+        return ok, saved, dict(last_encode_result)
+
+    def test_a_successful_run_writes_the_output_and_reports_it(self, tiny_clip, tmp_path):
+        clip = tmp_path / "in.mp4"
+        shutil.copy(tiny_clip, clip)
+        ok, saved, result = self._run(clip, force=True, audio_mode="standard")
+        assert ok is True and saved > 0
+        assert (tmp_path / "in_opt.mp4").exists()
+        assert result["status"] == "success"
+        assert result["ssim"] > 0
+        assert result["quality"] is not None
+        assert Path(result["output_path"]).name == "in_opt.mp4"
+
+    def test_copy_mode_muxes_without_re_encoding(self, tiny_clip, tmp_path):
+        # Passthrough writes <stem>_trim.mp4 and leaves the video stream
+        # untouched — the whole point is not to re-encode.
+        clip = tmp_path / "in.mp4"
+        shutil.copy(tiny_clip, clip)
+        ok, _, result = self._run(clip, video_mode="copy", copy_audio=True)
+        assert ok is True
+        out = tmp_path / "in_trim.mp4"
+        assert out.exists()
+        assert result["status"] == "success"
+        codecs = [st["codec_name"] for st in _probe(out, "stream=codec_name")["streams"]]
+        assert "h264" in codecs
+
+    def test_a_trimmed_run_uses_the_same_output_name(self, tiny_clip, tmp_path):
+        # Remote workers glob for <stem>_opt.mp4 and would report a bogus
+        # failure if the trim branch ever wrote something else.
+        clip = tmp_path / "in.mp4"
+        shutil.copy(tiny_clip, clip)
+        ok, _, _ = self._run(clip, force=True, audio_mode="standard", ss="0", to="1")
+        assert ok is True
+        assert (tmp_path / "in_opt.mp4").exists()
+
+    def test_an_out_of_range_manual_quality_falls_back_to_the_search(self, tiny_clip, tmp_path):
+        # --q 999 is outside every profile's range. The run must fall back to
+        # the binary search rather than carrying the bogus value into it.
+        clip = tmp_path / "in.mp4"
+        shutil.copy(tiny_clip, clip)
+        ok, _, result = self._run(clip, force=True, audio_mode="standard", q_override=999)
+        assert ok is True
+        assert result["quality"] != 999
+
+    def test_a_full_disk_stops_the_run_before_it_starts(self, tiny_clip, tmp_path, monkeypatch):
+        # Without this the encode runs into ENOSPC, writes a truncated file,
+        # fails its integrity check and reports "failed" with no hint why.
+        import shutil as _shutil
+
+        import videocrunch
+        clip = tmp_path / "in.mp4"
+        shutil.copy(tiny_clip, clip)
+        monkeypatch.setattr(videocrunch.shutil, "disk_usage",
+                            lambda _p: _shutil._ntuple_diskusage(1_000_000, 999_000, 1_000))
+        ok, saved, result = self._run(clip, force=True, audio_mode="standard")
+        assert (ok, saved) == (False, 0)
+        assert not (tmp_path / "in_opt.mp4").exists()
+        assert "space" in (result["reason"] or "").lower()
+
+    def test_a_missing_file_is_refused_without_touching_anything(self, tmp_path):
+        ok, saved, _ = self._run(tmp_path / "gone.mp4")
+        assert (ok, saved) == (False, 0)
+        assert list(tmp_path.iterdir()) == []
+
+    def test_an_existing_output_is_left_alone(self, tiny_clip, tmp_path):
+        # Re-running over a folder must not re-encode what is already done.
+        clip = tmp_path / "in.mp4"
+        shutil.copy(tiny_clip, clip)
+        (tmp_path / "in_opt.mp4").write_bytes(b"previous result")
+        ok, _, result = self._run(clip, force=True)
+        assert ok is False
+        assert result["status"] == "skipped"
+        assert (tmp_path / "in_opt.mp4").read_bytes() == b"previous result"
+
+    def test_the_source_survives_a_run(self, tiny_clip, tmp_path):
+        clip = tmp_path / "in.mp4"
+        shutil.copy(tiny_clip, clip)
+        before = clip.read_bytes()
+        self._run(clip, force=True, audio_mode="standard")
+        assert clip.read_bytes() == before
+
+
 class TestProgressCallback:
     """scripts/mac_worker.py passes a callback so it can report encode
     progress upstream; the local CLI passes none."""

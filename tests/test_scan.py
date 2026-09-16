@@ -28,6 +28,7 @@ if str(REPO_ROOT) not in sys.path:
 from scan import (  # noqa: E402
     ask_yes_no,
     batch_runtime_sec,
+    disk_shortfall,
     display_name,
     downscale_candidates,
     find_videos,
@@ -593,3 +594,23 @@ class TestBatchRuntime:
 
     def test_no_history_at_all_means_no_estimate(self):
         assert batch_runtime_sec([{"size_mb": 50.0, "height": 1080}], []) is None
+
+
+class TestWizardDiskCheck:
+    """The wizard adds up what the whole selection needs before starting.
+
+    Per-file checks catch the problem, but only once the batch is running and
+    files start failing one after another. The selection is known up front.
+    """
+
+    ENTRIES = [{"size_mb": 100.0}, {"size_mb": 50.0}]
+
+    def test_enough_room_reports_no_shortfall(self):
+        assert disk_shortfall(self.ENTRIES, free_bytes=10 * 1024**3) == 0
+
+    def test_a_shortfall_is_reported_in_bytes(self):
+        # 150 MB of source needs headroom for staging on top.
+        assert disk_shortfall(self.ENTRIES, free_bytes=1024) > 0
+
+    def test_an_empty_selection_needs_nothing(self):
+        assert disk_shortfall([], free_bytes=0) == 0
