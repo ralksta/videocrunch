@@ -1756,6 +1756,7 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
     Percentages are per pass: the quality search runs several passes and each
     one restarts at 0, which is what `label` is for.
     """
+    input_path = Path(input_path)
     plan = prepare_encode(input_path, profile, min_size_mb, copy_audio, audio_mode,
                           ss, to, video_mode, q_override, scale_height, force, min_ssim)
     if plan is None:
