@@ -20,16 +20,24 @@ algorithm, encoder profiles, and quality-verification machinery.
 8. [HDR / 10-bit Safety](#hdr--10-bit-safety)
 9. [Two-Pass Linear Loudnorm](#two-pass-linear-loudnorm)
 10. [Stream & Metadata Preservation](#stream--metadata-preservation)
-11. [Output Integrity Verification](#output-integrity-verification)
-12. [Replacing the Source](#replacing-the-source)
-13. [Interrupted Runs](#interrupted-runs)
-14. [Machine-Readable Result](#machine-readable-result)
-15. [Configuration Constants](#configuration-constants)
-16. [CLI Reference](#cli-reference)
+11. [Disk Space](#disk-space)
+12. [Output Integrity Verification](#output-integrity-verification)
+13. [Replacing the Source](#replacing-the-source)
+14. [Interrupted Runs](#interrupted-runs)
+15. [Machine-Readable Result](#machine-readable-result)
+16. [Configuration Constants](#configuration-constants)
+17. [CLI Reference](#cli-reference)
 
 ---
 
 ## Architecture
+
+`process_file()` runs one file end to end, in two phases that are now
+separate functions: `prepare_encode()` settles everything before the first
+pass — probing, HDR handling, stream inventory, the pre-flight gate, bitrate
+ladder, sample windows — and hands it over as an `EncodePlan`; what remains
+is the quality search itself. `run_copy_mode()` holds the passthrough/trim
+path, which shares nothing with the search.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -308,6 +316,22 @@ capture date ends up in both the `mvhd` atom and a `udta` key, so
 `ffprobe -show_entries format_tags=creation_time` reports the same value
 twice, joined by a semicolon. Players read `mvhd`, Photos reads
 `com.apple.quicktime.creationdate`; both are correct.
+
+---
+
+## Disk Space
+
+Nothing used to look at free space. An encode that runs out writes a
+truncated file: the integrity check rejects it, so no data is lost, but the
+run reports `failed` with nothing to say why — and in a batch that repeats
+for every file.
+
+`disk_headroom_needed()` budgets **twice** the source size per file: the
+staging file of the current pass and the best pass kept from an earlier one
+exist at the same time, and both can approach the size of the source.
+`prepare_encode()` checks it per file and skips with a reason that names the
+numbers; the wizard adds the whole selection up before the batch starts, so
+the answer comes before the first encode rather than after the fifth failure.
 
 ---
 

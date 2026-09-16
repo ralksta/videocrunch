@@ -356,6 +356,45 @@ class TestBatchResultsForTheWizard:
         assert batch.write_batch_results(tmp_path / "nope" / "r.json", []) is False
 
 
+class TestBatchWindowHold:
+    """The pause at the end of a batch belongs to the window it keeps open.
+
+    `batch.py` is launched two ways: in a Terminal window opened by AppleScript,
+    where an immediate exit would close the window before anyone reads the
+    summary — and from the wizard or a script, where ten seconds of waiting are
+    ten seconds of nothing.
+    """
+
+    def test_a_terminal_gets_the_pause(self):
+        assert batch.window_hold_seconds(is_tty=True) > 0
+
+    def test_a_pipeline_does_not_wait(self):
+        assert batch.window_hold_seconds(is_tty=False) == 0
+
+
+class TestQualitySearchBounds:
+    """When the linear search has walked past its last rung.
+
+    The two encoder families count in opposite directions — VideoToolbox's
+    q:v rises with quality, everyone else's CRF/CQ falls — so "past the end"
+    means the opposite comparison depending on the profile.
+    """
+
+    def test_rising_scales_stop_above_the_end(self):
+        # NVENC/x265: higher value = worse quality, search walks upward.
+        assert videocrunch.quality_search_continues(30, end_q=32, direction=1) is True
+        assert videocrunch.quality_search_continues(33, end_q=32, direction=1) is False
+
+    def test_falling_scales_stop_below_the_end(self):
+        # VideoToolbox: higher value = better quality, search walks downward.
+        assert videocrunch.quality_search_continues(50, end_q=45, direction=-1) is True
+        assert videocrunch.quality_search_continues(44, end_q=45, direction=-1) is False
+
+    def test_the_last_rung_is_included(self):
+        assert videocrunch.quality_search_continues(32, end_q=32, direction=1) is True
+        assert videocrunch.quality_search_continues(45, end_q=45, direction=-1) is True
+
+
 class TestJsonResult:
     """`--json-out PATH` — the machine-readable result of a run.
 
@@ -515,9 +554,10 @@ class TestProcessFileImportContract:
 
         Matches the assignment, not any mention of the string — a log line
         saying "_opt.mp4 already exists" must not keep this test green after
-        the real output name changed.
+        the real output name changed. The assignment lives in prepare_encode,
+        which is where process_file settles every path before encoding.
         """
-        source = inspect.getsource(videocrunch.process_file)
+        source = inspect.getsource(videocrunch.prepare_encode)
         assignment = 'output_path = input_path.parent / f"{input_path.stem}_opt.mp4"'
         count = source.count(assignment)
         assert count >= 2, (

@@ -144,6 +144,19 @@ def read_worker_result(path) -> dict | None:
         return None
 
 
+WINDOW_HOLD_SECONDS = 10
+
+
+def window_hold_seconds(is_tty: bool) -> int:
+    """How long to keep the window open after the summary.
+
+    The pause exists for the Terminal window AppleScript opens, which would
+    otherwise close before anyone read the result. Started from the wizard or
+    a script there is no window, and the wait is pure delay.
+    """
+    return WINDOW_HOLD_SECONDS if is_tty else 0
+
+
 def write_batch_results(path, results: list) -> bool:
     """Write every file's result as one JSON object. Never raises.
 
@@ -515,14 +528,16 @@ def main():
     if args.json_out:
         write_batch_results(args.json_out, file_results)
 
-    print(f"\n{Y}Window will close in 10 seconds (Ctrl+C to close now)...{NC}")
-    try:
-        for i in range(10, 0, -1):
-            print(f"\r{DIM}Closing in {i}...{NC}", end="", flush=True)
-            time.sleep(1)
-        print()
-    except KeyboardInterrupt:
-        print(f"\n{G}Closing...{NC}")
+    hold = window_hold_seconds(sys.stdout.isatty())
+    if hold:
+        print(f"\n{Y}Window will close in {hold} seconds (Ctrl+C to close now)...{NC}")
+        try:
+            for i in range(hold, 0, -1):
+                print(f"\r{DIM}Closing in {i}...{NC}", end="", flush=True)
+                time.sleep(1)
+            print()
+        except KeyboardInterrupt:
+            print(f"\n{G}Closing...{NC}")
 
 
 if __name__ == "__main__":

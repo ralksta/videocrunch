@@ -177,6 +177,12 @@ can settle.
 Interrupting a run with Ctrl-C asks whether to keep the passes that already
 finished; the next run reuses them instead of encoding them again.
 
+Before anything is encoded, the run checks that the volume has room for it —
+twice the source size per file, because the staging file of the current pass
+and the best one kept from an earlier pass exist at the same time. Running
+out of space mid-encode is caught by the integrity check either way, but it
+costs an hour of encoding to find out.
+
 ## What comes across into the output
 
 Every audio track, every text subtitle track, and the container metadata —

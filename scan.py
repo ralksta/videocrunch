@@ -14,6 +14,7 @@ which runs the encodes in parallel.
 import argparse
 import json
 import os
+import shutil
 import statistics
 import subprocess
 import sys
@@ -25,6 +26,7 @@ from typing import Any, Optional
 
 from crunch_utils import (
     DEFAULT_HISTORY_PATH,
+    disk_headroom_needed,
     estimate_runtime_sec,
     history_throughput,
     read_encode_history,
@@ -561,6 +563,18 @@ def retry_floor(results: list) -> float | None:
     return suggested_floor(min(scores))
 
 
+def disk_shortfall(entries: list, free_bytes: int) -> int:
+    """Bytes missing to run this selection, or 0 when there is room.
+
+    Checked for the whole selection before the batch starts: the per-file
+    check inside the encoder catches the same problem, but only once files
+    have begun failing one after another.
+    """
+    needed = sum(disk_headroom_needed(int((e.get("size_mb") or 0) * 1024 * 1024))
+                 for e in entries)
+    return max(0, needed - int(free_bytes))
+
+
 def batch_runtime_sec(entries: list, records: list) -> float | None:
     """Seconds the selected files should take, each in its own class.
 
@@ -748,6 +762,20 @@ def main() -> int:
     chosen = [shown[i - 1] for i in picked]
     scale_height = None
     replace = False
+
+    try:
+        free = shutil.disk_usage(root).free
+    except OSError:
+        free = None
+    if free is not None:
+        missing = disk_shortfall(chosen, free)
+        if missing:
+            print(f"\n{R}Zu wenig Platz:{NC} es fehlen etwa "
+                  f"{format_size(missing / (1024 * 1024))} auf diesem Volume.")
+            print(DIM + "   Encodes brauchen Platz für Zwischenstände, nicht nur "
+                  "für das Ergebnis." + NC)
+            if not interactive or not ask_yes_no("Trotzdem starten?", default=False):
+                return 0
 
     if interactive:
         print()

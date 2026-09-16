@@ -21,6 +21,7 @@ from crunch_utils import (  # noqa: E402
     build_audio_filter_chain,
     build_stream_args,
     clamp_maxrate_to_pass,
+    disk_headroom_needed,
     estimate_runtime_sec,
     history_throughput,
     is_hdr_or_10bit,
@@ -449,3 +450,26 @@ class TestReadEncodeHistory:
 
     def test_a_missing_history_is_simply_empty(self, tmp_path):
         assert read_encode_history(tmp_path / "nothing.jsonl") == []
+
+
+class TestDiskHeadroom:
+    """How much room a run needs before it starts.
+
+    Nothing in the project ever looked at free space. Running out mid-encode
+    produces a truncated file — caught by the integrity check, but the user
+    sees a row of unexplained failures instead of the one sentence that
+    explains all of them.
+    """
+
+    def test_a_run_needs_room_for_more_than_the_result(self):
+        # The staging file of the current pass and the best one kept from an
+        # earlier pass exist at the same time, and both can approach the size
+        # of the source.
+        assert disk_headroom_needed(1000) > 1000
+
+    def test_the_estimate_scales_with_the_source(self):
+        assert disk_headroom_needed(2000) == 2 * disk_headroom_needed(1000)
+
+    def test_a_batch_needs_room_for_every_file_at_once(self):
+        # Workers run in parallel, so their staging files coexist.
+        assert disk_headroom_needed(1000, files=4) == 4 * disk_headroom_needed(1000)

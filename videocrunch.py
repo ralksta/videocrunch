@@ -11,10 +11,12 @@ import math
 import os
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -30,6 +32,7 @@ from crunch_utils import (
     build_audio_filter_chain,
     build_stream_args,
     clamp_maxrate_to_pass,
+    disk_headroom_needed,
     is_hdr_or_10bit,
     narrow_quality_window,
     nearest_quality_index,
@@ -932,7 +935,10 @@ def build_ffmpeg_command(input_path, output_path, profile, quality_value, copy_a
     tag = 'av01' if is_av1 else 'hvc1'
 
     cmd.extend([
-        '-tag:v', tag,
+        # Copy mode keeps the source's own video codec, so stamping this
+        # profile's tag on it is wrong — ffmpeg rejects `hvc1` on an H.264
+        # stream outright. Without a tag it picks the matching one itself.
+        *([] if video_mode == 'copy' else ['-tag:v', tag]),
         # delay_moov: prevents partial/corrupt moov on aborted encodes.
         # use_metadata_tags: carries QuickTime keys (GPS, capture date with
         # timezone, camera model) through — without it the mp4 muxer writes
@@ -1229,15 +1235,161 @@ def retention_floor(min_ssim: Optional[float]) -> float:
     return min_ssim if min_ssim else SSIM_ACCEPTABLE
 
 
-def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None, audio_mode='enhanced', ss=None, to=None, video_mode='compress', q_override=None, presearch=True, scale_height=None, force=False, min_ssim=None, replace=False, progress_callback=None):
-    """Process a single video file. Returns (success, bytes_saved).
+def quality_search_continues(q: int, end_q: int, direction: int) -> bool:
+    """Whether the linear search has rungs left.
 
-    `progress_callback(done_seconds, total_seconds, label)` is called while
-    ffmpeg runs, so an embedding caller (scripts/mac_worker.py) can report
-    progress upstream. It fires from the ffmpeg reader loop — it must return
-    fast and must not do network I/O, or it stalls the progress pipe.
-    Percentages are per pass: the quality search runs several passes and each
-    one restarts at 0, which is what `label` is for.
+    The two encoder families count in opposite directions — VideoToolbox's
+    q:v rises with quality, CRF/CQ falls — so "past the end" is the opposite
+    comparison depending on the profile.
+    """
+    return q <= end_q if direction > 0 else q >= end_q
+
+
+def run_copy_mode(input_path, output_path, profile, copy_audio, audio_mode,
+                  ss, to, source_streams, port, size_before, info, is_trim,
+                  trim_duration, progress_callback=None):
+    """Passthrough/trim: mux the source into a new file without re-encoding.
+
+    Split out of process_file because it shares nothing with the quality
+    search — no passes, no measurement, no staging — and only made the
+    search harder to read.
+    """
+    print(f"{BG}>>> COPY MODE: Skipping re-encode logic.{NC}")
+    file_start_time = time.time()
+
+    # No quality value exists in copy mode and none is read: the builder
+    # writes `-c:v copy` and never touches it. Passing the search's `quality`
+    # here is what made this path raise UnboundLocalError — that variable is
+    # only assigned much later, in the linear search.
+    cmd = build_ffmpeg_command(input_path, output_path, profile, 0, copy_audio, audio_mode, ss, to, video_mode='copy', streams=source_streams)
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+    # Simple progress loop (copy/trim tends to be fast but we still want feedback)
+    # Note: ffmpeg output parsing logic below relies partially on encoding stats.
+    # Copy mode outputs less stats, but we can try reuse the existing loop.
+
+    encode_start = time.time()
+    captured_errors = []
+
+    # Start Non-Blocking Reader
+    q = queue.Queue()
+    t = threading.Thread(target=enqueue_output, args=(process.stdout, q))
+    t.daemon = True
+    t.start()
+
+    try:
+         while True:
+            try:
+                line = q.get(timeout=2.0)
+            except queue.Empty:
+                if process.poll() is not None:
+                    break
+                # Still running but silent? likely faststart
+                sys.stdout.write(f"\r {G}copy{NC} [Moving Atoms / Finalizing...] ({time.time()-encode_start:.0f}s)    ")
+                sys.stdout.flush()
+                continue
+
+            if not line:
+                break
+
+            # Capture potential errors
+            if line.strip() and not any(k in line for k in ['bitrate=', 'speed=', 'out_time_ms=', 'total_size=']):
+                 captured_errors.append(line.strip())
+
+            # Only duration/size is really reliable in copy mode progress?
+            if 'out_time_ms=' in line:
+                val = line.split('=')[1].strip()
+                if val != 'N/A':
+                     try:
+                        ms = int(val)
+                        elapsed = time.time() - encode_start
+                        duration_to_show = trim_duration if is_trim else info['duration']
+                        show_progress(ms / 1000000, duration_to_show, 'copy', "copy", "fast", elapsed)
+                        _report_progress(progress_callback, ms / 1000000, duration_to_show, 'copy')
+                     except ValueError:
+                        pass
+
+    except KeyboardInterrupt:
+        process.terminate()
+        if output_path.exists():
+            output_path.unlink()
+        return (False, 0)
+
+    process.wait()
+
+    if process.returncode == 0:
+         file_time = time.time() - file_start_time
+         print(f" {BG}>>> SUCCESS (COPY)! Saved to {output_path.name} in {format_time(file_time)}.{NC}")
+         batch_stats['total_time'] += file_time
+         batch_stats['success'] += 1
+
+         # Calculate size diff just for logs, though savings aren't guaranteed
+         size_after = output_path.stat().st_size
+         saved_bytes = size_before - size_after
+
+         last_encode_result['filename'] = input_path.name
+         last_encode_result['status'] = 'success'
+         last_encode_result['reason'] = 'Video Copy (Passthrough)'
+         last_encode_result['duration'] = file_time
+         last_encode_result['saved_bytes'] = saved_bytes # Might be negative if container overhead
+
+         if port:
+             notify_server(port, input_path)
+         return (True, 0)
+    else:
+
+         print(f"{R}FFmpeg error during copy.{NC}")
+         for err in captured_errors[-10:]: # Print last 10 lines of error
+             print(f"  {R}{err}{NC}")
+         batch_stats['failed'] += 1
+         return (False, 0)
+
+@dataclass
+class EncodePlan:
+    """Everything decided before the first pass runs.
+
+    process_file used to build these two dozen values inline and then run
+    the search over them in the same thousand-line body. Naming the
+    hand-off makes the two phases separable — and reviewable.
+    """
+    info: Any
+    profile: Any
+    output_path: Any
+    scale_height: Any
+    source_streams: Any
+    size_before: Any
+    size_to_compare: Any
+    effective_height: Any
+    expected_out_duration: Any
+    expected_audio_tracks: Any
+    is_trim: Any
+    trim_duration: Any
+    start_offset: Any
+    file_start_time: Any
+    sample_starts: Any
+    loudnorm_measured: Any
+    maxrate_kbps: Any
+    bufsize_kbps: Any
+    quality_values: Any
+    bitrate_values: Any
+    use_binary_search: Any
+    start_q: Any
+    end_q: Any
+    step: Any
+    ssim_min: Any
+    fallback_floor: Any
+    source_avg_kbps: Any
+    q_override: Any
+
+def prepare_encode(input_path, profile, min_size_mb=0, copy_audio=False,
+                   audio_mode='enhanced', ss=None, to=None, video_mode='compress',
+                   q_override=None, scale_height=None, force=False, min_ssim=None):
+    """Everything that has to be settled before the first encode pass.
+
+    Probing, HDR handling, stream inventory, the pre-flight savings gate,
+    bitrate ladder and sample windows. Returns None when the file must not
+    be encoded at all — the caller answers (False, 0); the reason has
+    already been printed and recorded.
     """
     input_path = Path(input_path)
     is_trim = ss is not None or to is not None
@@ -1251,7 +1403,7 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
     fallback_floor = retention_floor(min_ssim)
 
     if not input_path.exists():
-        return (False, 0)
+        return None
 
     # Skip already marked files (UNLESS trimming is active, then we allow re-processing)
     if not is_trim and ("NO-OPT" in input_path.name):
@@ -1261,7 +1413,7 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
         last_encode_result['status'] = 'skipped'
         last_encode_result['reason'] = 'NO-OPT marker found'
         last_encode_result['duration'] = 0
-        return (False, 0)
+        return None
 
     # Determine Output Path
     if video_mode == 'copy':
@@ -1283,17 +1435,39 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
             last_encode_result['reason'] = 'Output file already exists'
             last_encode_result['duration'] = 0
             last_encode_result['output_path'] = str(output_path.resolve())
-            return (False, 0)
+            return None
 
     last_encode_result['output_path'] = str(output_path.resolve())
 
     size_before = input_path.stat().st_size
     size_mb = size_before / (1024 * 1024)
 
+    # --- DISK SPACE ---
+    # An encode that runs out of space writes a truncated file: the integrity
+    # check rejects it, so nothing is lost, but the run reports "failed" with
+    # no hint why. Saying so up front costs one syscall.
+    needed = disk_headroom_needed(size_before)
+    try:
+        free = shutil.disk_usage(input_path.parent).free
+    except OSError:
+        free = None
+    if free is not None and free < needed:
+        # Spelled out in full because this text is what lands in the log and
+        # in the JSON result, where nothing else says what went wrong.
+        reason = (f"not enough disk space: needs ~{format_size(needed)}, "
+                  f"{format_size(free)} free on this volume")
+        print(f"{R}Skipping:{NC} {input_path.name} — {reason}")
+        batch_stats['skipped'] += 1
+        last_encode_result['filename'] = input_path.name
+        last_encode_result['status'] = 'skipped'
+        last_encode_result['reason'] = reason
+        last_encode_result['duration'] = 0
+        return None
+
     info = get_video_info(input_path)
     if not info or info['duration'] <= 0:
         batch_stats['failed'] += 1
-        return (False, 0)
+        return None
 
     # --- DOWNSCALE REQUEST ---
     # Only ever downscale: upscaling would grow the file and invent detail.
@@ -1337,7 +1511,7 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
             last_encode_result['status'] = 'skipped'
             last_encode_result['reason'] = reason
             last_encode_result['duration'] = 0
-            return (False, 0)
+            return None
 
     # --- HDR / 10-BIT SAFETY ---
     # Stamping BT.709 tags onto BT.2020/PQ content washes out colors. Encode
@@ -1352,7 +1526,7 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
             last_encode_result['status'] = 'skipped'
             last_encode_result['reason'] = reason
             last_encode_result['duration'] = 0
-            return (False, 0)
+            return None
         profile = hdr_profile
         print(f"{Y}HDR/10-bit source:{NC} main10 encode with color passthrough ({info.get('color_transfer') or '10-bit SDR'})")
 
@@ -1417,7 +1591,7 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
         last_encode_result['status'] = 'skipped'
         last_encode_result['reason'] = f'File too small ({size_mb:.1f} MB < {min_size_mb} MB)'
         last_encode_result['duration'] = 0
-        return (False, 0)
+        return None
 
     print(f"\n{G}Target:{NC} {input_path.name} ({format_size(size_before)})")
     if is_trim:
@@ -1535,107 +1709,94 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
             use_binary_search = True
         else:
             print(f"{Y}Manual Start Quality:{NC} Q={q_override} (linear search)")
-            quality = q_override
 
     file_start_time = time.time()
 
-    def should_continue(q):
-        if video_mode == 'copy':
-            return False # Only one pass for copy mode
+    return EncodePlan(
+        info=info,
+        profile=profile,
+        output_path=output_path,
+        scale_height=scale_height,
+        source_streams=source_streams,
+        size_before=size_before,
+        size_to_compare=size_to_compare,
+        effective_height=effective_height,
+        expected_out_duration=expected_out_duration,
+        expected_audio_tracks=expected_audio_tracks,
+        is_trim=is_trim,
+        trim_duration=trim_duration,
+        start_offset=start_offset,
+        file_start_time=file_start_time,
+        sample_starts=sample_starts,
+        loudnorm_measured=loudnorm_measured,
+        maxrate_kbps=maxrate_kbps,
+        bufsize_kbps=bufsize_kbps,
+        quality_values=quality_values,
+        bitrate_values=bitrate_values,
+        use_binary_search=use_binary_search,
+        start_q=start_q,
+        end_q=end_q,
+        step=step,
+        ssim_min=ssim_min,
+        fallback_floor=fallback_floor,
+        source_avg_kbps=_source_avg_kbps,
+        # Corrected here when it was out of range: letting the caller
+        # keep the original value would put a bogus Q back in play.
+        q_override=q_override,
+    )
 
-        if profile['quality_direction'] > 0:
-            return q <= end_q
-        else:
-            return q >= end_q
+
+def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None, audio_mode='enhanced', ss=None, to=None, video_mode='compress', q_override=None, presearch=True, scale_height=None, force=False, min_ssim=None, replace=False, progress_callback=None):
+    """Process a single video file. Returns (success, bytes_saved).
+
+    `progress_callback(done_seconds, total_seconds, label)` is called while
+    ffmpeg runs, so an embedding caller (scripts/mac_worker.py) can report
+    progress upstream. It fires from the ffmpeg reader loop — it must return
+    fast and must not do network I/O, or it stalls the progress pipe.
+    Percentages are per pass: the quality search runs several passes and each
+    one restarts at 0, which is what `label` is for.
+    """
+    plan = prepare_encode(input_path, profile, min_size_mb, copy_audio, audio_mode,
+                          ss, to, video_mode, q_override, scale_height, force, min_ssim)
+    if plan is None:
+        return (False, 0)
+
+    info = plan.info
+    profile = plan.profile
+    output_path = plan.output_path
+    scale_height = plan.scale_height
+    source_streams = plan.source_streams
+    size_before = plan.size_before
+    size_to_compare = plan.size_to_compare
+    effective_height = plan.effective_height
+    expected_out_duration = plan.expected_out_duration
+    expected_audio_tracks = plan.expected_audio_tracks
+    is_trim = plan.is_trim
+    trim_duration = plan.trim_duration
+    start_offset = plan.start_offset
+    file_start_time = plan.file_start_time
+    sample_starts = plan.sample_starts
+    loudnorm_measured = plan.loudnorm_measured
+    maxrate_kbps = plan.maxrate_kbps
+    bufsize_kbps = plan.bufsize_kbps
+    quality_values = plan.quality_values
+    bitrate_values = plan.bitrate_values
+    use_binary_search = plan.use_binary_search
+    end_q = plan.end_q
+    step = plan.step
+    ssim_min = plan.ssim_min
+    fallback_floor = plan.fallback_floor
+    q_override = plan.q_override
+    _source_avg_kbps = plan.source_avg_kbps
+
+    def should_continue(q):
+        return quality_search_continues(q, end_q, profile['quality_direction'])
 
     # Video Copy Mode Bypass
     if video_mode == 'copy':
-        print(f"{BG}>>> COPY MODE: Skipping re-encode logic.{NC}")
-        file_start_time = time.time()
-
-        cmd = build_ffmpeg_command(input_path, output_path, profile, quality, copy_audio, audio_mode, ss, to, video_mode='copy', streams=source_streams)
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-
-        # Simple progress loop (copy/trim tends to be fast but we still want feedback)
-        # Note: ffmpeg output parsing logic below relies partially on encoding stats.
-        # Copy mode outputs less stats, but we can try reuse the existing loop.
-
-        encode_start = time.time()
-        captured_errors = []
-
-        # Start Non-Blocking Reader
-        q = queue.Queue()
-        t = threading.Thread(target=enqueue_output, args=(process.stdout, q))
-        t.daemon = True
-        t.start()
-
-        try:
-             while True:
-                try:
-                    line = q.get(timeout=2.0)
-                except queue.Empty:
-                    if process.poll() is not None:
-                        break
-                    # Still running but silent? likely faststart
-                    sys.stdout.write(f"\r {G}copy{NC} [Moving Atoms / Finalizing...] ({time.time()-encode_start:.0f}s)    ")
-                    sys.stdout.flush()
-                    continue
-
-                if not line:
-                    break
-
-                # Capture potential errors
-                if line.strip() and not any(k in line for k in ['bitrate=', 'speed=', 'out_time_ms=', 'total_size=']):
-                     captured_errors.append(line.strip())
-
-                # Only duration/size is really reliable in copy mode progress?
-                if 'out_time_ms=' in line:
-                    val = line.split('=')[1].strip()
-                    if val != 'N/A':
-                         try:
-                            ms = int(val)
-                            elapsed = time.time() - encode_start
-                            duration_to_show = trim_duration if is_trim else info['duration']
-                            show_progress(ms / 1000000, duration_to_show, 'copy', "copy", "fast", elapsed)
-                            _report_progress(progress_callback, ms / 1000000, duration_to_show, 'copy')
-                         except ValueError:
-                            pass
-
-        except KeyboardInterrupt:
-            process.terminate()
-            if output_path.exists():
-                output_path.unlink()
-            return (False, 0)
-
-        process.wait()
-
-        if process.returncode == 0:
-             file_time = time.time() - file_start_time
-             print(f" {BG}>>> SUCCESS (COPY)! Saved to {output_path.name} in {format_time(file_time)}.{NC}")
-             batch_stats['total_time'] += file_time
-             batch_stats['success'] += 1
-
-             # Calculate size diff just for logs, though savings aren't guaranteed
-             size_after = output_path.stat().st_size
-             saved_bytes = size_before - size_after
-
-             last_encode_result['filename'] = input_path.name
-             last_encode_result['status'] = 'success'
-             last_encode_result['reason'] = 'Video Copy (Passthrough)'
-             last_encode_result['duration'] = file_time
-             last_encode_result['saved_bytes'] = saved_bytes # Might be negative if container overhead
-
-             if port:
-                 notify_server(port, input_path)
-             return (True, 0)
-        else:
-
-             print(f"{R}FFmpeg error during copy.{NC}")
-             for err in captured_errors[-10:]: # Print last 10 lines of error
-                 print(f"  {R}{err}{NC}")
-             batch_stats['failed'] += 1
-             return (False, 0)
-
+        return run_copy_mode(input_path, output_path, profile, copy_audio,
+                             audio_mode, ss, to, source_streams, port, size_before,
+                             info, is_trim, trim_duration, progress_callback)
     # Helper: clean up any leftover staging files for current output
     def _cleanup_staging():
         for f in output_path.parent.glob(f"{output_path.stem}._staging_q*{output_path.suffix}"):
