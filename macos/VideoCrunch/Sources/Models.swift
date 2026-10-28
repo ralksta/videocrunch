@@ -1,0 +1,87 @@
+import Foundation
+import SwiftUI
+
+// MARK: - Models
+
+struct Candidate: Identifiable, Codable, Hashable {
+    var id: String { file_path }
+    let file_path: String
+    let size_mb: Double
+    let codec: String
+    let width: Int
+    let height: Int
+    let bitrate_mbps: Double
+    let estimated_saved_mb: Double
+    let estimated_saved_pct: Double
+    let confidence: String
+    let source: String
+    let reason: String
+
+    var filename: String {
+        URL(fileURLWithPath: file_path).lastPathComponent
+    }
+
+    var resolutionString: String {
+        if height > 0 {
+            return "\(height)p"
+        }
+        return "Unknown"
+    }
+
+    var sizeFormatted: String {
+        formatMB(size_mb)
+    }
+
+    var savedFormatted: String {
+        formatMB(estimated_saved_mb)
+    }
+}
+
+struct ScanSummary: Codable {
+    let total_files: Int
+    let total_estimated_saved_mb: Double
+    let history_based: Int
+}
+
+struct ScanResponse: Codable {
+    let summary: ScanSummary
+    let results: [Candidate]
+}
+
+struct WorkerStatus: Identifiable {
+    let id: Int
+    var file: String
+    var status: String
+    var progress: Int
+    var q: Int
+}
+
+struct BatchItemResult: Codable, Identifiable {
+    var id: String { path ?? filename ?? UUID().uuidString }
+    let filename: String?
+    let path: String?
+    let status: String?
+    let quality: Int?
+    let ssim: Double?
+    let saved_pct: Double?
+    let saved_bytes: Int64?
+    let duration: Double?
+    let reason: String?
+}
+
+struct BatchReport: Codable {
+    let videocrunch: Int?
+    let results: [BatchItemResult]?
+}
+
+func formatMB(_ mb: Double) -> String {
+    if mb >= 1024 {
+        return String(format: "%.2f GB", mb / 1024.0)
+    }
+    return String(format: "%.1f MB", mb)
+}
+
+func formatBytes(_ bytes: Int64) -> String {
+    let mb = Double(bytes) / (1024.0 * 1024.0)
+    return formatMB(mb)
+}

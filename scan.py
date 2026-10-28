@@ -685,20 +685,23 @@ def main() -> int:
     log = (lambda msg: print(msg, file=sys.stderr)) if args.json else print
 
     root = Path(args.folder).expanduser()
-    if not root.is_dir():
-        log(f"{R}Kein Ordner: {root}{NC}")
+    if root.is_file():
+        paths = [root]
+    elif root.is_dir():
+        log(f"{G}Ordner:{NC} {root}")
+        paths = find_videos(root)
+    else:
+        log(f"{R}Kein Ordner oder Datei: {root}{NC}")
         return 1
 
-    log(f"{G}Ordner:{NC} {root}")
-
-    paths = find_videos(root)
     if not paths:
         if args.json:
             print(json.dumps(rank([], args.codec, set(), EncodeHistory(), limit=args.limit)))
         else:
             log(f"{Y}Keine Videodateien gefunden.{NC}")
         return 0
-    log(f"{G}Gefunden:{NC} {len(paths)} Videodateien\n")
+    if root.is_dir():
+        log(f"{G}Gefunden:{NC} {len(paths)} Videodateien\n")
 
     if shutil.which('ffprobe') is None:
         log(f"{R}ffprobe nicht gefunden (PATH: {os.environ.get('PATH', '')}){NC}")
@@ -706,10 +709,9 @@ def main() -> int:
 
     entries = probe_all(paths, quiet=args.json)
     if not entries:
+        log(f"{R}Keine lesbaren Videodateien.{NC}")
         if args.json:
             print(json.dumps(rank([], args.codec, set(), EncodeHistory(), limit=args.limit)))
-        else:
-            log(f"{R}Keine lesbaren Videodateien.{NC}")
         return 1
 
     # Files that already have an _opt.mp4 next to them are done.
