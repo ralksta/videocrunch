@@ -12,6 +12,7 @@ import os
 import queue
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -2658,8 +2659,19 @@ def build_parser():
     return parser
 
 
+def abort_on_sigterm(signum, frame):
+    """batch.py cancels its workers with SIGTERM; take Ctrl+C's abort path.
+
+    That path stops ffmpeg and removes the half-written pass. SIGINT itself
+    can't be relied on: a process started in the background inherits it as
+    ignored, and Python then never raises KeyboardInterrupt.
+    """
+    raise KeyboardInterrupt
+
+
 def main():
     args = build_parser().parse_args()
+    signal.signal(signal.SIGTERM, abort_on_sigterm)
 
     if args.port:
         print(f"🔌 Notification Port: {args.port}")

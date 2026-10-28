@@ -180,6 +180,22 @@ class TestBatchInvocation:
         with pytest.raises(SystemExit):
             batch.build_parser().parse_args(["--port=8000"])
 
+    def test_files_from_keeps_commas_in_names(self, tmp_path):
+        # "Urlaub, Tag 1.mov" was split into two paths that both don't exist.
+        listing = tmp_path / "files.txt"
+        listing.write_text("/v/Urlaub, Tag 1.mov\n/v/b.mp4\n", encoding="utf-8")
+        args = batch.build_parser().parse_args([f"--files-from={listing}"])
+        assert batch.file_list(args) == ["/v/Urlaub, Tag 1.mov", "/v/b.mp4"]
+
+    def test_files_and_files_from_are_exclusive(self, tmp_path):
+        with pytest.raises(SystemExit):
+            batch.build_parser().parse_args(
+                ["--files=/a.mp4", f"--files-from={tmp_path / 'x.txt'}"])
+
+    def test_comma_form_still_splits(self):
+        args = batch.build_parser().parse_args(["--files=/a.mp4, /b.mp4"])
+        assert batch.file_list(args) == ["/a.mp4", "/b.mp4"]
+
 
 class TestRejectedResult:
     """What a failed run leaves the user with.

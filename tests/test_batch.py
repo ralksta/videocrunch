@@ -1,11 +1,15 @@
 """Unit tests for batch_controller output parsing (pure logic, no ffmpeg)."""
+import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+import batch  # noqa: E402
 from batch import terminal_verdict  # noqa: E402
 
 
@@ -49,3 +53,61 @@ class TestTerminalVerdict:
 
     def test_empty_line(self):
         assert terminal_verdict("") == (None, None)
+
+
+# Stands in for videocrunch.py: same SIGTERM handling, says it is ready, then
+# waits to be cancelled. SIGINT is ignored the way a background job inherits
+# it, so only the real cancel path can end it with 7.
+FAKE_WORKER = (
+    "import signal, sys, time\n"
+    f"sys.path.insert(0, {str(REPO_ROOT)!r})\n"
+    "from videocrunch import abort_on_sigterm\n"
+    "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+    "signal.signal(signal.SIGTERM, abort_on_sigterm)\n"
+    "print('ready', flush=True)\n"
+    "try:\n"
+    "    time.sleep(30)\n"
+    "except KeyboardInterrupt:\n"
+    "    sys.exit(7)\n"
+)
+
+
+class TestAbort:
+    """Cancelling the batch must stop the encodes, not just batch.py.
+
+    The wizard cancels with SIGTERM. Without forwarding, batch.py died and
+    every videocrunch.py with its ffmpeg kept encoding on its own.
+    """
+
+    @pytest.fixture(autouse=True)
+    def fresh_state(self):
+        batch.abort_requested.clear()
+        batch.active_workers.clear()
+        yield
+        for process in list(batch.active_workers):
+            process.kill()
+        batch.abort_requested.clear()
+        batch.active_workers.clear()
+
+    def _start(self):
+        process = batch.start_worker([sys.executable, "-c", FAKE_WORKER])
+        assert process.stdout.readline().strip() == "ready"
+        return process
+
+    def test_running_worker_gets_its_own_abort_path(self):
+        # Ends in videocrunch.py's KeyboardInterrupt path, which stops ffmpeg
+        # and removes the half-written pass.
+        process = self._start()
+        batch.abort_workers()
+        assert process.wait(timeout=10) == 7
+
+    def test_no_new_worker_starts_after_abort(self):
+        batch.abort_workers()
+        assert batch.start_worker([sys.executable, "-c", FAKE_WORKER]) is None
+
+    def test_finished_worker_is_forgotten(self):
+        process = self._start()
+        process.kill()
+        process.wait()
+        batch.finish_worker(process)
+        assert process not in batch.active_workers

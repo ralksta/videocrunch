@@ -38,6 +38,7 @@ from scan import (  # noqa: E402
     parse_selection,
     probe_to_media,
     retry_floor,
+    run_batch,
     retry_paths,
     select_candidates,
     summary_lines,
@@ -335,6 +336,19 @@ class TestJsonOutput:
         assert result.returncode == 0
         json.loads(result.stdout)
 
+    def test_missing_ffprobe_is_named_on_stderr(self, tmp_path):
+        # A Finder-launched GUI gets PATH=/usr/bin:/bin:..., without Homebrew.
+        # Every probe then fails silently and the only stderr line left was
+        # the progress counter — the error has to say what is actually wrong.
+        (tmp_path / "clip.mov").write_bytes(b"not really a video")
+        result = subprocess.run(
+            [sys.executable, str(self.SCAN_PY), str(tmp_path), "--json"],
+            capture_output=True, text=True, timeout=30,
+            env={"PATH": str(tmp_path)},
+        )
+        assert result.returncode == 1
+        assert "ffprobe nicht gefunden" in result.stderr
+
     @pytest.mark.skipif(
         shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
         reason="ffmpeg/ffprobe not installed",
@@ -614,3 +628,19 @@ class TestWizardDiskCheck:
 
     def test_an_empty_selection_needs_nothing(self):
         assert disk_shortfall([], free_bytes=0) == 0
+
+
+class TestRunBatch:
+    """The interactive scan hands its selection to batch.py."""
+
+    def test_names_with_commas_reach_batch_intact(self, monkeypatch):
+        seen = {}
+
+        def fake_run(cmd, *a, **kw):
+            listing = cmd[cmd.index("--files-from") + 1]
+            seen["files"] = Path(listing).read_text(encoding="utf-8").splitlines()
+            return subprocess.CompletedProcess(cmd, 0)
+
+        monkeypatch.setattr("scan.subprocess.run", fake_run)
+        assert run_batch(["/v/Urlaub, Tag 1.mov", "/v/b.mp4"], "enhanced") == 0
+        assert seen["files"] == ["/v/Urlaub, Tag 1.mov", "/v/b.mp4"]
