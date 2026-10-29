@@ -218,54 +218,135 @@ struct WizardView: View {
 
     // MARK: - Step 3: Options View
     private var optionsView: some View {
-        Form {
-            Section(header: Text("Zusammenfassung der Auswahl").font(.headline)) {
-                HStack {
-                    Label("\(vm.selectedCandidates.count) Videos ausgewählt", systemImage: "video.fill")
-                    Spacer()
-                    Text("Erwartete Ersparnis: ~\(formatMB(vm.selectedEstimatedSavedMB))")
-                        .fontWeight(.bold)
-                        .foregroundColor(.green)
-                }
-            }
+        ScrollView {
+            VStack(alignment: .leading, spacing: 22) {
+                savingsSummary
 
-            Section(header: Text("Optimierungs-Optionen").font(.headline)) {
-                if vm.hasTallCandidates {
-                    Toggle(isOn: $vm.scaleTo1080p) {
-                        VStack(alignment: .leading) {
-                            Text("\(vm.tallCandidatesCount) Dateien sind höher als 1080p: Auf 1080p verkleinern?")
-                                .fontWeight(.medium)
-                            Text("Spart meist am meisten Platz, behält Seitenverhältnis bei.")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
+                OptionSection(title: "Codec") {
+                    HStack(spacing: 12) {
+                        ChoiceCard(
+                            icon: "bolt.fill",
+                            title: "HEVC / H.265",
+                            subtitle: "Hardware-Encoder, schnell. Läuft auf praktisch jedem Gerät.",
+                            selected: vm.targetCodec == "hevc"
+                        ) { vm.targetCodec = "hevc" }
+                        ChoiceCard(
+                            icon: "sparkles",
+                            title: "AV1",
+                            subtitle: "Kleinere Dateien, deutlich langsamer. Braucht neuere Geräte zum Abspielen.",
+                            badge: "Experimentell",
+                            selected: vm.targetCodec == "av1"
+                        ) { vm.targetCodec = "av1" }
+                    }
+                    .fixedSize(horizontal: false, vertical: true)
+                    if vm.targetCodec != vm.scannedCodec {
+                        Label("Die Ersparnis oben wurde für \(codecName(vm.scannedCodec)) geschätzt.",
+                              systemImage: "info.circle")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                OptionSection(title: "Audio") {
+                    HStack(spacing: 12) {
+                        ChoiceCard(
+                            icon: "speaker.wave.3.fill",
+                            title: "Lautheit angleichen",
+                            subtitle: "Auf −16 LUFS: leise Handyvideos werden hörbar, laute gezähmt.",
+                            selected: vm.audioMode == "enhanced"
+                        ) { vm.audioMode = "enhanced" }
+                        ChoiceCard(
+                            icon: "waveform",
+                            title: "Original",
+                            subtitle: "Der Ton bleibt, wie er ist. Nur neu kodiert.",
+                            selected: vm.audioMode == "standard"
+                        ) { vm.audioMode = "standard" }
+                    }
+                    .fixedSize(horizontal: false, vertical: true)
+                }
+
+                OptionSection(title: "Dateien") {
+                    VStack(spacing: 0) {
+                        if vm.hasTallCandidates {
+                            SettingRow(
+                                icon: "arrow.down.right.and.arrow.up.left",
+                                tint: .blue,
+                                title: "Auf 1080p verkleinern",
+                                subtitle: "\(videoCount(vm.tallCandidatesCount)) höher als 1080p. Spart meist am meisten, Seitenverhältnis bleibt."
+                            ) {
+                                Toggle("", isOn: $vm.scaleTo1080p)
+                                    .toggleStyle(.switch)
+                                    .labelsHidden()
+                            }
+                            Divider().padding(.leading, 54)
+                        }
+                        SettingRow(
+                            icon: "trash.fill",
+                            tint: vm.moveToTrash ? .red : .gray,
+                            title: "Originale in den Papierkorb",
+                            subtitle: vm.moveToTrash
+                                ? "Erst nach bestandenem SSIM-Qualitätscheck. Aus dem Papierkorb wiederherstellbar."
+                                : "Aus: Das Original bleibt neben der neuen _opt.mp4 liegen."
+                        ) {
+                            Toggle("", isOn: $vm.moveToTrash)
+                                .toggleStyle(.switch)
+                                .labelsHidden()
                         }
                     }
-                    .toggleStyle(.checkbox)
-                }
-
-                Toggle(isOn: $vm.moveToTrash) {
-                    VStack(alignment: .leading) {
-                        Text("Originale nach erfolgreichem Encode in Papierkorb legen?")
-                            .fontWeight(.medium)
-                        Text("Wird erst verschoben, nachdem der SSIM-Qualitätscheck bestanden wurde.")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-                }
-                .toggleStyle(.checkbox)
-
-                Picker("Audio-Modus", selection: $vm.audioMode) {
-                    Text("Enhanced (-16 LUFS, optimierte Dynamik)").tag("enhanced")
-                    Text("Standard (Lautstärke unverändert)").tag("standard")
-                }
-
-                Picker("Ziel-Codec", selection: $vm.targetCodec) {
-                    Text("HEVC / H.265 (Hardware VideoToolbox)").tag("hevc")
-                    Text("AV1 (Modern)").tag("av1")
+                    .cardBackground()
                 }
             }
+            .frame(maxWidth: 640)
+            .padding(.horizontal, 24)
+            .padding(.vertical, 22)
+            .frame(maxWidth: .infinity)
         }
-        .padding(30)
+    }
+
+    /// Before/after at a glance: what the selection weighs now and after.
+    private var savingsSummary: some View {
+        let before = vm.selectedTotalMB
+        let after = vm.selectedTotalAfterMB
+        let saved = vm.selectedEstimatedSavedMB
+        let fraction = before > 0 ? after / before : 1
+        return VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(videoCount(vm.selectedCandidates.count) + " ausgewählt")
+                        .font(.headline)
+                    Text("\(formatMB(before)) → ca. \(formatMB(after))")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+                Spacer()
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text("−\(formatMB(saved))")
+                        .font(.system(size: 26, weight: .bold, design: .rounded))
+                        .foregroundStyle(.green)
+                        .monospacedDigit()
+                    Text(before > 0 ? "ca. \(Int((1 - fraction) * 100)) % kleiner" : "geschätzt")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.green.opacity(0.25))
+                    Capsule()
+                        .fill(Color.accentColor.gradient)
+                        .frame(width: max(8, geo.size.width * fraction))
+                }
+            }
+            .frame(height: 8)
+            .accessibilityLabel("Danach ca. \(Int(fraction * 100)) % der heutigen Größe")
+        }
+        .padding(16)
+        .cardBackground()
+    }
+
+    private func codecName(_ codec: String) -> String {
+        codec == "av1" ? "AV1" : "HEVC"
     }
 
     // MARK: - Step 4: Encoding Live Status
@@ -388,9 +469,13 @@ struct WizardView: View {
     private var bottomBar: some View {
         HStack {
             if vm.currentStep == .options {
-                Button("Zurück") {
+                Button {
                     vm.backToCandidates()
+                } label: {
+                    Label("Zurück", systemImage: "chevron.left")
                 }
+                .controlSize(.large)
+                .keyboardShortcut(.cancelAction)
             } else if vm.currentStep == .encoding {
                 Button("Abbrechen") {
                     vm.cancelEncoding()
@@ -406,16 +491,28 @@ struct WizardView: View {
                     .font(.caption)
                     .foregroundColor(.secondary)
 
-                Button("Weiter zur Konfiguration") {
+                Button {
                     vm.proceedToOptions()
+                } label: {
+                    Label("Weiter", systemImage: "chevron.right")
                 }
                 .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .keyboardShortcut(.defaultAction)
                 .disabled(count == 0)
             } else if vm.currentStep == .options {
-                Button("Start Crunch 🚀") {
+                Text("\(videoCount(vm.selectedCandidates.count)) · \(codecName(vm.targetCodec))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Button {
                     vm.startEncoding()
+                } label: {
+                    Label("Encode starten", systemImage: "play.fill")
                 }
                 .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .keyboardShortcut(.defaultAction)
             } else if vm.currentStep == .completed {
                 Button("Schließen") {
                     NSApplication.shared.terminate(nil)
@@ -425,7 +522,139 @@ struct WizardView: View {
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 12)
-        .background(Color.secondary.opacity(0.05))
+        .background(.bar)
+    }
+}
+
+func videoCount(_ n: Int) -> String {
+    n == 1 ? "1 Video" : "\(n) Videos"
+}
+
+// MARK: - Option building blocks
+
+/// Grouped card surface, the way System Settings draws its sections.
+private struct CardBackground: ViewModifier {
+    func body(content: Content) -> some View {
+        content
+            .background(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(Color(nsColor: .controlBackgroundColor).opacity(0.55))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(Color(nsColor: .separatorColor))
+            )
+    }
+}
+
+extension View {
+    func cardBackground() -> some View {
+        modifier(CardBackground())
+    }
+}
+
+/// A titled group of options.
+private struct OptionSection<Content: View>: View {
+    let title: String
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .padding(.leading, 2)
+            content
+        }
+    }
+}
+
+/// One of several mutually exclusive choices, shown as a selectable card.
+private struct ChoiceCard: View {
+    let icon: String
+    let title: String
+    let subtitle: String
+    var badge: String? = nil
+    let selected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Image(systemName: icon)
+                        .font(.title3)
+                        .foregroundStyle(selected ? Color.accentColor : .secondary)
+                    Spacer()
+                    Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                        .font(.body)
+                        .foregroundStyle(selected ? Color.accentColor : Color.secondary.opacity(0.5))
+                }
+                HStack(spacing: 6) {
+                    Text(title)
+                        .fontWeight(.semibold)
+                    if let badge {
+                        Text(badge)
+                            .font(.caption2.weight(.medium))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1)
+                            .background(Capsule().fill(Color.orange.opacity(0.18)))
+                            .foregroundStyle(.orange)
+                    }
+                }
+                Text(subtitle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .padding(12)
+            .background(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(selected
+                          ? Color.accentColor.opacity(0.12)
+                          : Color(nsColor: .controlBackgroundColor).opacity(0.55))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(selected ? Color.accentColor : Color(nsColor: .separatorColor),
+                                  lineWidth: selected ? 2 : 1)
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+}
+
+/// Icon tile, title and explanation on the left, a control on the right.
+private struct SettingRow<Trailing: View>: View {
+    let icon: String
+    let tint: Color
+    let title: String
+    let subtitle: String
+    @ViewBuilder var trailing: Trailing
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: icon)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(width: 28, height: 28)
+                .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(tint.gradient))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .fontWeight(.medium)
+                Text(subtitle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 12)
+            trailing
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 11)
     }
 }
 
