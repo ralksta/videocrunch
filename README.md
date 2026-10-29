@@ -5,7 +5,9 @@ libraries to HEVC or AV1, using a binary search over encoder quality levels
 with SSIM verification to find the smallest file that still looks right —
 instead of guessing a single CRF value and hoping. A folder scanner ranks
 which files are worth re-encoding before you spend any GPU time on them, and
-a parallel batch runner encodes a whole selection at once.
+a parallel batch runner encodes a whole selection at once. On macOS a native
+wizard app, reached from a Finder Quick Action, puts the same engine behind a
+window.
 
 ## Requirements
 
@@ -14,6 +16,10 @@ a parallel batch runner encodes a whole selection at once.
 - A hardware encoder is strongly recommended: Apple VideoToolbox (Apple
   Silicon), NVIDIA NVENC, or Intel QuickSync. `libx265` (software) works as a
   fallback but is much slower.
+
+For the macOS app only: macOS 13+ and the Swift compiler from the Xcode
+Command Line Tools (`xcode-select --install`). The installer builds the app
+from source.
 
 videocrunch has **zero runtime dependencies** — it's plain Python standard
 library plus the `ffmpeg`/`ffprobe` binaries. `pip install` is only needed
@@ -35,7 +41,8 @@ not a requirement.
 
 ## Usage
 
-There are three ways in, all built on the same engine:
+There are three ways in on the command line, all built on the same engine
+(plus the [macOS app](#macos-app-and-finder-quick-action)):
 
 ### 1. `crunch.sh` — the wizard
 
@@ -72,7 +79,7 @@ search on the whole file), `--json-out PATH` (write the result as JSON — statu
 quality, SSIM, savings, in and out paths — whatever the outcome), `--replace`
 (put the result in the source's place; the original goes to the trash).
 
-### 3. `scan.py` — rank a folder without encoding anything
+### 3. `scan.py` — rank a folder (or one file) without encoding anything
 
 ```bash
 .venv/bin/python3 scan.py ~/Videos --no-encode --limit 20
@@ -84,7 +91,8 @@ seconds even for large libraries — no encoding happens), and prints a table
 ranked by expected savings in MB. `--no-encode` stops after printing the
 table; otherwise it walks you through the run and hands the selection to
 `batch.py` for parallel encoding. Files that already have a
-`<name>_opt.mp4` sibling are skipped as done.
+`<name>_opt.mp4` sibling are skipped as done. Given a single video instead of
+a folder, it ranks just that one.
 
 Picking files takes `1,3,7-10`, `a` for all, `a -3` for all but one, or a
 name — `Urlaub` selects everything under that folder. Rows are identified by
@@ -113,11 +121,14 @@ above).
 
 `batch.py` itself (`--files a.mp4,b.mp4 --audio-mode enhanced`) runs the
 marked files in parallel with a live status table and a persistent log; you
-normally reach it through `scan.py`, not directly. It also takes
-`--min-ssim S`, `--scale-height H` and `--replace` and forwards them to every
-per-file encode, reads each worker's verdict from its `--json-out` file
-rather than from its console output, and can write the whole batch's results
-with its own `--json-out`.
+normally reach it through `scan.py` or the app, not directly. For names that
+contain commas, `--files-from list.txt` reads one path per line instead. It
+also takes `--codec`, `--min-ssim S`, `--scale-height H` and `--replace` and
+forwards them to every per-file encode, reads each worker's verdict from its
+`--json-out` file rather than from its console output, and can write the
+whole batch's results with its own `--json-out`. Sending it SIGTERM cancels
+the batch: running encodes stop and clean up, queued ones never start, and
+those files are reported as `cancelled`.
 
 ## How the quality search works
 
@@ -212,32 +223,40 @@ formula without updating the fixture fails the test; the fixture itself
 should not be regenerated casually, since its whole purpose is pinning this
 math to a known-good set of numbers.
 
-## macOS Finder Quick Action
+## macOS app and Finder Quick Action
 
 ```bash
 bash install_macos_quick_action.sh
 ```
 
-Installs a `videocrunch` entry into `~/Library/Services/`, so right-clicking
-a folder in Finder → *Schnellaktionen* (Quick Actions) → *videocrunch* opens
-a Terminal window running `crunch.sh` on that folder. The path is passed to
-AppleScript via `quoted form`, so folder names with spaces or apostrophes
-work correctly. If the entry doesn't show up, enable it under System
-Settings → General → Login Items & Extensions → Finder Extensions.
+Builds `VideoCrunch.app` from the Swift sources in `macos/VideoCrunch/` and
+installs a `videocrunch` entry into `~/Library/Services/`. Right-clicking a
+video or a folder in Finder → *Schnellaktionen* (Quick Actions) →
+*videocrunch* opens the app on it. If the entry doesn't show up, enable it
+under System Settings → General → Login Items & Extensions → Finder
+Extensions.
 
-The installer restarts Finder (`killall Finder`) to make it pick up the new
-service — this is expected, Finder relaunches immediately, and it only adds
-its own `videocrunch.workflow` bundle without touching any other Quick
-Action you already have installed.
+The app walks through the same steps as the command-line wizard: **Scan**
+(`scan.py --json`), **Auswahl** (pick files, with the expected savings per
+file), **Optionen** (codec, loudness, downscaling to 1080p, originals to the
+trash), **Encode** (`batch.py`, with live progress per file and a Cancel
+button that stops and cleans up) and **Fertig** (what each file saved, with a
+retry for files just under the quality floor). Started without a file, it
+asks for one or takes a drag and drop.
 
-To uninstall the Quick Action again:
+The installer writes this checkout's path into the app's `Info.plist`, so the
+app runs the scripts from here. Move the repository, and run the installer
+again. A Finder-launched app only sees `/usr/bin:/bin:/usr/sbin:/sbin`; the
+app adds `/opt/homebrew/bin` and `/usr/local/bin` itself, so a Homebrew
+`ffmpeg` and `python3` are found. It prefers `.venv/bin/python3` if present.
+
+The built app stays inside the repository (`macos/VideoCrunch/VideoCrunch.app`,
+ignored by git). The Quick Action bundle is the installer's only footprint
+outside it. To uninstall the Quick Action:
 
 ```bash
-rm -rf ~/Library/Services/videocrunch.workflow && killall Finder
+rm -rf ~/Library/Services/videocrunch.workflow
 ```
-
-That bundle is the installer's only footprint outside this repo — nothing
-else is written to the system.
 
 ## Tests
 
