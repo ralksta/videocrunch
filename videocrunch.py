@@ -449,6 +449,34 @@ def verify_output_integrity(path: Path, expected_duration: float, tolerance: flo
     return (True, "ok")
 
 
+def stop_encoder(process) -> None:
+    """Stop an ffmpeg that is being abandoned, and wait until it is gone.
+
+    On SIGTERM ffmpeg still finalizes its output, and +faststart rewrites the
+    file under the same name. A pass deleted before ffmpeg exits comes back.
+    The output is thrown away anyway, so there is nothing to finalize.
+    """
+    process.kill()
+    process.wait()
+
+
+def discard_abort_leftovers(input_path: Path, is_interactive: bool, ask=None) -> None:
+    """Clean up after an abort that struck outside an encode pass.
+
+    A pass cleans up its own interruption, but a cancel can also land in the
+    pre-search, a quality check or between two passes. The file's finished
+    passes are then still on disk; same rule as inside a pass applies.
+    """
+    stagings = sorted(input_path.parent.glob(f"{input_path.stem}_opt._staging_q*.mp4"))
+    if keep_stagings_after_abort(stagings, is_interactive, ask):
+        return
+    for staging in stagings:
+        try:
+            staging.unlink()
+        except OSError:
+            pass
+
+
 def keep_stagings_after_abort(stagings: list, is_interactive: bool, ask=None) -> bool:
     """Whether an interrupted run should leave its finished passes on disk.
 
@@ -652,6 +680,10 @@ def get_multi_ssim(
         match = re.search(r'All:([\d.]+)', stderr_out)
         if match:
             return float(match.group(1))
+    except KeyboardInterrupt:
+        # Abandoned with the run: don't leave ffmpeg measuring on its own.
+        stop_encoder(process)
+        raise
     except (subprocess.SubprocessError, OSError) as e:
         print(f"{R}Error calculating quality score: {e}{NC}")
     return 0.0
@@ -1311,7 +1343,7 @@ def run_copy_mode(input_path, output_path, profile, copy_audio, audio_mode,
                         pass
 
     except KeyboardInterrupt:
-        process.terminate()
+        stop_encoder(process)
         if output_path.exists():
             output_path.unlink()
         return (False, 0)
@@ -2031,7 +2063,7 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
 
         except KeyboardInterrupt:
             print(f"\n{R}>>> Abort.{NC}")
-            process.terminate()
+            stop_encoder(process)
             # This pass died mid-write and is unusable whatever the answer.
             if effective_out.exists():
                 effective_out.unlink()
@@ -2745,22 +2777,27 @@ def main():
     run_results: list = []
     for f in files:
         batch_stats['processed'] += 1
-        success, saved_bytes = process_file(
-            f, profile,
-            min_size_mb=args.min_size,
-            copy_audio=args.copy_audio,
-            port=args.port,
-            audio_mode=args.audio_mode,
-            ss=args.ss,
-            to=args.to,
-            video_mode=args.video_mode,
-            q_override=args.q,
-            presearch=not args.no_presearch,
-            scale_height=args.scale_height,
-            force=args.force,
-            min_ssim=args.min_ssim,
-            replace=args.replace
-        )
+        try:
+            success, saved_bytes = process_file(
+                f, profile,
+                min_size_mb=args.min_size,
+                copy_audio=args.copy_audio,
+                port=args.port,
+                audio_mode=args.audio_mode,
+                ss=args.ss,
+                to=args.to,
+                video_mode=args.video_mode,
+                q_override=args.q,
+                presearch=not args.no_presearch,
+                scale_height=args.scale_height,
+                force=args.force,
+                min_ssim=args.min_ssim,
+                replace=args.replace
+            )
+        except KeyboardInterrupt:
+            print(f"\n{R}>>> Abort.{NC}")
+            discard_abort_leftovers(Path(f).expanduser(), sys.stdin.isatty())
+            sys.exit(1)
 
         # Write to encode log (for both batch controller and single-file calls)
         if last_encode_result['filename']:

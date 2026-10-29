@@ -1,6 +1,8 @@
 """Unit tests for batch_controller output parsing (pure logic, no ffmpeg)."""
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -83,6 +85,7 @@ class TestAbort:
     def fresh_state(self):
         batch.abort_requested.clear()
         batch.active_workers.clear()
+        batch.file_results.clear()
         yield
         for process in list(batch.active_workers):
             process.kill()
@@ -111,3 +114,30 @@ class TestAbort:
         process.wait()
         batch.finish_worker(process)
         assert process not in batch.active_workers
+
+    def test_cancelled_file_is_reported_as_cancelled(self, monkeypatch):
+        # Not "failed": the wizard would count it as an error and offer a
+        # quality-floor retry for a file nobody let finish.
+        monkeypatch.setattr(batch, "build_optimizer_command",
+                            lambda *a, **kw: [sys.executable, "-c", FAKE_WORKER])
+        outcome = {}
+        worker = threading.Thread(target=lambda: outcome.update(
+            r=batch.run_optimizer(("/v/a.mov", None, "standard", None, None, False, "hevc", 1))))
+        worker.start()
+        for _ in range(100):
+            if batch.active_workers:
+                break
+            time.sleep(0.05)
+        time.sleep(0.3)  # let the fake worker install its handler
+        batch.abort_workers()
+        worker.join(timeout=10)
+        _, ok, result = outcome["r"]
+        assert not ok
+        assert result["status"] == "cancelled"
+
+    def test_file_never_started_is_cancelled_too(self):
+        batch.abort_workers()
+        _, ok, result = batch.run_optimizer(
+            ("/v/a.mov", None, "standard", None, None, False, "hevc", 1))
+        assert not ok
+        assert result["status"] == "cancelled"

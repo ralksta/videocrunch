@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct WizardView: View {
     @ObservedObject var vm: WizardViewModel
@@ -91,127 +92,101 @@ struct WizardView: View {
     }
 
     // MARK: - Step 1: Scan View
+    @ViewBuilder
     private var scanView: some View {
-        VStack(spacing: 16) {
-            Spacer()
-            if let err = vm.errorMessage {
-                Image(systemName: "exclamationmark.triangle")
-                    .font(.system(size: 40))
-                    .foregroundColor(.red)
-                Text("Fehler beim Scannen")
-                    .font(.title2)
-                    .fontWeight(.semibold)
-                Text(err)
-                    .font(.subheadline)
-                    .foregroundColor(.secondary)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal, 40)
-            } else {
-                ProgressView()
-                    .scaleEffect(1.2)
-                Text("Lese Metadaten...")
-                    .font(.title3)
-                    .fontWeight(.medium)
-                Text("Analysiere Auflösung, Codec & Einsparpotenzial ohne Kodierung.")
-                    .font(.subheadline)
-                    .foregroundColor(.secondary)
+        if let err = vm.errorMessage {
+            StatusHero(icon: "exclamationmark.triangle.fill", tint: .orange,
+                       title: "Scan fehlgeschlagen", message: err) {
+                if let url = vm.targetURL {
+                    Button {
+                        vm.startScan(for: url)
+                    } label: {
+                        Label("Erneut scannen", systemImage: "arrow.clockwise")
+                    }
+                    .controlSize(.large)
+                }
             }
-            Spacer()
+        } else if vm.targetURL == nil {
+            StatusHero(icon: "film.stack", tint: .accentColor,
+                       title: "Videos auswählen",
+                       message: "Zieh ein Video oder einen Ordner hierher – oder wähle sie aus. Es wird erst kodiert, wenn du es bestätigst.") {
+                Button {
+                    chooseTarget()
+                } label: {
+                    Label("Video oder Ordner wählen …", systemImage: "folder")
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+            }
+            .dropDestination(for: URL.self) { urls, _ in
+                guard let url = urls.first else { return false }
+                vm.startScan(for: url)
+                return true
+            }
+        } else {
+            StatusHero(icon: "magnifyingglass", tint: .accentColor,
+                       title: "Analysiere Videos …",
+                       message: "Liest Auflösung, Codec und Bitrate. Dabei wird nichts kodiert.") {
+                ProgressView()
+                    .controlSize(.small)
+            }
         }
-        .padding()
     }
 
-    // MARK: - Step 2: Selection Table
+    private func chooseTarget() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.movie, .folder]
+        if panel.runModal() == .OK, let url = panel.url {
+            vm.startScan(for: url)
+        }
+    }
+
+    // MARK: - Step 2: Selection
     private var selectionView: some View {
         VStack(spacing: 0) {
-            // Quick Toolbar
-            HStack {
-                Text("\(vm.candidates.count) Videos analysiert")
-                    .font(.subheadline)
-                    .foregroundColor(.secondary)
-
+            HStack(spacing: 8) {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(vm.candidates.count == 1 ? "1 Kandidat" : "\(vm.candidates.count) Kandidaten")
+                        .font(.headline)
+                    Text("Videos, die mindestens 10 % kleiner würden")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 Spacer()
-
-                Button("Alle auswählen") { vm.selectAll() }
-                    .buttonStyle(.plain)
-                    .font(.caption)
-                    .foregroundColor(.accentColor)
-
-                Text("·").foregroundColor(.secondary)
-
+                Button("Alle") { vm.selectAll() }
+                    .disabled(vm.selectedIds.count == vm.candidates.count)
                 Button("Keine") { vm.deselectAll() }
-                    .buttonStyle(.plain)
-                    .font(.caption)
-                    .foregroundColor(.accentColor)
+                    .disabled(vm.selectedIds.isEmpty)
             }
-            .padding(.horizontal, 20)
-            .padding(.vertical, 8)
-            .background(Color.secondary.opacity(0.05))
+            .controlSize(.small)
+            .padding(.horizontal, 24)
+            .padding(.vertical, 12)
 
-            // Candidates List
+            Divider()
+
             if vm.candidates.isEmpty {
-                VStack(spacing: 12) {
-                    Spacer()
-                    Image(systemName: "checkmark.seal")
-                        .font(.system(size: 44))
-                        .foregroundColor(.green)
-                    Text("Alles optimal!")
-                        .font(.title3)
-                        .fontWeight(.bold)
-                    Text("Keine Videos über der 10%-Einsparschwelle gefunden.")
-                        .foregroundColor(.secondary)
-                    Spacer()
+                StatusHero(icon: "checkmark.seal.fill", tint: .green,
+                           title: "Alles optimal",
+                           message: "Kein Video würde um mindestens 10 % kleiner. Hier gibt es nichts zu holen.") {
+                    EmptyView()
                 }
             } else {
-                List(vm.candidates) { c in
-                    let isSelected = vm.selectedIds.contains(c.id)
-                    HStack(spacing: 12) {
-                        Toggle("", isOn: Binding(
-                            get: { isSelected },
-                            set: { _ in vm.toggleSelection(for: c.id) }
-                        ))
-                        .labelsHidden()
-
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(c.filename)
-                                .font(.body)
-                                .fontWeight(.medium)
-                                .lineLimit(1)
-                            HStack(spacing: 8) {
-                                Text(c.codec.uppercased())
-                                    .padding(.horizontal, 4)
-                                    .padding(.vertical, 1)
-                                    .background(Color.secondary.opacity(0.2))
-                                    .cornerRadius(4)
-                                    .font(.caption2)
-                                Text("\(c.resolutionString) · \(String(format: "%.1f", c.bitrate_mbps)) Mbit/s")
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
-                                Text(c.reason)
-                                    .font(.caption2)
-                                    .foregroundColor(.secondary)
-                                    .italic()
+                ScrollView {
+                    LazyVStack(spacing: 8) {
+                        ForEach(vm.candidates) { c in
+                            CandidateRow(candidate: c, selected: vm.selectedIds.contains(c.id)) {
+                                vm.toggleSelection(for: c.id)
                             }
                         }
-
-                        Spacer()
-
-                        VStack(alignment: .trailing, spacing: 2) {
-                            Text("-\(c.savedFormatted)")
-                                .font(.subheadline)
-                                .fontWeight(.bold)
-                                .foregroundColor(.green)
-                            Text("-\(String(format: "%.0f", c.estimated_saved_pct))%")
-                                .font(.caption2)
-                                .foregroundColor(.secondary)
-                            Text("von \(c.sizeFormatted)")
-                                .font(.caption2)
-                                .foregroundColor(.secondary)
-                        }
                     }
-                    .padding(.vertical, 4)
+                    .frame(maxWidth: 760)
+                    .padding(.horizontal, 24)
+                    .padding(.vertical, 16)
+                    .frame(maxWidth: .infinity)
                 }
-                .listStyle(.inset)
             }
         }
     }
@@ -349,120 +324,192 @@ struct WizardView: View {
         codec == "av1" ? "AV1" : "HEVC"
     }
 
-    // MARK: - Step 4: Encoding Live Status
+    // MARK: - Step 4: Encoding
     private var encodingView: some View {
-        VStack(spacing: 16) {
-            // Stats Banner
-            HStack(spacing: 30) {
-                Label("\(vm.completedCount) Fertig", systemImage: "checkmark.circle.fill")
-                    .foregroundColor(.green)
-                Label("\(vm.failedCount) Fehlgeschlagen", systemImage: "xmark.circle.fill")
-                    .foregroundColor(vm.failedCount > 0 ? .red : .secondary)
-                Spacer()
-                Text("Gesamt: \(vm.totalToEncode)")
-                    .foregroundColor(.secondary)
-            }
-            .font(.subheadline)
-            .padding(.horizontal, 20)
-            .padding(.top, 14)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                overallProgress
 
-            // Worker List
-            VStack(spacing: 10) {
-                if vm.workers.isEmpty {
-                    Text("Starte Encoding Engine...")
-                        .foregroundColor(.secondary)
-                        .padding()
-                } else {
-                    ForEach(Array(vm.workers.values.sorted(by: { $0.id < $1.id }))) { w in
-                        VStack(alignment: .leading, spacing: 4) {
-                            HStack {
-                                Text("Worker #\(w.id): \(w.file.isEmpty ? "Initialisiere..." : w.file)")
-                                    .font(.caption)
-                                    .fontWeight(.medium)
-                                    .lineLimit(1)
-                                Spacer()
-                                if w.q > 0 {
-                                    Text("Q=\(w.q)")
-                                        .font(.caption2)
-                                        .padding(.horizontal, 4)
-                                        .background(Color.secondary.opacity(0.1))
-                                        .cornerRadius(4)
-                                }
-                                Text("\(w.progress)%")
-                                    .font(.caption)
-                                    .fontWeight(.bold)
+                OptionSection(title: "Laufende Encodes") {
+                    VStack(spacing: 8) {
+                        if vm.workers.isEmpty {
+                            HStack(spacing: 10) {
+                                ProgressView().controlSize(.small)
+                                Text("Starte Encoder …")
+                                    .foregroundStyle(.secondary)
                             }
-                            ProgressView(value: Double(w.progress), total: 100.0)
-                        }
-                        .padding(.horizontal, 20)
-                    }
-                }
-            }
-
-            Spacer()
-
-            // Console output disclosure
-            DisclosureGroup("Live-Ausgabe") {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 2) {
-                        ForEach(vm.logs.suffix(15), id: \.self) { line in
-                            Text(line)
-                                .font(.system(size: 10, design: .monospaced))
-                                .foregroundColor(.secondary)
+                            .frame(maxWidth: .infinity)
+                            .padding(16)
+                            .cardBackground()
+                        } else {
+                            ForEach(vm.workers.values.sorted(by: { $0.id < $1.id })) { w in
+                                WorkerRow(worker: w)
+                            }
                         }
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(8)
                 }
-                .frame(height: 80)
-                .background(Color.black.opacity(0.2))
-                .cornerRadius(6)
+
+                DisclosureGroup("Protokoll") {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 2) {
+                            ForEach(Array(vm.logs.suffix(40).enumerated()), id: \.offset) { _, line in
+                                Text(line)
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(10)
+                        .textSelection(.enabled)
+                    }
+                    .frame(height: 140)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(Color.black.opacity(0.25))
+                    )
+                    .padding(.top, 6)
+                }
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
             }
-            .padding(.horizontal, 20)
-            .padding(.bottom, 10)
+            .frame(maxWidth: 640)
+            .padding(.horizontal, 24)
+            .padding(.vertical, 22)
+            .frame(maxWidth: .infinity)
         }
     }
 
-    // MARK: - Step 5: Completed View
-    private var completedView: some View {
-        VStack(spacing: 20) {
-            Spacer()
-            Image(systemName: "checkmark.circle.fill")
-                .font(.system(size: 60))
-                .foregroundColor(.green)
-
-            Text("Optimierung abgeschlossen!")
-                .font(.title2)
-                .fontWeight(.bold)
-
-            VStack(spacing: 6) {
-                Text("\(formatBytes(vm.actualSavedBytes)) Speicherplatz gespart.")
-                    .font(.headline)
-                    .foregroundColor(.green)
-                Text("\(vm.completedCount) von \(vm.totalToEncode) Dateien erfolgreich optimiert.")
-                    .font(.subheadline)
-                    .foregroundColor(.secondary)
-            }
-
-            if let floor = vm.suggestedFloor, !vm.retryEligibleCandidates.isEmpty {
-                VStack(spacing: 8) {
-                    Text("\(vm.retryEligibleCandidates.count) Datei(en) erreichten die SSIM-Schwelle nicht.")
-                        .font(.caption)
-                        .foregroundColor(.orange)
-
-                    Button("Mit angepasstem Floor (\(String(format: "%.2f", floor))) erneut versuchen") {
-                        vm.retryFailedWithNewFloor()
+    /// Whole-batch progress: finished files plus the running files' share.
+    private var overallProgress: some View {
+        let total = max(vm.totalToEncode, 1)
+        let finished = vm.completedCount + vm.failedCount
+        let running = vm.workers.values
+            .filter { $0.status == "running" }
+            .reduce(0.0) { $0 + Double($1.progress) / 100 }
+        let fraction = min(1, (Double(finished) + running) / Double(total))
+        let runningCount = vm.workers.values.filter { $0.status == "running" }.count
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(vm.isEncoding
+                         ? "\(finished) von \(vm.totalToEncode) fertig"
+                         : "Wird beendet …")
+                        .font(.headline)
+                    if let start = vm.encodeStartedAt {
+                        TimelineView(.periodic(from: start, by: 1)) { context in
+                            Text((runningCount > 1 ? "\(runningCount) parallel · " : "")
+                                 + "läuft seit \(elapsedString(from: start, to: context.date))")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                                .monospacedDigit()
+                        }
                     }
-                    .buttonStyle(.borderedProminent)
                 }
-                .padding()
-                .background(Color.orange.opacity(0.1))
-                .cornerRadius(8)
+                Spacer()
+                Text("\(Int(fraction * 100)) %")
+                    .font(.system(size: 26, weight: .bold, design: .rounded))
+                    .monospacedDigit()
             }
-
-            Spacer()
+            ProgressView(value: fraction)
+            HStack(spacing: 8) {
+                Chip(text: "\(vm.completedCount) fertig", icon: "checkmark.circle.fill", tint: .green)
+                if vm.failedCount > 0 {
+                    Chip(text: "\(vm.failedCount) fehlgeschlagen", icon: "xmark.circle.fill", tint: .red)
+                }
+            }
         }
-        .padding()
+        .padding(16)
+        .cardBackground()
+    }
+
+    private func elapsedString(from start: Date, to now: Date) -> String {
+        let seconds = max(0, Int(now.timeIntervalSince(start)))
+        return String(format: "%d:%02d", seconds / 60, seconds % 60)
+    }
+
+    // MARK: - Step 5: Completed
+    private var completedView: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                completedHeadline
+                    .frame(maxWidth: .infinity)
+
+                HStack(spacing: 12) {
+                    StatTile(title: "Gespart", value: formatBytes(vm.actualSavedBytes), tint: .green)
+                    StatTile(title: "Optimiert", value: "\(vm.completedCount) von \(vm.totalToEncode)", tint: .primary)
+                    if vm.wasCancelled {
+                        StatTile(title: "Abgebrochen", value: "\(vm.cancelledCount)", tint: .orange)
+                    } else {
+                        StatTile(title: "Fehlgeschlagen", value: "\(vm.failedCount)",
+                                 tint: vm.failedCount > 0 ? .red : .secondary)
+                    }
+                }
+                .fixedSize(horizontal: false, vertical: true)
+
+                if let floor = vm.suggestedFloor, !vm.retryEligibleCandidates.isEmpty {
+                    HStack(spacing: 12) {
+                        Image(systemName: "dial.medium.fill")
+                            .font(.title2)
+                            .foregroundStyle(.orange)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("\(videoCount(vm.retryEligibleCandidates.count)) knapp unter der Qualitätsschwelle")
+                                .fontWeight(.medium)
+                            Text("Mit Schwelle \(String(format: "%.2f", floor)) würden sie angenommen.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Button("Erneut versuchen") {
+                            vm.retryFailedWithNewFloor()
+                        }
+                    }
+                    .padding(14)
+                    .background(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .fill(Color.orange.opacity(0.12))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .strokeBorder(Color.orange.opacity(0.4))
+                    )
+                }
+
+                if !vm.batchResults.isEmpty {
+                    OptionSection(title: "Ergebnisse") {
+                        VStack(spacing: 0) {
+                            ForEach(Array(vm.batchResults.enumerated()), id: \.offset) { index, r in
+                                if index > 0 { Divider().padding(.leading, 46) }
+                                ResultRow(result: r)
+                            }
+                        }
+                        .cardBackground()
+                    }
+                }
+            }
+            .frame(maxWidth: 640)
+            .padding(.horizontal, 24)
+            .padding(.vertical, 22)
+            .frame(maxWidth: .infinity)
+        }
+    }
+
+    @ViewBuilder
+    private var completedHeadline: some View {
+        if vm.wasCancelled {
+            StatusHero(icon: "stop.circle.fill", tint: .orange, title: "Abgebrochen",
+                       message: "\(vm.completedCount) von \(vm.totalToEncode) Videos wurden vor dem Abbruch fertig. Halb fertige Dateien wurden entfernt.",
+                       compact: true) { EmptyView() }
+        } else if vm.completedCount == 0 {
+            StatusHero(icon: "xmark.octagon.fill", tint: .red, title: "Nichts optimiert",
+                       message: "Kein Video wurde ersetzt. Die Gründe stehen unten bei den Ergebnissen.",
+                       compact: true) { EmptyView() }
+        } else {
+            StatusHero(icon: "checkmark.circle.fill", tint: .green, title: "Fertig",
+                       message: vm.moveToTrash
+                           ? "Die Originale liegen im Papierkorb."
+                           : "Die neuen Dateien liegen als _opt.mp4 neben den Originalen.",
+                       compact: true) { EmptyView() }
+        }
     }
 
     // MARK: - Bottom Action Bar
@@ -477,10 +524,20 @@ struct WizardView: View {
                 .controlSize(.large)
                 .keyboardShortcut(.cancelAction)
             } else if vm.currentStep == .encoding {
-                Button("Abbrechen") {
+                Button(role: .destructive) {
                     vm.cancelEncoding()
+                } label: {
+                    Label("Abbrechen", systemImage: "stop.fill")
                 }
-                .foregroundColor(.red)
+                .controlSize(.large)
+                .disabled(!vm.isEncoding)
+            } else if vm.currentStep == .completed, let url = vm.targetURL {
+                Button {
+                    NSWorkspace.shared.activateFileViewerSelecting([url])
+                } label: {
+                    Label("Im Finder zeigen", systemImage: "folder")
+                }
+                .controlSize(.large)
             }
 
             Spacer()
@@ -518,6 +575,8 @@ struct WizardView: View {
                     NSApplication.shared.terminate(nil)
                 }
                 .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .keyboardShortcut(.defaultAction)
             }
         }
         .padding(.horizontal, 20)
@@ -672,4 +731,264 @@ struct VisualEffectView: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
+}
+
+// MARK: - Shared building blocks
+
+/// Big round icon, title and explanation — for waiting, empty, error and done states.
+private struct StatusHero<Accessory: View>: View {
+    let icon: String
+    let tint: Color
+    let title: String
+    let message: String?
+    var compact: Bool = false
+    @ViewBuilder var accessory: Accessory
+
+    var body: some View {
+        VStack(spacing: 14) {
+            ZStack {
+                Circle()
+                    .fill(tint.opacity(0.15))
+                    .frame(width: compact ? 60 : 76, height: compact ? 60 : 76)
+                Image(systemName: icon)
+                    .font(.system(size: compact ? 26 : 32, weight: .semibold))
+                    .foregroundStyle(tint)
+            }
+            Text(title)
+                .font(.title2.weight(.semibold))
+            if let message {
+                Text(message)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 460)
+                    .textSelection(.enabled)
+            }
+            accessory
+                .padding(.top, 4)
+        }
+        .padding(compact ? 8 : 32)
+        .frame(maxWidth: .infinity, maxHeight: compact ? nil : .infinity)
+    }
+}
+
+/// Small rounded label for codec, resolution, counts.
+private struct Chip: View {
+    let text: String
+    var icon: String? = nil
+    var tint: Color = .secondary
+
+    var body: some View {
+        HStack(spacing: 3) {
+            if let icon {
+                Image(systemName: icon)
+            }
+            Text(text)
+        }
+        .font(.caption2.weight(.medium))
+        .padding(.horizontal, 7)
+        .padding(.vertical, 2)
+        .background(Capsule().fill(tint.opacity(0.15)))
+        .foregroundStyle(tint == .secondary ? Color.primary.opacity(0.75) : tint)
+    }
+}
+
+/// Share of a file the encode is expected to save.
+private struct SavingsBar: View {
+    let fraction: Double
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.secondary.opacity(0.2))
+                Capsule()
+                    .fill(Color.green.gradient)
+                    .frame(width: max(3, geo.size.width * min(1, max(0, fraction))))
+            }
+        }
+    }
+}
+
+/// One scan candidate; the whole card toggles its selection.
+private struct CandidateRow: View {
+    let candidate: Candidate
+    let selected: Bool
+    let toggle: () -> Void
+
+    var body: some View {
+        Button(action: toggle) {
+            HStack(spacing: 14) {
+                Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                    .font(.title3)
+                    .foregroundStyle(selected ? Color.accentColor : Color.secondary.opacity(0.5))
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(candidate.filename)
+                        .fontWeight(.medium)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    HStack(spacing: 5) {
+                        Chip(text: candidate.codec.uppercased())
+                        Chip(text: candidate.resolutionString)
+                        Chip(text: String(format: "%.1f Mbit/s", candidate.bitrate_mbps))
+                        if candidate.source == "history" {
+                            Chip(text: "aus Verlauf", icon: "clock.arrow.circlepath", tint: .blue)
+                        }
+                    }
+                    Text(candidate.reasonDetail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 12)
+                VStack(alignment: .trailing, spacing: 5) {
+                    Text("−\(candidate.savedFormatted)")
+                        .font(.system(.headline, design: .rounded))
+                        .foregroundStyle(.green)
+                        .monospacedDigit()
+                    SavingsBar(fraction: candidate.estimated_saved_pct / 100)
+                        .frame(width: 90, height: 5)
+                    Text("\(Int(candidate.estimated_saved_pct.rounded())) % von \(candidate.sizeFormatted)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+            }
+            .padding(12)
+            .background(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(selected
+                          ? Color.accentColor.opacity(0.08)
+                          : Color(nsColor: .controlBackgroundColor).opacity(0.55))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(selected ? Color.accentColor.opacity(0.6) : Color(nsColor: .separatorColor))
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+}
+
+/// One parallel encode slot.
+private struct WorkerRow: View {
+    let worker: WorkerStatus
+
+    private var look: (icon: String, tint: Color, label: String) {
+        switch worker.status {
+        case "done": return ("checkmark.circle.fill", .green, "Fertig")
+        case "failed": return ("xmark.circle.fill", .red, "Fehlgeschlagen")
+        case "skipped": return ("forward.circle.fill", .secondary, "Übersprungen")
+        case "cancelled": return ("stop.circle.fill", .orange, "Abgebrochen")
+        default: return ("film", .accentColor, "\(worker.progress) %")
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: look.icon)
+                    .foregroundStyle(look.tint)
+                Text(worker.file.isEmpty ? "Encoder \(worker.id) startet …" : worker.file)
+                    .fontWeight(.medium)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer()
+                if worker.status == "running" && worker.q > 0 {
+                    Chip(text: "Q \(worker.q)")
+                        .help("Qualitätsstufe, die gerade ausprobiert wird")
+                }
+                Text(look.label)
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(worker.status == "running" ? Color.primary : look.tint)
+                    .monospacedDigit()
+            }
+            ProgressView(value: Double(worker.progress), total: 100)
+                .tint(look.tint)
+        }
+        .padding(12)
+        .cardBackground()
+    }
+}
+
+/// A labelled number in the summary row.
+private struct StatTile: View {
+    let title: String
+    let value: String
+    let tint: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.system(.title3, design: .rounded).weight(.semibold))
+                .foregroundStyle(tint)
+                .monospacedDigit()
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        .padding(14)
+        .cardBackground()
+    }
+}
+
+/// One file's outcome from batch.py's report.
+private struct ResultRow: View {
+    let result: BatchItemResult
+
+    private var look: (icon: String, tint: Color) {
+        switch result.status {
+        case "success": return ("checkmark.circle.fill", .green)
+        case "skipped": return ("forward.circle.fill", .secondary)
+        case "cancelled": return ("stop.circle.fill", .orange)
+        default: return ("xmark.circle.fill", .red)
+        }
+    }
+
+    private var detail: String {
+        if result.status == "success" {
+            var parts: [String] = []
+            if let pct = result.saved_pct { parts.append("−\(Int(pct.rounded())) %") }
+            if let ssim = result.ssim { parts.append(String(format: "SSIM %.3f", ssim)) }
+            if let q = result.quality { parts.append("Q \(q)") }
+            return parts.joined(separator: " · ")
+        }
+        switch result.status {
+        case "cancelled": return "Abgebrochen, bevor es fertig war"
+        case "skipped": return result.reason ?? "Übersprungen"
+        default: return result.reason ?? "Fehlgeschlagen"
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: look.icon)
+                .font(.title3)
+                .foregroundStyle(look.tint)
+                .frame(width: 22)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(result.filename ?? "Unbekannte Datei")
+                    .fontWeight(.medium)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            Spacer(minLength: 12)
+            if result.status == "success", let bytes = result.saved_bytes {
+                Text("−\(formatBytes(bytes))")
+                    .font(.system(.callout, design: .rounded).weight(.semibold))
+                    .foregroundStyle(.green)
+                    .monospacedDigit()
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+    }
 }

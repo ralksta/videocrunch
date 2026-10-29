@@ -19,6 +19,7 @@ never an accidental side effect of a refactor.
 """
 import inspect
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -318,6 +319,68 @@ class TestAbortKeepsWork:
     only right if the user is there to say so: a script that dies unattended
     should leave the folder as it found it.
     """
+
+    def test_encoder_is_gone_before_the_pass_is_deleted(self):
+        # ffmpeg finishes a +faststart file on SIGTERM and rewrites it under
+        # the same name, so a pass deleted right after terminate() came back.
+        # Stand-in that, like a finalizing ffmpeg, does not stop on SIGTERM:
+        encoder = subprocess.Popen(
+            [sys.executable, "-c",
+             "import signal, time\n"
+             "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+             "print('ready', flush=True)\n"
+             "time.sleep(30)\n"],
+            stdout=subprocess.PIPE, text=True)
+        assert encoder.stdout.readline().strip() == "ready"
+        videocrunch.stop_encoder(encoder)
+        assert encoder.poll() is not None
+
+    def test_abort_outside_a_pass_leaves_no_staging(self, tmp_path):
+        # A cancel landing in the pre-search or a quality check escaped the
+        # pass's own handler and left finished passes behind.
+        source = tmp_path / "clip.mov"
+        source.write_bytes(b"x")
+        staging = tmp_path / "clip_opt._staging_q45.mp4"
+        staging.write_bytes(b"x")
+        other = tmp_path / "other_opt._staging_q45.mp4"
+        other.write_bytes(b"x")
+        videocrunch.discard_abort_leftovers(source, is_interactive=False)
+        assert not staging.exists()
+        assert other.exists()
+
+    def test_abort_outside_a_pass_keeps_on_yes(self, tmp_path):
+        source = tmp_path / "clip.mov"
+        staging = tmp_path / "clip_opt._staging_q45.mp4"
+        staging.write_bytes(b"x")
+        videocrunch.discard_abort_leftovers(source, is_interactive=True, ask=lambda: "j")
+        assert staging.exists()
+
+    def test_cancelled_quality_check_stops_its_ffmpeg(self, monkeypatch, tmp_path):
+        # A cancel during the SSIM measurement left that ffmpeg reading on,
+        # for minutes on a long file, after everything else had stopped.
+        class FakeMeasurement:
+            def __init__(self, *a, **kw):
+                self.killed = False
+                self.stdout = self
+                self.stderr = self
+
+            def readline(self):
+                raise KeyboardInterrupt
+
+            def kill(self):
+                self.killed = True
+
+            def wait(self):
+                return -9
+
+        started = []
+        monkeypatch.setattr(videocrunch, "_detect_quality_filter", lambda: "ssim")
+        monkeypatch.setattr(videocrunch, "get_video_info", lambda path: {"fps": 30})
+        monkeypatch.setattr(videocrunch.subprocess, "Popen",
+                            lambda *a, **kw: started.append(FakeMeasurement()) or started[-1])
+        with pytest.raises(KeyboardInterrupt):
+            videocrunch.get_multi_ssim(tmp_path / "a.mov", tmp_path / "b.mp4", [0.0], [0.0], 1.0)
+        assert started and started[0].killed
 
     def test_asks_and_keeps_on_yes(self):
         assert videocrunch.keep_stagings_after_abort(

@@ -38,6 +38,8 @@ class WizardViewModel: ObservableObject {
     @Published var totalToEncode: Int = 0
     @Published var logs: [String] = []
     @Published var isEncoding: Bool = false
+    @Published var wasCancelled: Bool = false
+    @Published var encodeStartedAt: Date? = nil
 
     // Step 5: Completed
     @Published var batchResults: [BatchItemResult] = []
@@ -151,6 +153,10 @@ class WizardViewModel: ObservableObject {
         max(0, selectedTotalMB - selectedEstimatedSavedMB)
     }
 
+    var cancelledCount: Int {
+        batchResults.filter { $0.status == "cancelled" }.count
+    }
+
     var hasTallCandidates: Bool {
         selectedCandidates.contains { $0.height > 1080 }
     }
@@ -195,6 +201,11 @@ class WizardViewModel: ObservableObject {
         completedCount = 0
         failedCount = 0
         totalToEncode = selectedIds.count
+        wasCancelled = false
+        encodeStartedAt = Date()
+        batchResults = []
+        suggestedFloor = nil
+        retryEligibleCandidates = []
 
         let toProcess = selectedCandidates.map { $0.file_path }
         let tempDir = FileManager.default.temporaryDirectory
@@ -292,6 +303,7 @@ class WizardViewModel: ObservableObject {
     }
 
     func cancelEncoding() {
+        wasCancelled = true
         currentProcess?.terminate()
         currentProcess = nil
         isEncoding = false
@@ -320,6 +332,8 @@ class WizardViewModel: ObservableObject {
                         status = "failed"
                     } else if line.contains("⊘ Skip") {
                         status = "skipped"
+                    } else if line.contains("■ Cancelled") {
+                        status = "cancelled"
                     }
 
                     if let pctRange = line.range(of: #"(\d+)%"#, options: .regularExpression) {
@@ -333,6 +347,14 @@ class WizardViewModel: ObservableObject {
                     }
 
                     var curr = workers[wid] ?? WorkerStatus(id: wid, file: "", status: status, progress: prog, q: q)
+                    // "[2] clip.mov   Q=65 ..." — an idle slot has no name, only padding.
+                    if let nameRange = line.range(of: #"\[\d+\] \S.*?\s{2,}"#, options: .regularExpression) {
+                        let raw = line[nameRange]
+                        if let close = raw.firstIndex(of: "]") {
+                            let name = raw[raw.index(after: close)...].trimmingCharacters(in: .whitespaces)
+                            if !name.isEmpty { curr.file = name }
+                        }
+                    }
                     curr.status = status
                     curr.progress = prog
                     if q > 0 { curr.q = q }
@@ -376,7 +398,7 @@ class WizardViewModel: ObservableObject {
         self.currentStep = .completed
 
         sendNotification(
-            title: "videocrunch fertig!",
+            title: wasCancelled ? "videocrunch abgebrochen" : "videocrunch fertig",
             body: "\(completedCount) von \(totalToEncode) Videos optimiert. \(formatBytes(actualSavedBytes)) gespart."
         )
     }
