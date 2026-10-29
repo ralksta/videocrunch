@@ -383,6 +383,23 @@ next time. Now Ctrl-C asks whether to keep the finished ones — but only when
 someone is at the terminal (`keep_stagings_after_abort()`); an unattended
 script that dies leaves the folder as it found it.
 
+SIGTERM takes the same path: `abort_on_sigterm()` turns it into a
+`KeyboardInterrupt`. That is how `batch.py` cancels its workers, and how the
+macOS app's Cancel button reaches them through `batch.py`. SIGINT is not used
+for this, because a process started in the background inherits it as ignored.
+
+Three details make an abort leave nothing behind:
+
+- `stop_encoder()` kills ffmpeg and waits for it before the pass is deleted.
+  On SIGTERM ffmpeg would still finalize the file, and `+faststart` rewrites
+  it under the same name — after it had already been deleted.
+- An abort can land outside a pass: in the pre-search, a quality check, or
+  between two passes. `main()` catches it around `process_file()`, and
+  `discard_abort_leftovers()` applies the same keep-or-delete rule to the
+  file's finished passes.
+- `get_multi_ssim()` stops its own ffmpeg when interrupted, so a long
+  measurement does not keep running after everything else has stopped.
+
 On the next run, `reusable_staging()` checks each leftover against the full
 integrity check (duration, decode, track count). One that passes is a finished
 pass: the encode is skipped and only the quality measurement runs. A file
@@ -409,8 +426,10 @@ list wraps even a single file so a run over several has the same shape.
 `batch.py` hands every worker its own result file and takes the verdict from
 it, falling back to scraping stdout when the file is missing (an aborted
 worker leaves none). It writes the whole batch in the same shape through its
-own `--json-out`, which is how `scan.py` learns what a run delivered: without
-it the wizard saw an exit code and nothing else, so it could neither check
+own `--json-out`, which is how `scan.py` and the macOS app learn what a run
+delivered. A batch adds a fourth status, `cancelled`, for files a cancel
+stopped or never started; they are neither failures nor retry candidates.
+Without that report the wizard saw an exit code and nothing else, so it could neither check
 its own estimate nor offer to retry what fell under the quality floor. That fallback is why the shape is pinned in
 `tests/test_cli_contract.py`: output lines are human-facing and get reworded,
 which is exactly what made scraping them fragile in the first place.
