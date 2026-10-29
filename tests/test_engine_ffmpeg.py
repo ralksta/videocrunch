@@ -347,8 +347,35 @@ class TestProcessFileEndToEnd:
         # failure if the trim branch ever wrote something else.
         clip = tmp_path / "in.mp4"
         shutil.copy(tiny_clip, clip)
-        ok, _, _ = self._run(clip, force=True, audio_mode="standard", ss="0", to="1")
+        # The floor is lowered so this checks naming, not the quality of a
+        # one-second synthetic clip.
+        ok, _, _ = self._run(clip, force=True, audio_mode="standard", ss="0", to="1",
+                             min_ssim=0.9)
         assert ok is True
+        assert (tmp_path / "in_opt.mp4").exists()
+
+    def test_a_pass_meeting_the_target_survives_a_fallback_that_saved_more(
+            self, tiny_clip, tmp_path, monkeypatch):
+        # The fallback bookkeeping ran first and deleted the staging file of a
+        # pass that met the target, because a lower-quality fallback had saved
+        # more; the run then failed with the winning encode gone.
+        import re
+
+        import videocrunch
+        clip = tmp_path / "in.mp4"
+        shutil.copy(tiny_clip, clip)
+        monkeypatch.setattr(videocrunch, "MIN_SAVINGS", -100.0)  # a tiny clip barely shrinks
+        monkeypatch.setattr(videocrunch, "suggest_q_from_history", lambda *a, **kw: None)
+
+        def scripted_ssim(original, optimized, *a, **kw):
+            # libx265: lower CRF is better. Good enough only at the best rungs.
+            crf = int(re.search(r"_staging_q(\d+)", Path(optimized).name).group(1))
+            return 0.99 if crf <= 26 else 0.978
+
+        monkeypatch.setattr(videocrunch, "get_multi_ssim", scripted_ssim)
+        ok, _, result = self._run(clip, force=True, audio_mode="standard")
+        assert ok is True
+        assert result["ssim"] >= videocrunch.MIN_QUALITY
         assert (tmp_path / "in_opt.mp4").exists()
 
     def test_an_out_of_range_manual_quality_falls_back_to_the_search(self, tiny_clip, tmp_path):

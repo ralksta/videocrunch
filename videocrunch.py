@@ -55,7 +55,11 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 # --- CONFIGURATION ---
 MIN_SAVINGS = 20.0
-MIN_QUALITY = 0.960
+# Quality a pass must reach to count as done. Calibrated side by side on real
+# footage (4K60 HDR iPhone video downscaled to 1080p, already-efficient HEVC):
+# from 0.98 on the difference to the source is hard to see; 0.974 already
+# softens foliage, 0.954 smears it. No amount of savings lowers this.
+MIN_QUALITY = 0.980
 SAMPLE_DURATION = 3
 DEFAULT_MIN_SIZE_MB = 0  # No minimum file size – process all files
 
@@ -69,8 +73,8 @@ PRESEARCH_SEGMENT_SEC = 8.0     # Length of each stream-copied probe segment
 PROBE_TARGET_TOLERANCE = 1.25
 
 # --- SSIM / SAVINGS THRESHOLDS ---
-SSIM_MIN = 0.940           # Hard lower bound – reject anything below this
-SSIM_ACCEPTABLE = 0.945    # Acceptable quality for fallback results
+SSIM_MIN = 0.970           # Hard lower bound – reject anything below this
+SSIM_ACCEPTABLE = 0.975    # Preferred fallback when no pass reaches MIN_QUALITY
 EXCELLENT_SAVINGS_PCT = 50.0  # Savings % considered excellent (early-exit in binary search)
 EARLY_ABORT_RATIO = 0.95   # Abort encode early if output reaches this fraction of source size
 
@@ -475,6 +479,28 @@ def discard_abort_leftovers(input_path: Path, is_interactive: bool, ask=None) ->
             staging.unlink()
         except OSError:
             pass
+
+
+def meets_quality_targets(saved_pct: float, ssim: float) -> bool:
+    """Whether a pass is good enough to stop searching: worth it, and looks right.
+
+    Large savings used to buy a lower bar (SSIM_ACCEPTABLE at 50 %+). That is
+    how a 4K60 clip downscaled to 1080p shipped at 0.954 with smeared foliage:
+    the savings were spectacular precisely because detail was thrown away.
+    """
+    return saved_pct >= MIN_SAVINGS and ssim >= MIN_QUALITY
+
+
+def downscale_bitrate_scale(scale_height, source_height) -> float:
+    """Share of the source bitrate a downscaled encode is budgeted.
+
+    Proportional to the height ratio, i.e. pixels^0.5. pixels^0.75 gave
+    4K → 1080p only 0.35 of the source, and even the ladder's best rung could
+    not reach MIN_QUALITY on detailed 60 fps footage.
+    """
+    if not scale_height or not source_height or scale_height >= source_height:
+        return 1.0
+    return scale_height / source_height
 
 
 def keep_stagings_after_abort(stagings: list, is_interactive: bool, ask=None) -> bool:
@@ -1708,11 +1734,8 @@ def prepare_encode(input_path, profile, min_size_mb=0, copy_audio=False,
     # When downscaling, the ladder must follow the TARGET resolution. Otherwise every
     # pass aims at source-resolution bitrates for a much smaller frame — the encode
     # passes SSIM trivially and the search leaves most of the savings on the table.
-    # Rule of thumb: bitrate ~ pixels^0.75 (width scales with height, so pixels
-    # scale with the height ratio squared).
-    _br_scale = 1.0
-    if scale_height and info['height'] and _source_avg_kbps:
-        _br_scale = (scale_height / info['height']) ** 1.5
+    _br_scale = downscale_bitrate_scale(scale_height, info['height'])
+    if _source_avg_kbps:
         _source_avg_kbps *= _br_scale
 
     if _source_avg_kbps and _source_avg_kbps > 0:
@@ -2150,7 +2173,7 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
         if OPTIMIZER_UTILS_AVAILABLE and profile.get('_encoder_key'):
             _suggested_q = suggest_q_from_history(
                 profile['_encoder_key'], effective_height,
-                last_encode_result['source_kbps'] or 0.0)
+                last_encode_result['source_kbps'] or 0.0, min_ssim=MIN_QUALITY)
             if _suggested_q is not None:
                 first_mid = nearest_quality_index(quality_values, _suggested_q)
                 print(f"{Y}History Seed:{NC} starting at Q={quality_values[first_mid]} (median of past encodes)")
@@ -2231,15 +2254,14 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
             saved_pct = saved_bytes * 100 / size_to_compare
 
             # Check if meets targets
-            meets_targets = (saved_pct >= MIN_SAVINGS and ssim >= MIN_QUALITY) or \
-                           (saved_pct >= EXCELLENT_SAVINGS_PCT and ssim >= SSIM_ACCEPTABLE)
+            meets_targets = meets_quality_targets(saved_pct, ssim)
 
             # Track best acceptable result as backup (retain its staging file).
             # Retention uses SSIM_MIN, the documented hard floor — NOT the
-            # stricter SSIM_ACCEPTABLE. Otherwise 0.940..0.945 is a dead zone:
-            # good enough not to be rejected as "quality too low", too low to be
-            # kept as a fallback, so a 53%-savings pass at SSIM 0.9444 was
-            # deleted and the whole file reported as failed.
+            # stricter SSIM_ACCEPTABLE. Otherwise SSIM_MIN..SSIM_ACCEPTABLE is a
+            # dead zone: good enough not to be rejected as "quality too low", too
+            # low to be kept as a fallback, so a pass in it was deleted and the
+            # whole file reported as failed.
             # Ranking still PREFERS results clearing SSIM_ACCEPTABLE; the dead
             # zone only wins when nothing better exists.
             if ssim >= ssim_min and saved_pct > 0:
@@ -2252,8 +2274,10 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
                         best_acceptable_path.unlink()
                     best_acceptable = (quality, size_after, ssim, saved_bytes, saved_pct)
                     best_acceptable_path = staging
-                else:
-                    # We already have a better acceptable one
+                elif not meets_targets:
+                    # We already have a better acceptable one. A pass that meets
+                    # the targets is kept regardless: it can save less than a
+                    # lower-quality fallback, and is still the one to ship.
                     if staging != best_candidate_path and staging.exists():
                         staging.unlink()
 
@@ -2481,8 +2505,7 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
         saved_bytes = size_to_compare - size_after
         saved_pct = saved_bytes * 100 / size_to_compare
 
-        if (saved_pct >= MIN_SAVINGS and ssim >= MIN_QUALITY) or \
-           (saved_pct >= EXCELLENT_SAVINGS_PCT and ssim >= SSIM_ACCEPTABLE):
+        if meets_quality_targets(saved_pct, ssim):
             # Great result – promote staging file to final output
             # Discard any previously saved fallback
             if linear_best_acceptable_path and linear_best_acceptable_path.exists():

@@ -131,8 +131,10 @@ actually moves output size; `-q:v`/`-cq` alone don't reliably control size on
 every encoder.
 
 **Early exit / bias conditions:**
-- `EXCELLENT_SAVINGS_PCT = 50.0` — a pass this good that also clears the
-  quality bar ends the search immediately.
+- `EXCELLENT_SAVINGS_PCT = 50.0` — a pass this good that also reaches
+  `MIN_QUALITY` ends the search immediately. It no longer lowers the quality
+  bar: that is how a 4K60 clip downscaled to 1080p shipped at SSIM 0.954 with
+  smeared foliage (`meets_quality_targets()`).
 - `EARLY_ABORT_RATIO = 0.95` — abort mid-encode if the output is already at
   95% of source size (no point finishing that pass).
 - An "educated jump" skips several binary-search steps at once when a pass
@@ -140,13 +142,21 @@ every encoder.
   time.
 - `--q N` forces a starting quality and searches linearly from there instead
   of via binary search.
+- The first pass starts at the median winning quality of past encodes in the
+  same encoder / resolution / bitrate class (`suggest_q_from_history()`).
+  Only records that reached today's `MIN_QUALITY` count, so wins logged under
+  a laxer floor cannot keep seeding the search at a rung that no longer passes.
+- When downscaling, the bitrate ladder is scaled by the height ratio
+  (`downscale_bitrate_scale()`, i.e. pixels^0.5): 4K → 1080p keeps half the
+  source bitrate. pixels^0.75 (0.35) left even the best rung short of
+  `MIN_QUALITY` on detailed 60 fps footage.
 
 **SSIM threshold decision tree** (see [Configuration Constants](#configuration-constants) for values):
 
 | SSIM Score | Savings | Outcome |
 |:---|:---|:---|
-| ≥ `MIN_QUALITY` | ≥ `MIN_SAVINGS` | Strict success — promote immediately |
-| ≥ `MIN_QUALITY` or `SSIM_ACCEPTABLE` | ≥ `EXCELLENT_SAVINGS_PCT` | Excellent — early exit |
+| ≥ `MIN_QUALITY` | ≥ `MIN_SAVINGS` | Success — promote |
+| ≥ `MIN_QUALITY` | ≥ `EXCELLENT_SAVINGS_PCT` | Success — early exit |
 | ≥ `SSIM_ACCEPTABLE` | ≥ `MIN_SAVINGS` | Stored as fallback, search continues |
 | ≥ `SSIM_MIN` | any | Not useful — discard, try next step |
 | < `SSIM_MIN` | any | Hard abort — rescue the best fallback if one exists |
@@ -443,9 +453,9 @@ All tuning constants live at the top of `videocrunch.py`:
 | Constant | Default | Purpose |
 |:---|:---|:---|
 | `MIN_SAVINGS` | `20.0` | Minimum % savings a pass must hit to be accepted |
-| `MIN_QUALITY` | `0.960` | Minimum SSIM for a strict accept |
-| `SSIM_ACCEPTABLE` | `0.945` | SSIM floor for a fallback accept |
-| `SSIM_MIN` | `0.940` | Hard lower bound — reject below this regardless of savings (`--min-ssim` overrides per run) |
+| `MIN_QUALITY` | `0.980` | Minimum SSIM for an accept, whatever the savings |
+| `SSIM_ACCEPTABLE` | `0.975` | Preferred fallback when nothing reaches `MIN_QUALITY` |
+| `SSIM_MIN` | `0.970` | Hard lower bound — reject below this regardless of savings (`--min-ssim` overrides per run) |
 | `SAMPLE_DURATION` | `3` | Seconds per sample window for SSIM |
 | `EXCELLENT_SAVINGS_PCT` | `50.0` | Early-exit threshold in the binary search |
 | `EARLY_ABORT_RATIO` | `0.95` | Abort mid-encode once output reaches this fraction of source size |

@@ -88,6 +88,19 @@ class TestHistory:
         hist.write_text('not json\n{"broken":\n')
         assert suggest_q_from_history("videotoolbox", 1080, 12000, hist) is None
 
+    def test_suggest_ignores_wins_below_the_quality_target(self, tmp_path):
+        # Wins recorded under an older, laxer floor would seed every search at
+        # the bottom rung — where IMG_0886 came out visibly smeared.
+        hist = tmp_path / "h.jsonl"
+        for q, ssim in ((45, 0.954), (45, 0.95), (45, 0.958), (65, 0.982),
+                        (75, 0.985), (65, 0.981)):
+            append_encode_history(
+                {"encoder": "videotoolbox", "height": 1080,
+                 "source_kbps": 12000, "q": q, "ssim": ssim, "saved_pct": 40.0},
+                history_path=hist,
+            )
+        assert suggest_q_from_history("videotoolbox", 1080, 12000, hist, min_ssim=0.98) == 65
+
     def test_nearest_quality_index(self):
         assert nearest_quality_index([75, 65, 55, 45], 58) == 2
         assert nearest_quality_index([24, 28, 32, 36, 40, 44], 30) == 1
