@@ -124,10 +124,10 @@ class TestSingleFileInvocation:
 class TestQualityFloorOverride:
     """`--min-ssim` lets a caller move the hard quality floor for one run.
 
-    The default floor (SSIM_MIN) is calibrated for 1080p gameplay captures.
-    Material it was never calibrated for — heavily downscaled high-fps real
-    footage, for instance — can be visually fine and still land under it, so
-    the floor has to be steerable from the outside without editing the source.
+    No single floor fits all material: grain or water can look untouched and
+    still land under SSIM_MIN, while for other footage the default is the
+    minimum that still looks right. The floor has to be steerable from the
+    outside without editing the source.
     """
 
     def test_floor_override_parses(self):
@@ -658,3 +658,42 @@ class TestProcessFileImportContract:
     def test_encoder_profiles_expose_a_name(self):
         for key, profile in videocrunch.ENCODER_PROFILES.items():
             assert "name" in profile, f"profile {key!r} has no 'name' — callers print it"
+
+
+class TestQualityTargets:
+    """What a pass has to reach to count as done.
+
+    IMG_0886 (4K60 HDR, downscaled to 1080p) came out at SSIM 0.954 with the
+    foliage visibly smeared: a pass saving 50 %+ only had to clear 0.945.
+    Side by side with the source, 0.98 is where the difference becomes hard
+    to see; 0.974 already softens fine texture.
+    """
+
+    def test_big_savings_do_not_excuse_lower_quality(self):
+        assert not videocrunch.meets_quality_targets(saved_pct=83.2, ssim=0.954)
+
+    def test_target_quality_with_enough_savings_is_done(self):
+        assert videocrunch.meets_quality_targets(saved_pct=63.6, ssim=0.980)
+
+    def test_target_quality_without_savings_is_not(self):
+        assert not videocrunch.meets_quality_targets(saved_pct=12.0, ssim=0.99)
+
+    def test_floors_are_ordered(self):
+        assert (videocrunch.SSIM_MIN <= videocrunch.SSIM_ACCEPTABLE
+                <= videocrunch.MIN_QUALITY)
+        assert videocrunch.SSIM_MIN >= 0.97
+
+
+class TestDownscaleBitrate:
+    """How much of the source bitrate a downscaled encode is budgeted.
+
+    pixels^0.75 gave 4K → 1080p a factor of 0.35: the best rung of the ladder
+    then could not reach the quality target for detailed 60 fps footage.
+    """
+
+    def test_4k_to_1080p_keeps_half(self):
+        assert videocrunch.downscale_bitrate_scale(1080, 2160) == 0.5
+
+    def test_no_downscale_keeps_everything(self):
+        assert videocrunch.downscale_bitrate_scale(None, 2160) == 1.0
+        assert videocrunch.downscale_bitrate_scale(2160, 2160) == 1.0

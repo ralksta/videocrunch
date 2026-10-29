@@ -1,5 +1,4 @@
 """Unit tests for batch_controller output parsing (pure logic, no ffmpeg)."""
-import subprocess
 import sys
 import threading
 import time

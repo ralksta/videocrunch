@@ -72,8 +72,8 @@ Key flags: `--codec {hevc,av1}` (default hevc), `--encoder
 (force a starting quality and search linearly from there instead of via
 binary search), `--scale-height H` (downscale before encoding), `--ss`/`--to`
 (trim), `--force` (encode even if the savings heuristic says it's not worth
-it), `--min-ssim S` (move the hard quality floor for this run — fine-grained
-real footage can look perfect and still score below the default 0.940),
+it), `--min-ssim S` (move the hard quality floor for this run — the default
+is 0.970; check by eye before lowering it),
 `--no-presearch` (skip the sample-clip pre-search, always run the full
 search on the whole file), `--json-out PATH` (write the result as JSON — status,
 quality, SSIM, savings, in and out paths — whatever the outcome), `--replace`
@@ -166,10 +166,10 @@ Where the thresholds are, and what they do (`videocrunch.py`, "CONFIGURATION"
 | Constant | Value | Meaning |
 |---|---|---|
 | `MIN_SAVINGS` | `20.0` | Minimum file-size reduction (%) a pass must hit to be accepted. Also derives the top of the constrained-VBR bitrate ladder — a pass that can't clear this even at its target size is a guaranteed-failure rung and isn't tried. |
-| `MIN_QUALITY` | `0.960` | Target SSIM for a normal accept: a pass needs `saved% >= MIN_SAVINGS` *and* `SSIM >= MIN_QUALITY` to be picked as the primary result. |
-| `SSIM_MIN` | `0.940` | Hard floor. Any pass scoring below this is rejected outright and the search moves toward a higher-quality setting, regardless of how much space it saved. |
-| `SSIM_ACCEPTABLE` | `0.945` | Quality bar for the *fallback* result — used when nothing clears `MIN_QUALITY` but something between `SSIM_MIN` and `SSIM_ACCEPTABLE` still saved real space, so a 53%-savings pass at SSIM 0.944 isn't thrown away. |
-| `EXCELLENT_SAVINGS_PCT` | `50.0` | Savings % considered so good the search stops early — a pass this size that also clears `SSIM_ACCEPTABLE` (or `MIN_QUALITY`) ends the search immediately instead of trying to squeeze out more. |
+| `MIN_QUALITY` | `0.980` | Target SSIM: a pass needs `saved% >= MIN_SAVINGS` *and* `SSIM >= MIN_QUALITY` to be picked as the result. No amount of savings lowers it. Calibrated side by side on real footage: from 0.98 on the difference to the source is hard to see, 0.974 already softens foliage, 0.954 smears it. |
+| `SSIM_MIN` | `0.970` | Hard floor. Any pass scoring below this is rejected outright and the search moves toward a higher-quality setting, regardless of how much space it saved. |
+| `SSIM_ACCEPTABLE` | `0.975` | Preferred *fallback* — used when nothing reaches `MIN_QUALITY`; a pass at or above it wins over one between `SSIM_MIN` and `SSIM_ACCEPTABLE`. |
+| `EXCELLENT_SAVINGS_PCT` | `50.0` | Savings % considered so good the search stops early — a pass this size that also reaches `MIN_QUALITY` ends the search instead of trying to squeeze out more. |
 
 Tune these at the top of `videocrunch.py` if your material or standards
 differ — e.g. lower `MIN_QUALITY` for casual footage where a bit more

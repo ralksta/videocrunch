@@ -52,8 +52,13 @@ def append_encode_history(record: dict, history_path: Path = DEFAULT_HISTORY_PAT
 
 def suggest_q_from_history(encoder_key: str, height: int, source_kbps: float,
                            history_path: Path = DEFAULT_HISTORY_PATH,
-                           min_samples: int = 3) -> int | None:
-    """Median winning Q for this (encoder, resolution class, bitrate class) bucket."""
+                           min_samples: int = 3, min_ssim: float | None = None) -> int | None:
+    """Median winning Q for this (encoder, resolution class, bitrate class) bucket.
+
+    `min_ssim` drops wins that would not count as wins today: records made
+    under a laxer quality floor would otherwise keep seeding the search at
+    the rung that no longer passes.
+    """
     try:
         if not history_path.exists():
             return None
@@ -68,8 +73,11 @@ def suggest_q_from_history(encoder_key: str, height: int, source_kbps: float,
                 key = (rec.get("encoder"),
                        resolution_class(int(rec.get("height", 0))),
                        bitrate_class(float(rec.get("source_kbps", 0))))
-                if key == want and rec.get("q") is not None:
-                    qs.append(int(rec["q"]))
+                if key != want or rec.get("q") is None:
+                    continue
+                if min_ssim is not None and float(rec.get("ssim") or 0) < min_ssim:
+                    continue
+                qs.append(int(rec["q"]))
         if len(qs) < min_samples:
             return None
         return int(statistics.median(qs))
