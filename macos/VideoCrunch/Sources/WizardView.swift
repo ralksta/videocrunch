@@ -39,9 +39,10 @@ struct WizardView: View {
 
     private var headerBar: some View {
         HStack(spacing: 12) {
-            Image(systemName: "film.stack")
-                .font(.system(size: 24))
-                .foregroundColor(.accentColor)
+            Image(nsImage: NSApp.applicationIconImage)
+                .resizable()
+                .frame(width: 36, height: 36)
+                .accessibilityHidden(true)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text("videocrunch")

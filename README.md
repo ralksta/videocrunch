@@ -250,6 +250,9 @@ again. A Finder-launched app only sees `/usr/bin:/bin:/usr/sbin:/sbin`; the
 app adds `/opt/homebrew/bin` and `/usr/local/bin` itself, so a Homebrew
 `ffmpeg` and `python3` are found. It prefers `.venv/bin/python3` if present.
 
+The app icon is drawn in code: `macos/VideoCrunch/Icon/make_icon.swift`,
+rebuilt into `AppIcon.icns` by `macos/VideoCrunch/Icon/build_icon.sh`.
+
 The built app stays inside the repository (`macos/VideoCrunch/VideoCrunch.app`,
 ignored by git). The Quick Action bundle is the installer's only footprint
 outside it. To uninstall the Quick Action:

@@ -17,6 +17,10 @@ swiftc -parse-as-library \
     "$MACOS_DIR/Sources/main.swift" \
     -o "$MACOS_DIR/VideoCrunch.app/Contents/MacOS/VideoCrunch"
 
+if [ -f "$MACOS_DIR/AppIcon.icns" ]; then
+    cp "$MACOS_DIR/AppIcon.icns" "$MACOS_DIR/VideoCrunch.app/Contents/Resources/AppIcon.icns"
+fi
+
 cat > "$MACOS_DIR/VideoCrunch.app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -28,6 +32,8 @@ cat > "$MACOS_DIR/VideoCrunch.app/Contents/Info.plist" <<PLIST
     <string>com.videocrunch.app</string>
     <key>CFBundleName</key>
     <string>VideoCrunch</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -43,6 +49,12 @@ cat > "$MACOS_DIR/VideoCrunch.app/Contents/Info.plist" <<PLIST
 </dict>
 </plist>
 PLIST
+
+# Finder and the Dock cache an app's icon by bundle; without this a rebuilt
+# app keeps showing the icon (or the blank placeholder) it was first seen with.
+touch "$APP_BUNDLE"
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+    -f "$APP_BUNDLE" 2>/dev/null || true
 
 echo "📦 Registriere Finder Quick Action..."
 SERVICE_DIR="$HOME/Library/Services/videocrunch.workflow/Contents"
