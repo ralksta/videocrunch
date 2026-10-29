@@ -527,6 +527,17 @@ class TestBatchQualityFloorForwarding:
                                             scale_height=1080)
         assert cmd[cmd.index("--scale-height") + 1] == "1080"
 
+    def test_codec_reaches_the_per_file_command(self):
+        # The wizard offers AV1; without forwarding every file was HEVC anyway.
+        cmd = batch.build_optimizer_command("/a.mp4", port=None, audio_mode="standard",
+                                            codec="av1")
+        assert cmd[cmd.index("--codec") + 1] == "av1"
+
+    def test_codec_parses_and_defaults_to_hevc(self):
+        assert batch.build_parser().parse_args(["--files=/a.mp4"]).codec == "hevc"
+        assert batch.build_parser().parse_args(
+            ["--files=/a.mp4", "--codec=av1"]).codec == "av1"
+
     def test_replace_reaches_the_per_file_command(self):
         cmd = batch.build_optimizer_command("/a.mp4", port=None, audio_mode="standard",
                                             replace=True)

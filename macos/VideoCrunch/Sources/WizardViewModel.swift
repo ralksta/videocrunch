@@ -24,6 +24,8 @@ class WizardViewModel: ObservableObject {
 
     // Step 2 & 3: Options
     @Published var targetCodec: String = "hevc"
+    /// The codec the savings estimate was computed for.
+    @Published var scannedCodec: String = "hevc"
     @Published var audioMode: String = "enhanced"
     @Published var scaleTo1080p: Bool = false
     @Published var moveToTrash: Bool = false
@@ -71,6 +73,7 @@ class WizardViewModel: ObservableObject {
         let python = self.resolvePythonPath()
         let scanScript = self.scriptDir.appendingPathComponent("scan.py").path
         let codec = self.targetCodec
+        self.scannedCodec = codec
 
         // Run scan.py --json on background thread
         DispatchQueue.global(qos: .userInitiated).async {
@@ -144,6 +147,10 @@ class WizardViewModel: ObservableObject {
         selectedCandidates.reduce(0.0) { $0 + $1.estimated_saved_mb }
     }
 
+    var selectedTotalAfterMB: Double {
+        max(0, selectedTotalMB - selectedEstimatedSavedMB)
+    }
+
     var hasTallCandidates: Bool {
         selectedCandidates.contains { $0.height > 1080 }
     }
@@ -201,6 +208,7 @@ class WizardViewModel: ObservableObject {
         let scale1080 = self.scaleTo1080p
         let trash = self.moveToTrash
         let ssimFloor = self.minSSIMOverride
+        let codec = self.targetCodec
 
         DispatchQueue.global(qos: .userInitiated).async {
             do {
@@ -218,6 +226,7 @@ class WizardViewModel: ObservableObject {
                 batchScript,
                 "--files-from", fileListURL.path,
                 "--audio-mode", audioM,
+                "--codec", codec,
                 "--json-out", resultJsonPath
             ]
 
