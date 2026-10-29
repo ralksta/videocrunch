@@ -21,6 +21,12 @@ struct Candidate: Identifiable, Codable, Hashable {
         URL(fileURLWithPath: file_path).lastPathComponent
     }
 
+    /// scan.py's reason repeats codec, resolution and bitrate before " — ";
+    /// the row already shows those as chips.
+    var reasonDetail: String {
+        reason.components(separatedBy: " — ").last ?? reason
+    }
+
     var resolutionString: String {
         if height > 0 {
             return "\(height)p"

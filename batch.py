@@ -82,6 +82,8 @@ def draw_table(start_time, max_workers):
                 status_str = f"{R}✗ Failed{NC}"
             elif status == "skipped":
                 status_str = f"{Y}⊘ Skip{NC}"
+            elif status == "cancelled":
+                status_str = f"{Y}■ Cancelled{NC}"
             elif status == "encoding":
                 bar_len = 10
                 filled = int(progress / 100 * bar_len)
@@ -293,6 +295,7 @@ def run_optimizer(args_tuple):
     try:
         process = start_worker(cmd)
         if process is None:
+            result["status"] = "cancelled"
             result["reason"] = "Cancelled"
             with display_lock:
                 worker_status[worker_id]["status"] = "failed"
@@ -385,6 +388,10 @@ def run_optimizer(args_tuple):
         except OSError:
             pass
         merge_worker_result(scraped, from_worker)
+        # A file stopped by a cancel did not fail; it was never allowed to finish.
+        if scraped["status"] != "success" and abort_requested.is_set():
+            scraped["status"] = "cancelled"
+            scraped["reason"] = "Cancelled"
         result.update({k: v for k, v in scraped.items() if k != "status"})
         succeeded = scraped["status"] == "success"
 
