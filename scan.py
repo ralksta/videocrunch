@@ -38,7 +38,7 @@ from savings import (
     estimate_savings_pct,
     resolution_class,
 )
-from videocrunch import suggested_floor
+from videocrunch import MIN_QUALITY, suggested_floor
 
 # Extensions worth probing. Deliberately inlined: a standalone tool should not
 # need a config module for a constant list.
@@ -270,10 +270,16 @@ class EncodeHistory:
     only the matching bucket, not a full linear scan of every record. Reload
     (triggered by an mtime check) and bucket access are both guarded by a lock
     since the instance may be shared across threads.
+
+    Records whose SSIM is below `min_ssim` are left out: they come from passes
+    the search would reject today, and their savings would make every estimate
+    promise more than an encode delivers.
     """
 
-    def __init__(self, path: Path = DEFAULT_HISTORY_PATH) -> None:
+    def __init__(self, path: Path = DEFAULT_HISTORY_PATH,
+                 min_ssim: Optional[float] = MIN_QUALITY) -> None:
         self.path = path
+        self.min_ssim = min_ssim
         self._mtime: float = -1.0
         # bucket (resolution_class, bitrate_class) -> [(lowered codec str, saved_pct), ...]
         self._index: dict[tuple[str, str], list[tuple[str, float]]] = {}
@@ -303,6 +309,10 @@ class EncodeHistory:
                             bucket = (resolution_class(int(rec.get("height", 0))),
                                      bitrate_class(float(rec.get("source_kbps", 0))))
                             saved_pct = float(rec["saved_pct"])
+                            ssim = rec.get("ssim")
+                            if (self.min_ssim is not None and ssim is not None
+                                    and float(ssim) < self.min_ssim):
+                                continue
                         except (TypeError, ValueError):
                             continue
                         codec_str = str(rec.get("codec", "")).lower()

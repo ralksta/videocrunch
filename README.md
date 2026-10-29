@@ -110,7 +110,9 @@ When the batch is done, the estimate is held against what was actually saved,
 and anything that failed on quality can be retried right away at a floor that
 clears it.
 Historical encodes (from `~/.videocrunch/logs/encode_history.jsonl`) are used
-to sharpen the estimate where available — the table marks those rows.
+to sharpen the estimate where available — the table marks those rows. Only
+encodes that reached today's quality target (`MIN_QUALITY`) count, so savings
+from passes the search would now reject don't inflate the estimate.
 
 `--json` prints the same `{"results": [...], "summary": {...}}` structure as
 machine-readable JSON on stdout instead — nothing else: no banner, no

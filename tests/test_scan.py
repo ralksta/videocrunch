@@ -270,6 +270,28 @@ class TestRank:
         assert result["estimated_saved_pct"] == pytest.approx(50.0)
         assert out["summary"]["history_based"] == 1
 
+    def test_history_below_the_quality_target_does_not_count(self, tmp_path):
+        # Records from before the quality floor went up promised savings the
+        # search no longer delivers: 83 % at SSIM 0.954 is now a rejected pass.
+        from scan import EncodeHistory, rank
+        history_path = self._write_history(tmp_path, [
+            {"height": 1080, "source_kbps": 12000, "codec": "hevc_videotoolbox",
+             "saved_pct": 83.0, "ssim": 0.954},
+            {"height": 1080, "source_kbps": 12000, "codec": "hevc_videotoolbox",
+             "saved_pct": 80.0, "ssim": 0.958},
+            {"height": 1080, "source_kbps": 12000, "codec": "hevc_videotoolbox",
+             "saved_pct": 60.0, "ssim": 0.982},
+            {"height": 1080, "source_kbps": 12000, "codec": "hevc_videotoolbox",
+             "saved_pct": 58.0, "ssim": 0.985},
+            {"height": 1080, "source_kbps": 12000, "codec": "hevc_videotoolbox",
+             "saved_pct": 55.0, "ssim": 0.981},
+        ])
+        out = rank([self._media()], "hevc", set(), EncodeHistory(history_path), 10)
+        result = out["results"][0]
+        assert result["source"] == "history"
+        assert result["estimated_saved_pct"] == pytest.approx(58.0)
+        assert "3 echte Encodes" in result["reason"]
+
     def test_same_codec_source_is_excluded_from_the_history_override(self, tmp_path):
         from scan import EncodeHistory, rank
         # Same bucket as above, but the source is already HEVC targeting HEVC:
