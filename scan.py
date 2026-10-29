@@ -707,6 +707,10 @@ def main() -> int:
         log(f"{R}ffprobe nicht gefunden (PATH: {os.environ.get('PATH', '')}){NC}")
         return 1
 
+    if shutil.which('ffprobe') is None:
+        log(f"{R}ffprobe nicht gefunden (PATH: {os.environ.get('PATH', '')}){NC}")
+        return 1
+
     entries = probe_all(paths, quiet=args.json)
     if not entries:
         log(f"{R}Keine lesbaren Videodateien.{NC}")
