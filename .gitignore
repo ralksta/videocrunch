@@ -10,3 +10,6 @@ venv/
 # Built by install_macos_quick_action.sh
 macos/VideoCrunch/VideoCrunch.app/
 macos/VideoCrunch/VideoCrunchUI
+
+# macOS Finder metadata
+.DS_Store
