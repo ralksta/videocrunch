@@ -336,6 +336,28 @@ class TestJsonOutput:
         assert result.returncode == 0
         json.loads(result.stdout)
 
+    def test_single_file_is_accepted(self, tmp_path):
+        # The Finder Quick Action hands over one video, not a folder.
+        clip = tmp_path / "clip.mov"
+        clip.write_bytes(b"not really a video")
+        result = self._run(clip)
+        assert "Kein Ordner" not in result.stderr
+        json.loads(result.stdout)
+
+    def test_unreadable_file_says_so_on_stderr(self, tmp_path):
+        # The wizard shows stderr's last line on exit 1; without this it was
+        # the progress counter, "Lese Metadaten... 1/1".
+        clip = tmp_path / "clip.mov"
+        clip.write_bytes(b"not really a video")
+        result = self._run(clip)
+        assert result.returncode == 1
+        assert "Keine lesbaren Videodateien" in result.stderr
+
+    def test_missing_path_is_rejected(self, tmp_path):
+        result = self._run(tmp_path / "gone.mov")
+        assert result.returncode == 1
+        assert "Kein Ordner oder Datei" in result.stderr
+
     def test_missing_ffprobe_is_named_on_stderr(self, tmp_path):
         # A Finder-launched GUI gets PATH=/usr/bin:/bin:..., without Homebrew.
         # Every probe then fails silently and the only stderr line left was
