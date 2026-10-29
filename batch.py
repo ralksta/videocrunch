@@ -8,6 +8,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -41,6 +42,13 @@ stats = {"completed": 0, "succeeded": 0, "failed": 0, "total": 0}
 file_results = []  # Detailed results for logging: [{filename, status, quality, ssim, saved_pct, duration}]
 display_lock = threading.Lock()
 stop_display = threading.Event()
+
+# Running videocrunch.py processes, so a cancel can reach them. Only worker
+# threads and the signal handler take workers_lock, never the main loop, so
+# the handler cannot deadlock on a lock its own thread already holds.
+active_workers = set()
+workers_lock = threading.Lock()
+abort_requested = threading.Event()
 
 
 def truncate(text, max_len=35):
@@ -216,6 +224,41 @@ def build_optimizer_command(file_path, port, audio_mode, min_ssim=None, json_out
     return cmd
 
 
+def start_worker(cmd):
+    """Start one videocrunch.py, or return None once the batch is cancelled."""
+    with workers_lock:
+        if abort_requested.is_set():
+            return None
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1
+        )
+        active_workers.add(process)
+        return process
+
+
+def finish_worker(process):
+    with workers_lock:
+        active_workers.discard(process)
+
+
+def abort_workers(signum=None, frame=None):
+    """SIGTERM handler: interrupt every running worker and start no new ones.
+
+    Workers get SIGTERM, which videocrunch.py turns into its own abort path:
+    stop ffmpeg, delete the half-written pass. Dying here alone would leave
+    them encoding unsupervised.
+    """
+    abort_requested.set()
+    with workers_lock:
+        for process in active_workers:
+            if process.poll() is None:
+                process.terminate()
+
+
 def run_optimizer(args_tuple):
     """Worker function - captures output and updates shared state. Returns detailed results for logging."""
     file_path, port, audio_mode, min_ssim, scale_height, replace, worker_id = args_tuple
@@ -246,13 +289,13 @@ def run_optimizer(args_tuple):
                                   replace=replace)
 
     try:
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1
-        )
+        process = start_worker(cmd)
+        if process is None:
+            result["reason"] = "Cancelled"
+            with display_lock:
+                worker_status[worker_id]["status"] = "failed"
+                file_results.append(result)
+            return (file_path, False, result)
 
         success = False
         failed = False  # Track explicit failures
@@ -322,9 +365,11 @@ def run_optimizer(args_tuple):
                     worker_status[worker_id]["status"] = "skipped"
                     worker_status[worker_id]["progress"] = 100
                     file_results.append(result)
+                finish_worker(process)
                 return (file_path, True, result)
 
         process.wait()
+        finish_worker(process)
         result["duration"] = time.time() - file_start
 
         # The worker's own verdict outranks anything scraped from its output.
@@ -441,7 +486,11 @@ def write_log(start_time, elapsed, encoder_name):
 def build_parser():
     """The CLI surface — see tests/test_cli_contract.py for the invocation contract."""
     parser = argparse.ArgumentParser(description='Batch Controller V2.0')
-    parser.add_argument('--files', required=True, help='Comma-separated file paths')
+    sources = parser.add_mutually_exclusive_group(required=True)
+    sources.add_argument('--files', help='Comma-separated file paths')
+    sources.add_argument('--files-from', metavar='PATH',
+                         help='Read file paths from PATH, one per line '
+                              '(for names that contain commas)')
     parser.add_argument('--port', type=int,
                         help='Notify a companion server on this port when a file is done, '
                              'via GET /api/mark_optimized?path=<path>')
@@ -458,10 +507,19 @@ def build_parser():
     return parser
 
 
+def file_list(args) -> list:
+    """The files to encode, from --files-from or the comma-separated --files."""
+    if args.files_from:
+        text = Path(args.files_from).read_text(encoding='utf-8')
+        return [line for line in text.splitlines() if line.strip()]
+    return [f.strip() for f in args.files.split(',') if f.strip()]
+
+
 def main():
     args = build_parser().parse_args()
+    signal.signal(signal.SIGTERM, abort_workers)
 
-    files = [f.strip() for f in args.files.split(',') if f.strip()]
+    files = file_list(args)
 
     if not files:
         print(f"{R}No files provided.{NC}")

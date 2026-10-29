@@ -628,8 +628,21 @@ def read_batch_results(path) -> list:
 def run_batch(paths: list, audio_mode: str, port=None, scale_height=None,
               replace: bool = False, results_file=None, min_ssim=None) -> int:
     """Hand the marked files to batch.py for parallel encoding."""
+    # A list file, not --files: a comma in a name would split the path.
+    with tempfile.NamedTemporaryFile('w', suffix='.txt', encoding='utf-8',
+                                     delete=False) as listing:
+        listing.write("".join(f"{p}\n" for p in paths))
+    try:
+        return _run_batch(listing.name, audio_mode, port, scale_height,
+                          replace, results_file, min_ssim)
+    finally:
+        os.unlink(listing.name)
+
+
+def _run_batch(listing, audio_mode, port, scale_height, replace,
+               results_file, min_ssim) -> int:
     cmd = [sys.executable, str(Path(__file__).parent / "batch.py"),
-           '--files', ",".join(paths), '--audio-mode', audio_mode]
+           '--files-from', listing, '--audio-mode', audio_mode]
     if results_file:
         cmd.extend(['--json-out', str(results_file)])
     if min_ssim:
@@ -686,6 +699,10 @@ def main() -> int:
             log(f"{Y}Keine Videodateien gefunden.{NC}")
         return 0
     log(f"{G}Gefunden:{NC} {len(paths)} Videodateien\n")
+
+    if shutil.which('ffprobe') is None:
+        log(f"{R}ffprobe nicht gefunden (PATH: {os.environ.get('PATH', '')}){NC}")
+        return 1
 
     entries = probe_all(paths, quiet=args.json)
     if not entries:
