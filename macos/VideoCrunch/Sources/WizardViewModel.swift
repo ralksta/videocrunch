@@ -145,8 +145,20 @@ class WizardViewModel: ObservableObject {
         selectedCandidates.reduce(0.0) { $0 + $1.size_mb }
     }
 
+    /// Follows the 1080p switch: with it on, downscalable files count with
+    /// their downscaled estimate.
     var selectedEstimatedSavedMB: Double {
-        selectedCandidates.reduce(0.0) { $0 + $1.estimated_saved_mb }
+        selectedCandidates.reduce(0.0) { sum, c in
+            sum + (scaleTo1080p ? (c.estimated_saved_mb_1080 ?? c.estimated_saved_mb)
+                                : c.estimated_saved_mb)
+        }
+    }
+
+    /// What switching the 1080p downscale on adds to the selection's saving.
+    var downscaleExtraSavedMB: Double {
+        selectedCandidates.reduce(0.0) { sum, c in
+            sum + max(0, (c.estimated_saved_mb_1080 ?? c.estimated_saved_mb) - c.estimated_saved_mb)
+        }
     }
 
     var selectedTotalAfterMB: Double {
@@ -157,12 +169,14 @@ class WizardViewModel: ObservableObject {
         batchResults.filter { $0.status == "cancelled" }.count
     }
 
+    // scan.py decides what is above 1080p (by the short side, so a vertical
+    // 1080x1920 video is not); it reports a 1080p estimate only for those.
     var hasTallCandidates: Bool {
-        selectedCandidates.contains { $0.height > 1080 }
+        selectedCandidates.contains { $0.canDownscale }
     }
 
     var tallCandidatesCount: Int {
-        selectedCandidates.filter { $0.height > 1080 }.count
+        selectedCandidates.filter { $0.canDownscale }.count
     }
 
     func selectAll() {

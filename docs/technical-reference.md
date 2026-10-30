@@ -146,7 +146,11 @@ every encoder.
   same encoder / resolution / bitrate class (`suggest_q_from_history()`).
   Only records that reached today's `MIN_QUALITY` count, so wins logged under
   a laxer floor cannot keep seeding the search at a rung that no longer passes.
-- When downscaling, the bitrate ladder is scaled by the height ratio
+- `--scale-height` sets the shorter side (`downscaled_size()`,
+  `apply_scale_to_filter()`): 1080 is 1080p in either orientation. Setting the
+  height instead counted a vertical 1080x1920 clip as "above 1080p" and would
+  have squeezed vertical 4K to 608x1080.
+- When downscaling, the bitrate ladder is scaled by the short-side ratio
   (`downscale_bitrate_scale()`, i.e. pixels^0.5): 4K → 1080p keeps half the
   source bitrate. pixels^0.75 (0.35) left even the best rung short of
   `MIN_QUALITY` on detailed 60 fps footage.
@@ -494,7 +498,7 @@ usage: videocrunch.py [-h]
 | `--ss` / `--to` | Trim start/end time before encoding |
 | `--video-mode {compress,copy}` | compress (default) or passthrough |
 | `--q N` | Manual starting quality — searches linearly from there instead of binary search |
-| `--scale-height H` | Downscale to H pixels height (ignored if >= source height) |
+| `--scale-height H` | Downscale so the shorter side is H (ignored if the source is already that small) |
 | `--port PORT` | Notify a companion server on this port when a file is done, via `GET /api/mark_optimized?path=<path>` |
 | `--preset {fast,balanced,best}` | Encoder-specific speed/quality preset |
 | `--force` | Encode even when `savings.py` predicts it isn't worth it |

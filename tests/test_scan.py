@@ -270,6 +270,25 @@ class TestRank:
         assert result["estimated_saved_pct"] == pytest.approx(50.0)
         assert out["summary"]["history_based"] == 1
 
+    def test_estimate_with_1080p_downscale_is_reported_alongside(self):
+        # IMG_0886: iPhone 4K60 HEVC at 53.9 Mbit/s. Native estimate ~15 %
+        # (same codec); the real encode downscaled to 1080p saved 59.8 %.
+        from scan import EncodeHistory, rank
+        media = [self._media(codec="hevc", width=3840, height=2160, bitrate_mbps=53.9,
+                             frame_rate=60.0, size_mb=69.4)]
+        result = rank(media, "hevc", set(), EncodeHistory(Path("/nonexistent")), 10)["results"][0]
+        assert result["estimated_saved_pct"] < 20
+        assert 55 <= result["estimated_saved_pct_1080"] <= 65
+        assert result["estimated_saved_mb_1080"] == pytest.approx(
+            69.4 * result["estimated_saved_pct_1080"] / 100, abs=0.1)
+
+    def test_no_1080p_estimate_for_material_that_is_already_1080p(self):
+        from scan import EncodeHistory, rank
+        media = [self._media(width=1080, height=1920)]  # vertical 1080p
+        result = rank(media, "hevc", set(), EncodeHistory(Path("/nonexistent")), 10)["results"][0]
+        assert result["estimated_saved_pct_1080"] is None
+        assert result["estimated_saved_mb_1080"] is None
+
     def test_history_below_the_quality_target_does_not_count(self, tmp_path):
         # Records from before the quality floor went up promised savings the
         # search no longer delivers: 83 % at SSIM 0.954 is now a rejected pass.
@@ -563,6 +582,11 @@ class TestWizardQuestions:
     def test_downscale_is_offered_only_for_taller_material(self):
         entries = [{"height": 2160}, {"height": 1080}, {"height": 3840}]
         assert downscale_candidates(entries, 1080) == 2
+
+    def test_vertical_1080p_is_not_taller_than_1080p(self):
+        # Orientation is not resolution: 1080x1920 is 1080p, 2160x3840 is 4K.
+        entries = [{"width": 1080, "height": 1920}, {"width": 2160, "height": 3840}]
+        assert downscale_candidates(entries, 1080) == 1
 
     def test_nothing_to_downscale_means_no_question(self):
         entries = [{"height": 1080}, {"height": 720}]

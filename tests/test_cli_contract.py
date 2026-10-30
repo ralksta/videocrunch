@@ -19,6 +19,7 @@ never an accidental side effect of a refactor.
 """
 import inspect
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -697,3 +698,36 @@ class TestDownscaleBitrate:
     def test_no_downscale_keeps_everything(self):
         assert videocrunch.downscale_bitrate_scale(None, 2160) == 1.0
         assert videocrunch.downscale_bitrate_scale(2160, 2160) == 1.0
+
+
+class TestDownscaleIsTheShortSide:
+    """"1080p" means the shorter side, in either orientation.
+
+    --scale-height 1080 used to set the height: a vertical 1080x1920 phone
+    video counted as "taller than 1080p", and a vertical 4K one would have
+    been squeezed to 608x1080 instead of 1080x1920.
+    """
+
+    def test_target_size_follows_the_short_side(self):
+        assert videocrunch.downscaled_size(3840, 2160, 1080) == (1920, 1080)
+        assert videocrunch.downscaled_size(2160, 3840, 1080) == (1080, 1920)
+
+    def test_nothing_to_do_when_the_short_side_is_already_there(self):
+        assert videocrunch.downscaled_size(1080, 1920, 1080) is None
+        assert videocrunch.downscaled_size(1920, 1080, 1080) is None
+        assert videocrunch.downscaled_size(1280, 720, 1080) is None
+
+    @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+    @pytest.mark.parametrize("source, expected", [("720x1280", "360,640"),
+                                                  ("1280x720", "640,360")])
+    def test_the_filter_scales_the_short_side(self, tmp_path, source, expected):
+        vf = videocrunch.apply_scale_to_filter(
+            videocrunch.ENCODER_PROFILES["videotoolbox"]["video_filter"], 360)
+        frame = tmp_path / "f.png"
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+                        f"testsrc2=size={source}", "-vf", vf, "-frames:v", "1", str(frame)],
+                       check=True)
+        size = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=width,height",
+                               "-of", "csv=p=0", str(frame)],
+                              capture_output=True, text=True, check=True).stdout.strip()
+        assert size == expected

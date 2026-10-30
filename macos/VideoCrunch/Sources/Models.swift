@@ -13,6 +13,9 @@ struct Candidate: Identifiable, Codable, Hashable {
     let bitrate_mbps: Double
     let estimated_saved_mb: Double
     let estimated_saved_pct: Double
+    /// Same file with the 1080p downscale on; nil when it is already 1080p.
+    let estimated_saved_mb_1080: Double?
+    let estimated_saved_pct_1080: Double?
     let confidence: String
     let source: String
     let reason: String
@@ -27,11 +30,10 @@ struct Candidate: Identifiable, Codable, Hashable {
         reason.components(separatedBy: " — ").last ?? reason
     }
 
+    /// "1080p" names the short side, so a vertical 1080x1920 video is 1080p.
     var resolutionString: String {
-        if height > 0 {
-            return "\(height)p"
-        }
-        return "Unknown"
+        let short = width > 0 && height > 0 ? min(width, height) : height
+        return short > 0 ? "\(short)p" : "Unknown"
     }
 
     var sizeFormatted: String {
@@ -40,6 +42,10 @@ struct Candidate: Identifiable, Codable, Hashable {
 
     var savedFormatted: String {
         formatMB(estimated_saved_mb)
+    }
+
+    var canDownscale: Bool {
+        estimated_saved_mb_1080 != nil
     }
 }
 
