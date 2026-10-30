@@ -439,6 +439,39 @@ class TestJsonOutput:
         assert ANSI_ESCAPE_RE.search(text) is None
 
 
+class TestSeveralPaths:
+    """The app hands over everything dropped or picked at once, in one window."""
+
+    SCAN_PY = REPO_ROOT / "scan.py"
+
+    @pytest.mark.skipif(shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+                        reason="ffmpeg/ffprobe not installed")
+    def test_files_and_folders_are_ranked_together(self, tmp_path):
+        folder = tmp_path / "Urlaub"
+        folder.mkdir()
+        single = tmp_path / "einzeln.mp4"
+        for clip in (folder / "a.mp4", folder / "b.mp4", single):
+            subprocess.run(
+                ["ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=duration=1:size=1920x1080:rate=24",
+                 "-c:v", "libx264", "-preset", "ultrafast", "-b:v", "20M", str(clip)],
+                check=True, capture_output=True)
+        result = subprocess.run(
+            [sys.executable, str(self.SCAN_PY), str(folder), str(single), str(folder / "a.mp4"),
+             "--json"], capture_output=True, text=True, timeout=60)
+        assert result.returncode == 0, result.stderr
+        names = sorted(Path(r["file_path"]).name for r in json.loads(result.stdout)["results"])
+        # a.mp4 is named twice (inside the folder and on its own): listed once.
+        assert names == ["a.mp4", "b.mp4", "einzeln.mp4"]
+
+    def test_one_missing_path_does_not_sink_the_rest(self, tmp_path):
+        result = subprocess.run(
+            [sys.executable, str(self.SCAN_PY), str(tmp_path), str(tmp_path / "weg.mov"),
+             "--json"], capture_output=True, text=True, timeout=60)
+        assert result.returncode == 0
+        assert "Kein Ordner oder Datei" in result.stderr
+        json.loads(result.stdout)
+
+
 class TestDisplayName:
     """What the table calls a file.
 

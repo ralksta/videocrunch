@@ -1,5 +1,7 @@
-import Foundation
+import AppKit
 import Combine
+import Foundation
+import UniformTypeIdentifiers
 
 enum WizardStep {
     case scanning
@@ -11,7 +13,14 @@ enum WizardStep {
 
 @MainActor
 class WizardViewModel: ObservableObject {
-    @Published var targetURL: URL?
+    /// What was opened — files and folders, scanned together.
+    @Published var targetURLs: [URL] = []
+    /// Opened while an encode runs; offered once it is done.
+    @Published var queuedURLs: [URL] = []
+    /// Shown in the selection list, e.g. when adding files failed.
+    @Published var notice: String?
+    /// Opened while a scan runs; added when it is done.
+    private var scanBacklog: [URL] = []
     @Published var currentStep: WizardStep = .scanning
     @Published var errorMessage: String?
 
@@ -64,24 +73,71 @@ class WizardViewModel: ObservableObject {
         self.scriptDir = URL(fileURLWithPath: path)
     }
 
-    func startScan(for url: URL) {
-        self.targetURL = url
+    /// Everything opened — Dock, Finder, Quick Action, drop, ⌘O — lands here.
+    /// What happens depends on where the wizard is: before a selection it
+    /// starts over, during one it adds, during an encode it waits.
+    func open(_ urls: [URL]) {
+        let known = Set(targetURLs + queuedURLs + scanBacklog)
+        let fresh = urls.map(\.standardizedFileURL).filter { !known.contains($0) }
+        guard !fresh.isEmpty else { return }
+        switch currentStep {
+        case .encoding:
+            queuedURLs += fresh
+        case .scanning where isScanning:
+            scanBacklog += fresh
+        case .candidateSelection, .options:
+            targetURLs += fresh
+            runScan(fresh, adding: true)
+        default:  // empty start, failed scan, finished run
+            startScan(for: fresh)
+        }
+    }
+
+    func chooseAndOpen() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = true
+        panel.allowedContentTypes = [.movie, .folder]
+        if panel.runModal() == .OK {
+            open(panel.urls)
+        }
+    }
+
+    /// Scan what was queued during the encode, as a new run.
+    func scanQueued() {
+        let urls = queuedURLs
+        queuedURLs = []
+        startScan(for: urls)
+    }
+
+    func startScan(for urls: [URL]) {
+        self.targetURLs = urls
         self.errorMessage = nil
+        self.notice = nil
         self.currentStep = .scanning
-        self.isScanning = true
         self.candidates = []
         self.selectedIds = []
+        self.scaleTo1080p = false
+        runScan(urls, adding: false)
+    }
 
+    /// Runs scan.py over `urls`. `adding` keeps the current selection and
+    /// appends what is new instead of replacing the list.
+    private func runScan(_ urls: [URL], adding: Bool) {
+        self.isScanning = true
         let python = self.resolvePythonPath()
         let scanScript = self.scriptDir.appendingPathComponent("scan.py").path
         let codec = self.targetCodec
-        self.scannedCodec = codec
+        if !adding {
+            self.scannedCodec = codec
+        }
 
         // Run scan.py --json on background thread
         DispatchQueue.global(qos: .userInitiated).async {
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: python)
-            proc.arguments = [scanScript, url.path, "--json", "--codec", codec]
+            proc.arguments = [scanScript] + urls.map(\.path) + ["--json", "--codec", codec]
             proc.environment = WizardViewModel.toolEnvironment()
 
             let pipe = Pipe()
@@ -108,33 +164,58 @@ class WizardViewModel: ObservableObject {
                     let errData = errBuffer.stored
                     let errStr = WizardViewModel.lastMessage(errData) ?? "Scan fehlgeschlagen"
                     DispatchQueue.main.async {
-                        self.errorMessage = errStr
-                        self.isScanning = false
+                        self.scanFailed(errStr, adding: adding)
                     }
                     return
                 }
 
                 if let response = try? JSONDecoder().decode(ScanResponse.self, from: data) {
                     DispatchQueue.main.async {
-                        self.candidates = response.results
-                        self.scanSummary = response.summary
-                        self.selectedIds = Set(response.results.map { $0.id })
-                        self.isScanning = false
-                        self.currentStep = .candidateSelection
+                        self.scanFinished(response, adding: adding)
                     }
                 } else {
                     DispatchQueue.main.async {
-                        self.errorMessage = "Keine lesbaren Ergebnisse von scan.py erhalten."
-                        self.isScanning = false
+                        self.scanFailed("Keine lesbaren Ergebnisse von scan.py erhalten.", adding: adding)
                     }
                 }
             } catch {
                 DispatchQueue.main.async {
-                    self.errorMessage = "Fehler beim Starten von scan.py: \(error.localizedDescription)"
-                    self.isScanning = false
+                    self.scanFailed("Fehler beim Starten von scan.py: \(error.localizedDescription)",
+                                    adding: adding)
                 }
             }
         }
+    }
+
+    private func scanFinished(_ response: ScanResponse, adding: Bool) {
+        isScanning = false
+        if adding {
+            let known = Set(candidates.map(\.id))
+            let added = response.results.filter { !known.contains($0.id) }
+            candidates += added
+            selectedIds.formUnion(added.map(\.id))
+            notice = added.isEmpty ? "Nichts Neues, das sich lohnt." : nil
+        } else {
+            candidates = response.results
+            scanSummary = response.summary
+            selectedIds = Set(response.results.map { $0.id })
+            currentStep = .candidateSelection
+        }
+        let backlog = scanBacklog
+        scanBacklog = []
+        if !backlog.isEmpty {
+            open(backlog)
+        }
+    }
+
+    private func scanFailed(_ message: String, adding: Bool) {
+        isScanning = false
+        if adding {
+            notice = message
+        } else {
+            errorMessage = message
+        }
+        scanBacklog = []
     }
 
     var selectedCandidates: [Candidate] {

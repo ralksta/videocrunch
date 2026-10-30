@@ -80,7 +80,7 @@ search on the whole file), `--json-out PATH` (write the result as JSON — statu
 quality, SSIM, savings, in and out paths — whatever the outcome), `--replace`
 (put the result in the source's place; the original goes to the trash).
 
-### 3. `scan.py` — rank a folder (or one file) without encoding anything
+### 3. `scan.py` — rank folders and files without encoding anything
 
 ```bash
 .venv/bin/python3 scan.py ~/Videos --no-encode --limit 20
@@ -93,7 +93,8 @@ ranked by expected savings in MB. `--no-encode` stops after printing the
 table; otherwise it walks you through the run and hands the selection to
 `batch.py` for parallel encoding. Files that already have a
 `<name>_opt.mp4` sibling are skipped as done. Given a single video instead of
-a folder, it ranks just that one.
+a folder, it ranks just that one; several paths (folders and files mixed) are
+ranked together, each file once.
 
 Picking files takes `1,3,7-10`, `a` for all, `a -3` for all but one, or a
 name — `Urlaub` selects everything under that folder. Rows are identified by
@@ -248,12 +249,23 @@ math to a known-good set of numbers.
 bash install_macos_quick_action.sh
 ```
 
-Builds `VideoCrunch.app` from the Swift sources in `macos/VideoCrunch/` and
-installs a `videocrunch` entry into `~/Library/Services/`. Right-clicking a
-video or a folder in Finder → *Schnellaktionen* (Quick Actions) →
-*videocrunch* opens the app on it. If the entry doesn't show up, enable it
-under System Settings → General → Login Items & Extensions → Finder
-Extensions.
+Builds `VideoCrunch.app` from the Swift sources in `macos/VideoCrunch/`,
+installs it into `/Applications` (`~/Applications` if that isn't writable)
+and adds a `videocrunch` entry to `~/Library/Services/`. Drag the app from
+the Programme folder into the Dock to keep it there. Ways in:
+
+- drop videos or folders on the Dock icon, or use *Öffnen mit* in Finder
+  (the app is registered as an alternative, never as the default for videos);
+- right-click files or folders → *Schnellaktionen* → *videocrunch*; everything
+  selected arrives in one window. If the entry doesn't show up, enable it
+  under System Settings → General → Login Items & Extensions → Finder
+  Extensions;
+- *Ablage → Öffnen …* (⌘O), or drop onto the window.
+
+There is one window. What is opened while it holds a selection is added to
+it; what arrives during an encode is set aside and offered when the run is
+done. Run the installer while the app is closed — it refuses otherwise,
+rather than cutting off an encode.
 
 The app walks through the same steps as the command-line wizard: **Scan**
 (`scan.py --json`), **Auswahl** (pick files, with the expected savings per
@@ -261,7 +273,7 @@ file), **Optionen** (codec, loudness, downscaling to 1080p, originals to the
 trash), **Encode** (`batch.py`, with live progress per file and a Cancel
 button that stops and cleans up) and **Fertig** (what each file saved, with a
 retry for files just under the quality floor). Started without a file, it
-asks for one or takes a drag and drop.
+asks for one.
 
 The installer writes this checkout's path into the app's `Info.plist`, so the
 app runs the scripts from here. Move the repository, and run the installer
@@ -272,12 +284,12 @@ app adds `/opt/homebrew/bin` and `/usr/local/bin` itself, so a Homebrew
 The app icon is drawn in code: `macos/VideoCrunch/Icon/make_icon.swift`,
 rebuilt into `AppIcon.icns` by `macos/VideoCrunch/Icon/build_icon.sh`.
 
-The built app stays inside the repository (`macos/VideoCrunch/VideoCrunch.app`,
-ignored by git). The Quick Action bundle is the installer's only footprint
-outside it. To uninstall the Quick Action:
+The app is built inside the repository (`macos/VideoCrunch/VideoCrunch.app`,
+ignored by git) and copied to the Applications folder. Outside the repo the
+installer leaves exactly two things; to remove them:
 
 ```bash
-rm -rf ~/Library/Services/videocrunch.workflow
+rm -rf /Applications/VideoCrunch.app ~/Library/Services/videocrunch.workflow
 ```
 
 ## Tests

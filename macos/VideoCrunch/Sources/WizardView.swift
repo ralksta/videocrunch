@@ -33,6 +33,48 @@ struct WizardView: View {
         }
         .frame(minWidth: 780, minHeight: 520)
         .background(VisualEffectView(material: .sidebar, blendingMode: .behindWindow))
+        // Drop anywhere, in any step: before a selection it starts, during
+        // one it adds, during an encode it waits for the next run.
+        .dropDestination(for: URL.self) { urls, _ in
+            vm.open(urls)
+            return !urls.isEmpty
+        } isTargeted: { dropTargeted = $0 }
+        .overlay {
+            if dropTargeted {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .strokeBorder(Color.accentColor, style: StrokeStyle(lineWidth: 3, dash: [10, 6]))
+                    .background(Color.accentColor.opacity(0.08))
+                    .overlay {
+                        Label(dropHint, systemImage: "plus.circle.fill")
+                            .font(.title3.weight(.semibold))
+                            .padding(.horizontal, 18)
+                            .padding(.vertical, 10)
+                            .background(.regularMaterial, in: Capsule())
+                    }
+                    .padding(8)
+                    .allowsHitTesting(false)
+            }
+        }
+    }
+
+    @State private var dropTargeted = false
+
+    private var dropHint: String {
+        switch vm.currentStep {
+        case .candidateSelection, .options: return "Zur Auswahl hinzufügen"
+        case .encoding: return "Für den nächsten Durchlauf vormerken"
+        default: return "Loslassen zum Prüfen"
+        }
+    }
+
+    private var targetDescription: String? {
+        switch vm.targetURLs.count {
+        case 0: return nil
+        case 1: return vm.targetURLs[0].path
+        default:
+            let names = vm.targetURLs.prefix(3).map(\.lastPathComponent).joined(separator: ", ")
+            return vm.targetURLs.count > 3 ? "\(names) und \(vm.targetURLs.count - 3) weitere" : names
+        }
     }
 
     // MARK: - Subviews
@@ -48,8 +90,8 @@ struct WizardView: View {
                 Text("videocrunch")
                     .font(.headline)
                     .fontWeight(.bold)
-                if let url = vm.targetURL {
-                    Text(url.path)
+                if let target = targetDescription {
+                    Text(target)
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .lineLimit(1)
@@ -98,31 +140,27 @@ struct WizardView: View {
         if let err = vm.errorMessage {
             StatusHero(icon: "exclamationmark.triangle.fill", tint: .orange,
                        title: "Scan fehlgeschlagen", message: err) {
-                if let url = vm.targetURL {
+                if !vm.targetURLs.isEmpty {
                     Button {
-                        vm.startScan(for: url)
+                        vm.startScan(for: vm.targetURLs)
                     } label: {
                         Label("Erneut scannen", systemImage: "arrow.clockwise")
                     }
                     .controlSize(.large)
                 }
             }
-        } else if vm.targetURL == nil {
+        } else if vm.targetURLs.isEmpty {
             StatusHero(icon: "film.stack", tint: .accentColor,
                        title: "Videos auswählen",
-                       message: "Zieh ein Video oder einen Ordner hierher – oder wähle sie aus. Es wird erst kodiert, wenn du es bestätigst.") {
+                       message: "Zieh Videos oder Ordner hierher oder aufs Dock-Symbol – oder wähle sie aus. Es wird erst kodiert, wenn du es bestätigst.") {
                 Button {
-                    chooseTarget()
+                    vm.chooseAndOpen()
                 } label: {
-                    Label("Video oder Ordner wählen …", systemImage: "folder")
+                    Label("Videos oder Ordner wählen …", systemImage: "folder")
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
-            }
-            .dropDestination(for: URL.self) { urls, _ in
-                guard let url = urls.first else { return false }
-                vm.startScan(for: url)
-                return true
+                .keyboardShortcut(.defaultAction)
             }
         } else {
             StatusHero(icon: "magnifyingglass", tint: .accentColor,
@@ -131,17 +169,6 @@ struct WizardView: View {
                 ProgressView()
                     .controlSize(.small)
             }
-        }
-    }
-
-    private func chooseTarget() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = false
-        panel.allowedContentTypes = [.movie, .folder]
-        if panel.runModal() == .OK, let url = panel.url {
-            vm.startScan(for: url)
         }
     }
 
@@ -157,6 +184,23 @@ struct WizardView: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
+                if vm.isScanning {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Prüfe weitere …")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else if let notice = vm.notice {
+                    Text(notice)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Button {
+                    vm.chooseAndOpen()
+                } label: {
+                    Label("Hinzufügen", systemImage: "plus")
+                }
                 Button("Alle") { vm.selectAll() }
                     .disabled(vm.selectedIds.count == vm.candidates.count)
                 Button("Keine") { vm.deselectAll() }
@@ -331,6 +375,13 @@ struct WizardView: View {
             VStack(alignment: .leading, spacing: 20) {
                 overallProgress
 
+                if !vm.queuedURLs.isEmpty {
+                    Label("\(vm.queuedURLs.count == 1 ? "1 weiteres Element" : "\(vm.queuedURLs.count) weitere Elemente") vorgemerkt – danach geht es damit weiter.",
+                          systemImage: "tray.and.arrow.down")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+
                 OptionSection(title: "Laufende Encodes") {
                     VStack(spacing: 8) {
                         if vm.workers.isEmpty {
@@ -435,6 +486,10 @@ struct WizardView: View {
                 completedHeadline
                     .frame(maxWidth: .infinity)
 
+                if !vm.queuedURLs.isEmpty {
+                    queuedCard
+                }
+
                 HStack(spacing: 12) {
                     StatTile(title: "Gespart", value: formatBytes(vm.actualSavedBytes), tint: .green)
                     StatTile(title: "Optimiert", value: "\(vm.completedCount) von \(vm.totalToEncode)", tint: .primary)
@@ -494,6 +549,31 @@ struct WizardView: View {
         }
     }
 
+    /// What was dropped during the run, ready to be checked next.
+    private var queuedCard: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "tray.and.arrow.down.fill")
+                .font(.title2)
+                .foregroundStyle(Color.accentColor)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(vm.queuedURLs.count == 1 ? "1 weiteres Element vorgemerkt"
+                                              : "\(vm.queuedURLs.count) weitere Elemente vorgemerkt")
+                    .fontWeight(.medium)
+                Text(vm.queuedURLs.prefix(3).map(\.lastPathComponent).joined(separator: ", "))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer()
+            Button("Jetzt prüfen") {
+                vm.scanQueued()
+            }
+            .buttonStyle(.borderedProminent)
+        }
+        .padding(14)
+        .cardBackground()
+    }
+
     @ViewBuilder
     private var completedHeadline: some View {
         if vm.wasCancelled {
@@ -532,9 +612,9 @@ struct WizardView: View {
                 }
                 .controlSize(.large)
                 .disabled(!vm.isEncoding)
-            } else if vm.currentStep == .completed, let url = vm.targetURL {
+            } else if vm.currentStep == .completed, !vm.targetURLs.isEmpty {
                 Button {
-                    NSWorkspace.shared.activateFileViewerSelecting([url])
+                    NSWorkspace.shared.activateFileViewerSelecting(vm.targetURLs)
                 } label: {
                     Label("Im Finder zeigen", systemImage: "folder")
                 }

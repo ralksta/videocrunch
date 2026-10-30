@@ -714,7 +714,8 @@ def _run_batch(listing, audio_mode, port, scale_height, replace,
 def main() -> int:
     parser = argparse.ArgumentParser(
         description='Rank a folder\'s videos by expected re-encode savings')
-    parser.add_argument('folder', help='Folder to scan (searched recursively)')
+    parser.add_argument('folder', nargs='+', metavar='PATH',
+                        help='Folders (searched recursively) and/or video files')
     parser.add_argument('--codec', choices=['hevc', 'av1'], default='hevc',
                         help='Target codec for the estimate (default: hevc)')
     parser.add_argument('--limit', type=int, default=30,
@@ -735,15 +736,30 @@ def main() -> int:
     # (`scan.py folder --json > report.json`) produces parseable output.
     log = (lambda msg: print(msg, file=sys.stderr)) if args.json else print
 
-    root = Path(args.folder).expanduser()
-    if root.is_file():
-        paths = [root]
-    elif root.is_dir():
-        log(f"{G}Ordner:{NC} {root}")
-        paths = find_videos(root)
-    else:
-        log(f"{R}Kein Ordner oder Datei: {root}{NC}")
+    # Everything dropped or picked at once is ranked together; a file named
+    # twice (on its own and inside a named folder) is listed once.
+    inputs = [Path(p).expanduser() for p in args.folder]
+    paths: list[Path] = []
+    seen: set = set()
+    for item in inputs:
+        if item.is_file():
+            found = [item]
+        elif item.is_dir():
+            log(f"{G}Ordner:{NC} {item}")
+            found = find_videos(item)
+        else:
+            log(f"{R}Kein Ordner oder Datei: {item}{NC}")
+            continue
+        for path in found:
+            if path.resolve() not in seen:
+                seen.add(path.resolve())
+                paths.append(path)
+    existing = [i for i in inputs if i.exists()]
+    if not existing:
         return 1
+    # Names in the table are relative to what the inputs have in common.
+    root = Path(os.path.commonpath([str(i if i.is_dir() else i.parent) for i in existing]))
+    scanned_a_folder = any(i.is_dir() for i in existing)
 
     if not paths:
         if args.json:
@@ -751,12 +767,8 @@ def main() -> int:
         else:
             log(f"{Y}Keine Videodateien gefunden.{NC}")
         return 0
-    if root.is_dir():
+    if scanned_a_folder:
         log(f"{G}Gefunden:{NC} {len(paths)} Videodateien\n")
-
-    if shutil.which('ffprobe') is None:
-        log(f"{R}ffprobe nicht gefunden (PATH: {os.environ.get('PATH', '')}){NC}")
-        return 1
 
     if shutil.which('ffprobe') is None:
         log(f"{R}ffprobe nicht gefunden (PATH: {os.environ.get('PATH', '')}){NC}")
