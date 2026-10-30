@@ -271,7 +271,15 @@ window says how much time is left; before the start, the options page says
 how long the selection should take (from past encodes of the same resolution,
 shown only when every selected file has that history). A run that finishes
 while the app is in the background ends with a macOS notification with *Im
-Finder zeigen*. Run the installer while the app is closed — it refuses otherwise,
+Finder zeigen*.
+
+The selection list shows each video's thumbnail; the eye button or the space
+bar opens it in Quick Look. After a run, *Vergleichen* opens a window with the
+same frame of source and result behind a divider you drag — at the start,
+middle or end of the clip, fitted or at 100 % — so the result is judged by
+eye, not only by its SSIM. (It needs the original, so it is not offered when
+originals went to the trash.) *Neue Videos …* goes back to the start; ⌘Q
+quits. Run the installer while the app is closed — it refuses otherwise,
 rather than cutting off an encode.
 
 The app walks through the same steps as the command-line wizard: **Scan**

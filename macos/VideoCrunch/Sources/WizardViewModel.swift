@@ -104,6 +104,18 @@ class WizardViewModel: ObservableObject {
         }
     }
 
+    /// Back to the empty start screen after a finished run.
+    func startOver() {
+        targetURLs = []
+        candidates = []
+        selectedIds = []
+        batchResults = []
+        errorMessage = nil
+        notice = nil
+        scaleTo1080p = false
+        currentStep = .scanning
+    }
+
     /// Scan what was queued during the encode, as a new run.
     func scanQueued() {
         let urls = queuedURLs

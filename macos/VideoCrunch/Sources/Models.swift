@@ -85,6 +85,8 @@ struct BatchItemResult: Codable, Identifiable {
     /// Source tracks that could not come along, as videocrunch named them.
     let dropped: [String]?
     let dolby_vision: DolbyVision?
+    /// Where the encode landed (for the before/after comparison).
+    let output_path: String?
 }
 
 /// A Dolby Vision source and the HDR format its re-encode keeps.

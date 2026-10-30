@@ -14,6 +14,15 @@ struct VideoCrunchApp: App {
         }
         .windowStyle(.titleBar)
         .windowToolbarStyle(.unified)
+
+        // Before/after, in a window of its own: big enough to judge detail,
+        // and it can stay open next to the results.
+        WindowGroup("Vergleich", for: Comparison.self) { $comparison in
+            if let comparison {
+                ComparisonSheet(comparison: comparison)
+            }
+        }
+        .windowResizability(.contentMinSize)
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("Öffnen …") {
@@ -34,7 +43,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
         // Started with paths as arguments (a terminal, the binary directly).
-        let paths = CommandLine.arguments.dropFirst().filter { !$0.hasPrefix("-") }
+        // "-Key value" pairs are AppKit defaults (e.g. -NSRequiresAquaSystemAppearance
+        // YES), not files: the flag and its value are both skipped.
+        var paths: [String] = []
+        var arguments = CommandLine.arguments.dropFirst().makeIterator()
+        while let argument = arguments.next() {
+            if argument.hasPrefix("-") {
+                _ = arguments.next()
+            } else {
+                paths.append(argument)
+            }
+        }
         if !paths.isEmpty {
             viewModel.open(paths.map { URL(fileURLWithPath: $0) })
         }
