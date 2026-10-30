@@ -372,7 +372,37 @@ def build_stream_args(streams: list[dict], copy_audio: bool,
     if mapped_subs:
         args.extend(["-c:s", "mov_text"])
 
+    data = [s for s in streams if s.get("codec_type") == "data"]
+    if data:
+        names = sorted({str(s.get("codec_name") or s.get("codec_tag_string") or "unknown")
+                        for s in data})
+        noun = "data track" if len(data) == 1 else "data tracks"
+        skipped.append(f"{len(data)} {noun} ({', '.join(names)}): metadata mp4 cannot hold")
+
     return (args, skipped)
+
+
+# What a Dolby Vision file's base layer is, by dv_bl_signal_compatibility_id.
+# 0 means none: profile 5's IPT-PQ-c2 base layer only looks right after the
+# Dolby Vision processing an ffmpeg re-encode does not do.
+_DV_BASE_LAYER = {1: "HDR10", 2: "SDR", 4: "HLG", 6: "HDR10"}
+
+
+def dolby_vision_info(side_data: list) -> dict | None:
+    """Dolby Vision profile and what a re-encode keeps of it, or None.
+
+    The encoders here write no Dolby Vision metadata, so a re-encode keeps
+    only the base layer: `kept_as` names it ("HLG" for iPhone footage), or is
+    None when there is no usable base layer at all.
+    """
+    for entry in side_data or []:
+        if entry.get("side_data_type") != "DOVI configuration record":
+            continue
+        profile = entry.get("dv_profile")
+        compat = entry.get("dv_bl_signal_compatibility_id")
+        label = f"{profile}.{compat}" if compat else f"{profile}"
+        return {"profile": label, "kept_as": _DV_BASE_LAYER.get(compat)}
+    return None
 
 
 # ---------------------------------------------------------------------------

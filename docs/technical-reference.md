@@ -282,6 +282,15 @@ profile to a main10 encode with the source's color tags (BT.2020/PQ/HLG)
 passed through — encoders that don't support main10 skip the file with a
 clear reason rather than silently mistagging a downgraded encode as BT.709.
 
+Dolby Vision is read from the video stream's `DOVI configuration record`
+(`dolby_vision_info()`). No encoder here writes Dolby Vision metadata, so the
+output keeps only the base layer: profile 8.4 (iPhone) becomes HLG, 8.1 HDR10,
+and the run says so — stdout, `dolby_vision: {"profile", "kept_as"}` in the
+JSON result, forwarded by `batch.py` to the app. Profile 5 has no compatible
+base layer (IPT-PQ-c2): decoded without Dolby Vision processing it shows false
+colours, so such files are skipped with that reason. Source tracks left behind
+are listed in the result's `dropped`.
+
 ---
 
 ## Two-Pass Linear Loudnorm
@@ -311,7 +320,7 @@ capture date, GPS coordinates and camera model.
 | Video | `-map 0:v:0` |
 | Audio | every track mapped; the first gets the loudnorm chain (`-filter:a:0`), the rest are re-encoded flat. `--copy-audio` copies instead |
 | Subtitles | text-based (`subrip`, `ass`, `webvtt`, …) converted to `mov_text` |
-| Data | never mapped — the mp4 muxer rejects most of them (iPhone timecode/metadata tracks) |
+| Data | never mapped — the mp4 muxer rejects most of them (iPhone timecode/metadata tracks, `mebx`); named in one note |
 
 A track that cannot come along is **named on stdout** (`Stream dropped: …`)
 rather than vanishing. Two cases exist in practice: Apple's spatial audio

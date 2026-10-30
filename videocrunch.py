@@ -34,6 +34,7 @@ from crunch_utils import (
     build_stream_args,
     clamp_maxrate_to_pass,
     disk_headroom_needed,
+    dolby_vision_info,
     is_hdr_or_10bit,
     narrow_quality_window,
     nearest_quality_index,
@@ -309,6 +310,8 @@ last_encode_result = {
     'height': None,       # source height (for encode history bucketing)
     'source_kbps': None,  # source avg bitrate (for encode history bucketing)
     'size_mb': None,      # source size (with duration: throughput for estimates)
+    'dropped': None,      # notes on source tracks that could not come along
+    'dolby_vision': None,  # {"profile", "kept_as"} when the source had Dolby Vision
 }
 
 
@@ -897,7 +900,8 @@ def probe_stream_inventory(path) -> list:
     """Every stream of a file as {codec_type, codec_name}, in container order."""
     try:
         result = subprocess.run(
-            ['ffprobe', '-v', 'error', '-show_entries', 'stream=codec_type,codec_name',
+            ['ffprobe', '-v', 'error', '-show_entries',
+             'stream=codec_type,codec_name,codec_tag_string:stream_side_data',
              '-of', 'json', str(path)],
             capture_output=True, text=True, check=True, timeout=60,
         )
@@ -1639,6 +1643,22 @@ def prepare_encode(input_path, profile, min_size_mb=0, copy_audio=False,
                                                      decodable=available_decoders())
     for note in skipped_streams:
         print(f"{Y}Stream dropped:{NC} {note}")
+    last_encode_result['dropped'] = skipped_streams or None
+    _video = next((s for s in source_streams if s.get('codec_type') == 'video'), {})
+    dolby_vision = dolby_vision_info(_video.get('side_data_list', []))
+    last_encode_result['dolby_vision'] = dolby_vision
+    if dolby_vision and dolby_vision['kept_as'] is None and video_mode == 'compress':
+        reason = (f"Dolby Vision profile {dolby_vision['profile']} has no compatible "
+                  f"base layer; a re-encode would show false colours")
+        print(f"{Y}Skipping:{NC} {input_path.name} ({reason})")
+        last_encode_result['filename'] = input_path.name
+        last_encode_result['status'] = 'skipped'
+        last_encode_result['reason'] = reason
+        last_encode_result['duration'] = 0
+        return None
+    if dolby_vision and video_mode == 'compress':
+        print(f"{Y}Dolby Vision {dolby_vision['profile']}:{NC} dynamic metadata not carried "
+              f"over — the output is plain {dolby_vision['kept_as']}")
     # What the integrity check holds the finished file to — derived from the
     # same plan that drives the encode, so a deliberately skipped track is not
     # counted as a loss.

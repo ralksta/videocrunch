@@ -378,6 +378,39 @@ class TestProcessFileEndToEnd:
         assert result["ssim"] >= videocrunch.MIN_QUALITY
         assert (tmp_path / "in_opt.mp4").exists()
 
+    def _with_dolby_vision(self, monkeypatch, profile, compat):
+        import videocrunch
+        real = videocrunch.probe_stream_inventory
+
+        def with_dv(path):
+            streams = real(path)
+            for st in streams:
+                if st.get("codec_type") == "video":
+                    st["side_data_list"] = [{
+                        "side_data_type": "DOVI configuration record", "dv_profile": profile,
+                        "dv_level": 6, "dv_bl_signal_compatibility_id": compat}]
+            return streams
+
+        monkeypatch.setattr(videocrunch, "probe_stream_inventory", with_dv)
+
+    def test_dolby_vision_loss_is_reported_in_the_result(self, tiny_clip, tmp_path, monkeypatch):
+        clip = tmp_path / "in.mp4"
+        shutil.copy(tiny_clip, clip)
+        self._with_dolby_vision(monkeypatch, 8, 1)
+        _, _, result = self._run(clip, force=True, audio_mode="standard", min_ssim=0.5)
+        assert result["dolby_vision"] == {"profile": "8.1", "kept_as": "HDR10"}
+
+    def test_dolby_vision_profile_5_is_refused(self, tiny_clip, tmp_path, monkeypatch):
+        # Without the DV processing its base layer decodes to false colours.
+        clip = tmp_path / "in.mp4"
+        shutil.copy(tiny_clip, clip)
+        self._with_dolby_vision(monkeypatch, 5, 0)
+        ok, _, result = self._run(clip, force=True, audio_mode="standard")
+        assert ok is False
+        assert result["status"] == "skipped"
+        assert "Dolby Vision" in result["reason"]
+        assert not (tmp_path / "in_opt.mp4").exists()
+
     def test_an_out_of_range_manual_quality_falls_back_to_the_search(self, tiny_clip, tmp_path):
         # --q 999 is outside every profile's range. The run must fall back to
         # the binary search rather than carrying the bogus value into it.

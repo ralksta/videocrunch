@@ -556,6 +556,19 @@ class TestBatchReadsJsonResult:
         assert scraped["status"] == "success"
 
 
+class TestBatchCarriesLosses:
+    """The batch report keeps what a worker said was lost, for the wizard."""
+
+    def test_dolby_vision_and_dropped_tracks_reach_the_report(self):
+        result = {"status": "failed", "quality": None, "ssim": None, "saved_pct": None,
+                  "saved_bytes": None, "reason": None}
+        batch.merge_worker_result(result, {
+            "status": "success", "dropped": ["3 data tracks (mebx): metadata mp4 cannot hold"],
+            "dolby_vision": {"profile": "8.4", "kept_as": "HLG"}})
+        assert result["dropped"] == ["3 data tracks (mebx): metadata mp4 cannot hold"]
+        assert result["dolby_vision"] == {"profile": "8.4", "kept_as": "HLG"}
+
+
 class TestBatchQualityFloorForwarding:
     """`batch.py --min-ssim=…` must reach every per-file `videocrunch.py` call.
 

@@ -986,6 +986,9 @@ private struct ResultRow: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
+                if result.status == "success" {
+                    losses
+                }
             }
             Spacer(minLength: 12)
             if result.status == "success", let bytes = result.saved_bytes {
@@ -997,5 +1000,22 @@ private struct ResultRow: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
+    }
+
+    /// What the encode could not keep: said here, not left to be discovered.
+    @ViewBuilder
+    private var losses: some View {
+        if let dv = result.dolby_vision, let kept = dv.kept_as {
+            Label("Dolby Vision \(dv.profile) → \(kept)-HDR (ohne dynamische Metadaten)",
+                  systemImage: "info.circle")
+                .font(.caption2)
+                .foregroundStyle(.orange)
+        }
+        if let dropped = result.dropped, !dropped.isEmpty {
+            Label("Nicht alle Spuren übernommen", systemImage: "info.circle")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .help(dropped.joined(separator: "\n"))
+        }
     }
 }

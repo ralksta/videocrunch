@@ -79,6 +79,15 @@ struct BatchItemResult: Codable, Identifiable {
     let saved_bytes: Int64?
     let duration: Double?
     let reason: String?
+    /// Source tracks that could not come along, as videocrunch named them.
+    let dropped: [String]?
+    let dolby_vision: DolbyVision?
+}
+
+/// A Dolby Vision source and the HDR format its re-encode keeps.
+struct DolbyVision: Codable {
+    let profile: String
+    let kept_as: String?
 }
 
 struct BatchReport: Codable {
