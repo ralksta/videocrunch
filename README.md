@@ -206,7 +206,15 @@ ffmpeg's default behaviour keeps one audio track and no metadata, which for a
 video library means silent data loss. Two things genuinely cannot come along:
 Apple's spatial audio (`apple_apac`, no decoder and no mp4 tag) and
 image-based subtitles (PGS/VobSub, not convertible to `mov_text`). Both are
-reported on stdout as `Stream dropped: …` rather than disappearing quietly.
+reported on stdout as `Stream dropped: …` rather than disappearing quietly, as
+are the camera metadata tracks iPhones record (`mebx`), which mp4 cannot hold.
+
+**Dolby Vision** does not come across: the encoders here write no Dolby Vision
+metadata, so an iPhone clip (profile 8.4) comes out as plain HLG HDR — still
+HDR, without the per-frame tone-mapping data. The run says so (stdout, the
+JSON result's `dolby_vision`, the app's result list). Profile 5 sources, whose
+base layer only looks right after Dolby Vision processing, are skipped
+instead of being re-encoded into false colours.
 
 ## How the savings estimate works
 

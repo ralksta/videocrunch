@@ -193,7 +193,8 @@ def merge_worker_result(result: dict, data: dict | None) -> bool:
     """
     if not data:
         return False
-    for key in ("status", "quality", "ssim", "saved_pct", "saved_bytes", "reason"):
+    for key in ("status", "quality", "ssim", "saved_pct", "saved_bytes", "reason",
+                "dropped", "dolby_vision"):
         if key in data:
             result[key] = data[key]
     return True

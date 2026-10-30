@@ -22,6 +22,7 @@ from crunch_utils import (  # noqa: E402
     build_stream_args,
     clamp_maxrate_to_pass,
     disk_headroom_needed,
+    dolby_vision_info,
     estimate_runtime_sec,
     history_throughput,
     is_hdr_or_10bit,
@@ -385,6 +386,40 @@ class TestStreamMapping:
             [self.VIDEO, self._audio(), {"codec_type": "data", "codec_name": "bin_data"}],
             copy_audio=False, audio_filters=None)
         assert not any(a.startswith("0:d") for a in args)
+
+    def test_dropped_data_streams_are_named(self):
+        # An iPhone clip's three camera metadata tracks (codec tag mebx, no
+        # codec name) used to vanish without a word.
+        mebx = {"codec_type": "data", "codec_name": None, "codec_tag_string": "mebx"}
+        _, skipped = build_stream_args([self.VIDEO, self._audio(), mebx, mebx, mebx],
+                                       copy_audio=False, audio_filters=None)
+        assert skipped == ["3 data tracks (mebx): metadata mp4 cannot hold"]
+
+
+class TestDolbyVision:
+    """What a re-encode does to Dolby Vision — said, not left to be discovered."""
+
+    @staticmethod
+    def _side_data(profile, level, compat):
+        return [{"side_data_type": "DOVI configuration record", "dv_profile": profile,
+                 "dv_level": level, "dv_bl_signal_compatibility_id": compat}]
+
+    def test_iphone_profile_8_4_falls_back_to_hlg(self):
+        assert dolby_vision_info(self._side_data(8, 10, 4)) == {
+            "profile": "8.4", "kept_as": "HLG"}
+
+    def test_profile_8_1_falls_back_to_hdr10(self):
+        assert dolby_vision_info(self._side_data(8, 6, 1))["kept_as"] == "HDR10"
+
+    def test_profile_5_has_nothing_to_fall_back_to(self):
+        # IPT-PQ-c2 base layer: decoded without the DV processing it is
+        # displayed with false colours.
+        assert dolby_vision_info(self._side_data(5, 6, 0)) == {
+            "profile": "5", "kept_as": None}
+
+    def test_no_dolby_vision(self):
+        assert dolby_vision_info([{"side_data_type": "Ambient viewing environment"}]) is None
+        assert dolby_vision_info([]) is None
 
 
 class TestRuntimeEstimate:
