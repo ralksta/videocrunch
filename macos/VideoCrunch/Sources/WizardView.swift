@@ -279,164 +279,175 @@ struct WizardView: View {
     }
 
     // MARK: - Step 3: Options View
+    /// Everything on one screen, laptop included: the summary on top, the
+    /// video (when one is trimmed) on the left, the settings on the right.
+    /// Choices are compact switches with one line of explanation; the
+    /// settings column scrolls on its own only in a very small window.
     private var optionsView: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 22) {
-                savingsSummary
+        VStack(spacing: 16) {
+            savingsSummary
 
-                previewCard
-
+            HStack(alignment: .top, spacing: 16) {
                 if let target = vm.trimTarget, let duration = target.duration_sec {
-                    OptionSection(title: "Kürzen") {
-                        TrimEditor(url: URL(fileURLWithPath: target.file_path), duration: duration,
-                                   start: $vm.trimStart, end: $vm.trimEnd)
+                    TrimEditor(url: URL(fileURLWithPath: target.file_path), duration: duration,
+                               start: $vm.trimStart, end: $vm.trimEnd)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                        .layoutPriority(1)
+                    ScrollView {
+                        settingsColumn
                     }
-                }
-
-                OptionSection(title: "Codec") {
-                    HStack(spacing: 12) {
-                        ChoiceCard(
-                            icon: "bolt.fill",
-                            title: "HEVC / H.265",
-                            subtitle: "Hardware-Encoder, schnell. Läuft auf praktisch jedem Gerät.",
-                            selected: vm.targetCodec == "hevc"
-                        ) { vm.targetCodec = "hevc" }
-                        ChoiceCard(
-                            icon: "sparkles",
-                            title: "AV1",
-                            subtitle: "Kleinere Dateien, deutlich langsamer. Braucht neuere Geräte zum Abspielen.",
-                            badge: "Experimentell",
-                            selected: vm.targetCodec == "av1"
-                        ) { vm.targetCodec = "av1" }
+                    .scrollIndicators(.automatic)
+                    .frame(width: 340)
+                } else {
+                    ScrollView {
+                        settingsColumn
+                            .frame(maxWidth: 560)
+                            .frame(maxWidth: .infinity)
                     }
-                    .fixedSize(horizontal: false, vertical: true)
-                    if vm.targetCodec != vm.scannedCodec {
-                        Label("Die Ersparnis oben wurde für \(codecName(vm.scannedCodec)) geschätzt.",
-                              systemImage: "info.circle")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-
-                OptionSection(title: "Audio") {
-                    HStack(spacing: 12) {
-                        ChoiceCard(
-                            icon: "speaker.wave.3.fill",
-                            title: "Lautheit angleichen",
-                            subtitle: "Auf −16 LUFS: leise Handyvideos werden hörbar, laute gezähmt.",
-                            selected: vm.audioMode == "enhanced"
-                        ) { vm.audioMode = "enhanced" }
-                        ChoiceCard(
-                            icon: "waveform",
-                            title: "Original",
-                            subtitle: "Der Ton bleibt, wie er ist. Nur neu kodiert.",
-                            selected: vm.audioMode == "standard"
-                        ) { vm.audioMode = "standard" }
-                    }
-                    .fixedSize(horizontal: false, vertical: true)
-                }
-
-                OptionSection(title: "Dateien") {
-                    VStack(spacing: 0) {
-                        if !vm.downscaleOnlyUnselected.isEmpty {
-                            // Left unticked because they only pay off downscaled:
-                            // offered here, where the downscale is decided.
-                            SettingRow(
-                                icon: "sparkles",
-                                tint: .indigo,
-                                title: "\(videoCount(vm.downscaleOnlyUnselected.count)) lohnt sich mit 1080p",
-                                subtitle: vm.downscaleOnlyUnselected.prefix(2).map(\.filename)
-                                    .joined(separator: ", ")
-                                    + " – ohne Verkleinern unter 20 %, darum nicht vorausgewählt."
-                            ) {
-                                Button("Mitnehmen") {
-                                    vm.takeDownscaleOnly()
-                                }
-                                .help("Auswählen und auf 1080p verkleinern")
-                            }
-                            Divider().padding(.leading, 54)
-                        }
-                        if vm.hasTallCandidates {
-                            SettingRow(
-                                icon: "arrow.down.right.and.arrow.up.left",
-                                tint: .blue,
-                                title: vm.selectedNeedingDownscale > 0 && !vm.scaleTo1080p
-                                    ? "Auf 1080p verkleinern – empfohlen"
-                                    : "Auf 1080p verkleinern",
-                                subtitle: "\(videoCount(vm.tallCandidatesCount)) über 1080p. Spart zusätzlich ca. \(formatMB(vm.downscaleExtraSavedMB)), Seitenverhältnis bleibt."
-                            ) {
-                                Toggle("", isOn: $vm.scaleTo1080p)
-                                    .toggleStyle(.switch)
-                                    .labelsHidden()
-                            }
-                            Divider().padding(.leading, 54)
-                        }
-                        SettingRow(
-                            icon: "trash.fill",
-                            tint: vm.moveToTrash && !vm.isTrimmed ? .red : .gray,
-                            title: "Originale in den Papierkorb",
-                            subtitle: vm.isTrimmed
-                                ? "Beim Kürzen bleibt das Original immer erhalten."
-                                : vm.moveToTrash
-                                ? "Erst nach bestandenem SSIM-Qualitätscheck. Aus dem Papierkorb wiederherstellbar."
-                                : "Aus: Das Original bleibt neben der neuen _opt.mp4 liegen."
-                        ) {
-                            Toggle("", isOn: $vm.moveToTrash)
-                                .toggleStyle(.switch)
-                                .labelsHidden()
-                                .disabled(vm.isTrimmed)
-                        }
-                    }
-                    .cardBackground()
                 }
             }
-            .frame(maxWidth: 640)
-            .padding(.horizontal, 24)
-            .padding(.vertical, 22)
-            .frame(maxWidth: .infinity)
+            .frame(maxHeight: .infinity, alignment: .top)
+        }
+        .padding(.horizontal, 24)
+        .padding(.vertical, 16)
+        .frame(maxWidth: 1100)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var settingsColumn: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            OptionSection(title: "Codec") {
+                Picker("Codec", selection: $vm.targetCodec) {
+                    Text("HEVC / H.265").tag("hevc")
+                    Text("AV1 (experimentell)").tag("av1")
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                Text(vm.targetCodec == "av1"
+                     ? "Kleinere Dateien, deutlich langsamer. Braucht neuere Geräte."
+                     : "Hardware-Encoder, schnell. Läuft auf praktisch jedem Gerät.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if vm.targetCodec != vm.scannedCodec {
+                    Label("Die Ersparnis oben wurde für \(codecName(vm.scannedCodec)) geschätzt.",
+                          systemImage: "info.circle")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            OptionSection(title: "Audio") {
+                Picker("Audio", selection: $vm.audioMode) {
+                    Text("Lautheit angleichen").tag("enhanced")
+                    Text("Original").tag("standard")
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                Text(vm.audioMode == "enhanced"
+                     ? "Auf −16 LUFS: leise Handyvideos werden hörbar, laute gezähmt."
+                     : "Der Ton bleibt, wie er ist. Nur neu kodiert.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            OptionSection(title: "Dateien") {
+                VStack(spacing: 0) {
+                    if !vm.downscaleOnlyUnselected.isEmpty {
+                        // Left unticked because they only pay off downscaled:
+                        // offered here, where the downscale is decided.
+                        SettingRow(
+                            icon: "sparkles",
+                            tint: .indigo,
+                            title: "\(videoCount(vm.downscaleOnlyUnselected.count)) lohnt sich mit 1080p",
+                            subtitle: vm.downscaleOnlyUnselected.prefix(2).map(\.filename)
+                                .joined(separator: ", ")
+                                + " – ohne Verkleinern unter 20 %."
+                        ) {
+                            Button("Mitnehmen") {
+                                vm.takeDownscaleOnly()
+                            }
+                            .help("Auswählen und auf 1080p verkleinern")
+                        }
+                        Divider().padding(.leading, 50)
+                    }
+                    if vm.hasTallCandidates {
+                        SettingRow(
+                            icon: "arrow.down.right.and.arrow.up.left",
+                            tint: .blue,
+                            title: vm.selectedNeedingDownscale > 0 && !vm.scaleTo1080p
+                                ? "Auf 1080p – empfohlen"
+                                : "Auf 1080p verkleinern",
+                            subtitle: "Spart zusätzlich ca. \(formatMB(vm.downscaleExtraSavedMB))."
+                        ) {
+                            Toggle("", isOn: $vm.scaleTo1080p)
+                                .toggleStyle(.switch)
+                                .labelsHidden()
+                        }
+                        .help("\(videoCount(vm.tallCandidatesCount)) über 1080p. Das Seitenverhältnis bleibt.")
+                        Divider().padding(.leading, 50)
+                    }
+                    SettingRow(
+                        icon: "trash.fill",
+                        tint: vm.moveToTrash && !vm.isTrimmed ? .red : .gray,
+                        title: "Originale in den Papierkorb",
+                        subtitle: vm.isTrimmed
+                            ? "Beim Kürzen bleibt das Original erhalten."
+                            : vm.moveToTrash
+                            ? "Erst nach bestandenem Qualitätscheck."
+                            : "Aus: Original bleibt neben der _opt.mp4."
+                    ) {
+                        Toggle("", isOn: $vm.moveToTrash)
+                            .toggleStyle(.switch)
+                            .labelsHidden()
+                            .disabled(vm.isTrimmed)
+                    }
+                }
+                .cardBackground()
+            }
+
+            previewCard
         }
     }
 
     /// "So wird es aussehen": a few seconds encoded with these settings,
     /// judged by eye before the full run.
     private var previewCard: some View {
-        HStack(spacing: 12) {
-            Image(systemName: "eye.fill")
-                .font(.title3)
-                .foregroundStyle(Color.accentColor)
-                .frame(width: 28)
-            VStack(alignment: .leading, spacing: 2) {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 10) {
+                Image(systemName: "eye.fill")
+                    .foregroundStyle(Color.accentColor)
                 Text("So wird es aussehen")
                     .fontWeight(.medium)
-                Text(vm.previewError
-                     ?? "Kodiert die schwierigste Stelle mit diesen Einstellungen – in Sekunden statt Minuten.")
-                    .font(.caption)
-                    .foregroundStyle(vm.previewError == nil ? Color.secondary : Color.orange)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            Spacer()
-            if vm.previewingId != nil {
-                ProgressView()
-                    .controlSize(.small)
-                Text("Erstelle Vorschau …")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            } else if vm.selectedCandidates.count == 1, let only = vm.selectedCandidates.first {
-                Button("Vorschau ansehen") {
-                    vm.makePreview(for: only) { openWindow(value: $0) }
-                }
-            } else {
-                Menu("Vorschau ansehen") {
-                    ForEach(vm.selectedCandidates) { c in
-                        Button(c.filename) {
-                            vm.makePreview(for: c) { openWindow(value: $0) }
+                Spacer()
+                if vm.previewingId != nil {
+                    ProgressView()
+                        .controlSize(.small)
+                } else if vm.selectedCandidates.count == 1, let only = vm.selectedCandidates.first {
+                    Button("Vorschau") {
+                        vm.makePreview(for: only) { openWindow(value: $0) }
+                    }
+                } else {
+                    Menu("Vorschau") {
+                        ForEach(vm.selectedCandidates) { c in
+                            Button(c.filename) {
+                                vm.makePreview(for: c) { openWindow(value: $0) }
+                            }
                         }
                     }
+                    .fixedSize()
                 }
-                .fixedSize()
             }
+            Text(vm.previewError
+                 ?? (vm.previewingId != nil
+                     ? "Erstelle Vorschau …"
+                     : "Kodiert die schwierigste Stelle in Sekunden – zum Prüfen vor dem Encode."))
+                .font(.caption)
+                .foregroundStyle(vm.previewError == nil ? Color.secondary : Color.orange)
+                .fixedSize(horizontal: false, vertical: true)
         }
-        .padding(14)
+        .padding(12)
         .cardBackground()
     }
 
@@ -446,7 +457,7 @@ struct WizardView: View {
         let after = vm.selectedTotalAfterMB
         let saved = vm.selectedEstimatedSavedMB
         let fraction = before > 0 ? after / before : 1
-        return VStack(alignment: .leading, spacing: 14) {
+        return VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(videoCount(vm.selectedCandidates.count) + " ausgewählt")
@@ -465,7 +476,7 @@ struct WizardView: View {
                 Spacer()
                 VStack(alignment: .trailing, spacing: 2) {
                     Text("−\(formatMB(saved))")
-                        .font(.system(size: 26, weight: .bold, design: .rounded))
+                        .font(.system(size: 22, weight: .bold, design: .rounded))
                         .foregroundStyle(Color.savings)
                         .monospacedDigit()
                     Text(before > 0 ? "ca. \(Int((1 - fraction) * 100)) % kleiner" : "geschätzt")
@@ -481,10 +492,10 @@ struct WizardView: View {
                         .frame(width: max(8, geo.size.width * fraction))
                 }
             }
-            .frame(height: 8)
+            .frame(height: 6)
             .accessibilityLabel("Danach ca. \(Int(fraction * 100)) % der heutigen Größe")
         }
-        .padding(16)
+        .padding(14)
         .cardBackground()
     }
 
@@ -855,64 +866,6 @@ private struct OptionSection<Content: View>: View {
     }
 }
 
-/// One of several mutually exclusive choices, shown as a selectable card.
-private struct ChoiceCard: View {
-    let icon: String
-    let title: String
-    let subtitle: String
-    var badge: String? = nil
-    let selected: Bool
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack {
-                    Image(systemName: icon)
-                        .font(.title3)
-                        .foregroundStyle(selected ? Color.accentColor : .secondary)
-                    Spacer()
-                    Image(systemName: selected ? "checkmark.circle.fill" : "circle")
-                        .font(.body)
-                        .foregroundStyle(selected ? Color.accentColor : Color.secondary.opacity(0.5))
-                }
-                HStack(spacing: 6) {
-                    Text(title)
-                        .fontWeight(.semibold)
-                    if let badge {
-                        Text(badge)
-                            .font(.caption2.weight(.medium))
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 1)
-                            .background(Capsule().fill(Color.orange.opacity(0.18)))
-                            .foregroundStyle(.orange)
-                    }
-                }
-                Text(subtitle)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            .padding(12)
-            .background(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(selected
-                          ? Color.accentColor.opacity(0.12)
-                          : Color(nsColor: .controlBackgroundColor).opacity(0.55))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .strokeBorder(selected ? Color.accentColor : Color(nsColor: .separatorColor),
-                                  lineWidth: selected ? 2 : 1)
-            )
-            .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-        }
-        .buttonStyle(.plain)
-        .accessibilityAddTraits(selected ? .isSelected : [])
-    }
-}
-
 /// Icon tile, title and explanation on the left, a control on the right.
 private struct SettingRow<Trailing: View>: View {
     let icon: String
@@ -939,8 +892,8 @@ private struct SettingRow<Trailing: View>: View {
             Spacer(minLength: 12)
             trailing
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 11)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
     }
 }
 

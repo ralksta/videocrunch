@@ -14,6 +14,8 @@ struct VideoCrunchApp: App {
         }
         .windowStyle(.titleBar)
         .windowToolbarStyle(.unified)
+        // Fits a 13" laptop with room to spare; every step fits without scrolling.
+        .defaultSize(width: 980, height: 680)
 
         // Before/after, in a window of its own: big enough to judge detail,
         // and it can stay open next to the results.
