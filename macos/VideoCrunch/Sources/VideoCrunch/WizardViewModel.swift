@@ -35,7 +35,8 @@ class WizardViewModel: ObservableObject {
     @Published var targetCodec: String = "hevc"
     /// The codec the savings estimate was computed for.
     @Published var scannedCodec: String = "hevc"
-    @Published var audioMode: String = "enhanced"
+    /// The sound as recorded unless the user asks for loudness levelling.
+    @Published var audioMode: String = "standard"
     @Published var scaleTo1080p: Bool = false
     @Published var moveToTrash: Bool = false
     @Published var minSSIMOverride: Double? = nil
@@ -65,6 +66,8 @@ class WizardViewModel: ObservableObject {
 
     private var currentProcess: Process?
     var scriptDir: URL
+    /// Replaces the scan.py run when set — tests feed `scanFinished` directly.
+    var scanner: ((_ urls: [URL], _ adding: Bool) -> Void)?
 
     init() {
         // install_macos_quick_action.sh records the checkout it ran from;
@@ -145,6 +148,10 @@ class WizardViewModel: ObservableObject {
     /// appends what is new instead of replacing the list.
     private func runScan(_ urls: [URL], adding: Bool) {
         self.isScanning = true
+        if let scanner {
+            scanner(urls, adding)
+            return
+        }
         let python = self.resolvePythonPath()
         let scanScript = self.scriptDir.appendingPathComponent("scan.py").path
         let codec = self.targetCodec
@@ -206,7 +213,7 @@ class WizardViewModel: ObservableObject {
         }
     }
 
-    private func scanFinished(_ response: ScanResponse, adding: Bool) {
+    func scanFinished(_ response: ScanResponse, adding: Bool) {
         isScanning = false
         if adding {
             let known = Set(candidates.map(\.id))
@@ -231,7 +238,7 @@ class WizardViewModel: ObservableObject {
         }
     }
 
-    private func scanFailed(_ message: String, adding: Bool) {
+    func scanFailed(_ message: String, adding: Bool) {
         isScanning = false
         if adding {
             notice = message
@@ -523,7 +530,7 @@ class WizardViewModel: ObservableObject {
         logs.append("⚠️ Vorgang durch Benutzer abgebrochen.")
     }
 
-    private func parseBatchOutput(_ lines: [String]) {
+    func parseBatchOutput(_ lines: [String]) {
         defer { DockProgress.show(isEncoding ? overallFraction : nil) }
         for line in lines {
             guard let event = BatchEvent.decode(line) else {

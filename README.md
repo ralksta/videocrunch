@@ -17,7 +17,7 @@ window.
   Silicon), NVIDIA NVENC, or Intel QuickSync. `libx265` (software) works as a
   fallback but is much slower.
 
-For the macOS app only: macOS 13+ and the Swift compiler from the Xcode
+For the macOS app only: macOS 14+ and the Swift toolchain from the Xcode
 Command Line Tools (`xcode-select --install`). The installer builds the app
 from source.
 
@@ -259,7 +259,8 @@ math to a known-good set of numbers.
 bash install_macos_quick_action.sh
 ```
 
-Builds `VideoCrunch.app` from the Swift sources in `macos/VideoCrunch/`,
+Builds `VideoCrunch.app` from the Swift package in `macos/VideoCrunch/`
+(`swift build -c release`; every file under `Sources/` is part of it),
 installs it into `/Applications` (`~/Applications` if that isn't writable)
 and adds a `videocrunch` entry to `~/Library/Services/`. Drag the app from
 the Programme folder into the Dock to keep it there. Ways in:
@@ -314,7 +315,7 @@ rather than cutting off an encode.
 
 The app walks through the same steps as the command-line wizard: **Scan**
 (`scan.py --json`), **Auswahl** (pick files, with the expected savings per
-file), **Optionen** (codec, loudness, downscaling to 1080p, originals to the
+file), **Optionen** (codec, audio (original sound by default, loudness levelling on request), downscaling to 1080p, originals to the
 trash), **Encode** (`batch.py`, with live progress per file and a Cancel
 button that stops and cleans up) and **Fertig** (what each file saved, with a
 retry for files just under the quality floor). Started without a file, it
@@ -343,7 +344,12 @@ rm -rf /Applications/VideoCrunch.app ~/Library/Services/videocrunch.workflow
 .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/pytest
 .venv/bin/ruff check .
+swift test --package-path macos/VideoCrunch   # app logic; needs Xcode for XCTest
 ```
+
+The app tests cover what the wizard computes and decides without a window:
+the savings estimates with 1080p and trimming, where an opened file goes
+(scan, add, queue), the preselection, and reading `batch.py --events`.
 
 ## License
 

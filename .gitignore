@@ -13,3 +13,7 @@ macos/VideoCrunch/VideoCrunchUI
 
 # macOS Finder metadata
 .DS_Store
+
+# Swift package build output
+macos/VideoCrunch/.build/
+macos/VideoCrunch/.swiftpm/

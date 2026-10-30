@@ -29,15 +29,16 @@ echo "🔨 Kompiliere native SwiftUI App..."
 mkdir -p "$MACOS_DIR/VideoCrunch.app/Contents/MacOS"
 mkdir -p "$MACOS_DIR/VideoCrunch.app/Contents/Resources"
 
-swiftc -parse-as-library \
-    "$MACOS_DIR/Sources/Models.swift" \
-    "$MACOS_DIR/Sources/WizardViewModel.swift" \
-    "$MACOS_DIR/Sources/WizardView.swift" \
-    "$MACOS_DIR/Sources/DockAndNotifications.swift" \
-    "$MACOS_DIR/Sources/ProDesign.swift" \
-    "$MACOS_DIR/Sources/TrimView.swift" \
-    "$MACOS_DIR/Sources/main.swift" \
-    -o "$MACOS_DIR/VideoCrunch.app/Contents/MacOS/VideoCrunch"
+# A Swift package: every file under Sources/ is built, no list to maintain.
+# SwiftPM records the deployment target as the SDK version too; macOS then
+# treats the app as built for macOS 14 and gives it the old look (no
+# current toolbar). Linking with the real SDK version keeps it current.
+SDK_VERSION="$(xcrun --sdk macosx --show-sdk-version)"
+SWIFT_BUILD=(swift build -c release --package-path "$MACOS_DIR"
+             -Xlinker -platform_version -Xlinker macos -Xlinker 14.0 -Xlinker "$SDK_VERSION")
+"${SWIFT_BUILD[@]}"
+cp "$("${SWIFT_BUILD[@]}" --show-bin-path)/VideoCrunch" \
+    "$MACOS_DIR/VideoCrunch.app/Contents/MacOS/VideoCrunch"
 
 if [ -f "$MACOS_DIR/AppIcon.icns" ]; then
     cp "$MACOS_DIR/AppIcon.icns" "$MACOS_DIR/VideoCrunch.app/Contents/Resources/AppIcon.icns"
@@ -70,7 +71,7 @@ cat > "$MACOS_DIR/VideoCrunch.app/Contents/Info.plist" <<PLIST
     <key>CFBundleVersion</key>
     <string>1</string>
     <key>LSMinimumSystemVersion</key>
-    <string>13.0</string>
+    <string>14.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>LSApplicationCategoryType</key>
