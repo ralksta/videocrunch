@@ -14,11 +14,16 @@ struct TrimEditor: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            if let player {
-                PlayerView(player: player)
-                    .frame(height: 220)
-                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            // Takes what the window leaves: small on a laptop, larger when there is room.
+            Group {
+                if let player {
+                    PlayerView(player: player)
+                } else {
+                    Color.black
+                }
             }
+            .frame(minHeight: 140, maxHeight: .infinity)
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
             TrimTimeline(url: url, duration: duration, start: $start, end: $end) { time in
                 player?.seek(to: CMTime(seconds: time, preferredTimescale: 600),
                              toleranceBefore: .zero, toleranceAfter: .zero)
