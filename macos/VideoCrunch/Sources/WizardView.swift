@@ -7,10 +7,6 @@ struct WizardView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // Header Bar
-            headerBar
-            Divider()
-
             // Main Content by Step
             Group {
                 switch vm.currentStep {
@@ -30,12 +26,41 @@ struct WizardView: View {
             .transition(.opacity)
             .animation(.easeInOut(duration: 0.2), value: vm.currentStep)
 
-            Divider()
-            // Bottom Action Bar
-            bottomBar
+            // Nothing to act on while scanning or on the empty start screen.
+            if vm.currentStep != .scanning {
+                Divider()
+                bottomBar
+            }
         }
         .frame(minWidth: 780, minHeight: 520)
         .background(VisualEffectView(material: .sidebar, blendingMode: .behindWindow))
+        // Mac window chrome: what is open as the title, back and the step in
+        // the title bar, the way Finder and Gifski place them.
+        .navigationTitle(windowTitle)
+        .navigationSubtitle(windowSubtitle)
+        .toolbar {
+            ToolbarItem(placement: .navigation) {
+                Button {
+                    goBack()
+                } label: {
+                    Label("Zurück", systemImage: "chevron.left")
+                }
+                .help("Zurück (⌘[)")
+                .keyboardShortcut("[", modifiers: .command)
+                .disabled(!canGoBack)
+            }
+            ToolbarItem(placement: .principal) {
+                stepIndicatorPill
+            }
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    vm.chooseAndOpen()
+                } label: {
+                    Label("Hinzufügen", systemImage: "plus")
+                }
+                .help("Videos oder Ordner hinzufügen (⌘O)")
+            }
+        }
         // Drop anywhere, in any step: before a selection it starts, during
         // one it adds, during an encode it waits for the next run.
         .dropDestination(for: URL.self) { urls, _ in
@@ -82,33 +107,32 @@ struct WizardView: View {
 
     // MARK: - Subviews
 
-    private var headerBar: some View {
-        HStack(spacing: 12) {
-            Image(nsImage: NSApp.applicationIconImage)
-                .resizable()
-                .frame(width: 36, height: 36)
-                .accessibilityHidden(true)
+    private var windowTitle: String {
+        targetDescription.map { vm.targetURLs.count == 1 ? vm.targetURLs[0].lastPathComponent : $0 }
+            ?? "VideoCrunch"
+    }
 
-            VStack(alignment: .leading, spacing: 2) {
-                Text("videocrunch")
-                    .font(.headline)
-                    .fontWeight(.bold)
-                if let target = targetDescription {
-                    Text(target)
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
-            }
+    /// Where the opened item lives, as Finder would abbreviate it.
+    private var windowSubtitle: String {
+        guard let first = vm.targetURLs.first else { return "" }
+        let folder = vm.targetURLs.count == 1 ? first.deletingLastPathComponent() : first
+        return (folder.path as NSString).abbreviatingWithTildeInPath
+    }
 
-            Spacer()
-
-            // Step Indicator Pill
-            stepIndicatorPill
+    private var canGoBack: Bool {
+        switch vm.currentStep {
+        case .options, .candidateSelection: return true
+        case .scanning: return vm.errorMessage != nil
+        default: return false
         }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 14)
+    }
+
+    private func goBack() {
+        switch vm.currentStep {
+        case .options: vm.backToCandidates()
+        case .candidateSelection, .scanning: vm.startOver()
+        default: break
+        }
     }
 
     private var stepIndicatorPill: some View {
@@ -213,11 +237,6 @@ struct WizardView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
-                }
-                Button {
-                    vm.chooseAndOpen()
-                } label: {
-                    Label("Hinzufügen", systemImage: "plus")
                 }
                 Button("Empfohlene") { vm.selectRecommended() }
                     .disabled(vm.selectedIds == vm.recommendedIds)
@@ -654,17 +673,23 @@ struct WizardView: View {
     }
 
     // MARK: - Bottom Action Bar
+    /// What the selection will come to — always in view next to the button
+    /// that starts it, like Gifski's "Estimated size".
+    private var bottomInfo: String? {
+        switch vm.currentStep {
+        case .candidateSelection:
+            return "\(vm.selectedCandidates.count) ausgewählt · ca. −\(formatMB(vm.selectedEstimatedSavedMB))"
+        case .options:
+            let time = vm.selectedRuntimeSec.map { " · dauert \(formatDuration($0))" } ?? ""
+            return "Ergebnis ca. \(formatMB(vm.selectedTotalAfterMB)) · −\(formatMB(vm.selectedEstimatedSavedMB))" + time
+        default:
+            return nil
+        }
+    }
+
     private var bottomBar: some View {
-        HStack {
-            if vm.currentStep == .options {
-                Button {
-                    vm.backToCandidates()
-                } label: {
-                    Label("Zurück", systemImage: "chevron.left")
-                }
-                .controlSize(.large)
-                .keyboardShortcut(.cancelAction)
-            } else if vm.currentStep == .encoding {
+        HStack(spacing: 12) {
+            if vm.currentStep == .encoding {
                 Button(role: .destructive) {
                     vm.cancelEncoding()
                 } label: {
@@ -681,14 +706,18 @@ struct WizardView: View {
                 .controlSize(.large)
             }
 
+            if let info = bottomInfo {
+                Text(info)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+                    .lineLimit(1)
+            }
+
             Spacer()
 
             if vm.currentStep == .candidateSelection {
                 let count = vm.selectedCandidates.count
-                Text("\(count) ausgewählt · ~\(formatMB(vm.selectedEstimatedSavedMB)) Ersparnis")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-
                 Button {
                     vm.proceedToOptions()
                 } label: {
@@ -699,10 +728,6 @@ struct WizardView: View {
                 .keyboardShortcut(.defaultAction)
                 .disabled(count == 0)
             } else if vm.currentStep == .options {
-                Text("\(videoCount(vm.selectedCandidates.count)) · \(codecName(vm.targetCodec))")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-
                 Button {
                     vm.startEncoding()
                 } label: {

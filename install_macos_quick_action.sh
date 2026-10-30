@@ -8,6 +8,10 @@ MACOS_DIR="$SCRIPT_DIR/macos/VideoCrunch"
 APP_BUNDLE="$MACOS_DIR/VideoCrunch.app"
 LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 
+# Bundle identifier. VIDEOCRUNCH_BUNDLE_ID gives a test build its own, so it
+# never shares windows, settings or saved state with the installed app.
+BUNDLE_ID="${VIDEOCRUNCH_BUNDLE_ID:-com.videocrunch.app}"
+
 # Where the app goes. VIDEOCRUNCH_INSTALL_DIR overrides it (used for testing).
 INSTALL_DIR="${VIDEOCRUNCH_INSTALL_DIR:-/Applications}"
 if [ -z "${VIDEOCRUNCH_INSTALL_DIR:-}" ] && [ ! -w "$INSTALL_DIR" ]; then
@@ -46,7 +50,7 @@ cat > "$MACOS_DIR/VideoCrunch.app/Contents/Info.plist" <<PLIST
     <key>CFBundleExecutable</key>
     <string>VideoCrunch</string>
     <key>CFBundleIdentifier</key>
-    <string>com.videocrunch.app</string>
+    <string>$BUNDLE_ID</string>
     <!-- German UI: the standard menus read "Ablage", "Bearbeiten", … -->
     <key>CFBundleDevelopmentRegion</key>
     <string>de</string>
