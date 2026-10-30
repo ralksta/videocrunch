@@ -136,7 +136,10 @@ contain commas, `--files-from list.txt` reads one path per line instead. It
 also takes `--codec`, `--min-ssim S`, `--scale-height H` and `--replace` and
 forwards them to every per-file encode, reads each worker's verdict from its
 `--json-out` file rather than from its console output, and can write the
-whole batch's results with its own `--json-out`. Sending it SIGTERM cancels
+whole batch's results with its own `--json-out`. `--events` replaces the
+table with one JSON object per line (`start`, `file_start`, `progress` with
+phase, pass, quality and percent, `file_done`, `summary`); the app reads
+those instead of the table. Sending it SIGTERM cancels
 the batch: running encodes stop and clean up, queued ones never start, and
 those files are reported as `cancelled`.
 

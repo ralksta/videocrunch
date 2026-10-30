@@ -48,6 +48,7 @@ class WizardViewModel: ObservableObject {
 
     // Step 4: Encoding
     @Published var workers: [Int: WorkerStatus] = [:]
+    private var batchProgress = BatchProgress()
     @Published var completedCount: Int = 0
     @Published var failedCount: Int = 0
     @Published var totalToEncode: Int = 0
@@ -246,7 +247,7 @@ class WizardViewModel: ObservableObject {
         let finished = completedCount + failedCount
         let running = workers.values
             .filter { $0.status == "running" }
-            .reduce(0.0) { $0 + Double($1.progress) / 100 }
+            .reduce(0.0) { $0 + $1.fileFraction }
         return min(1, (Double(finished) + running) / Double(total))
     }
 
@@ -400,6 +401,7 @@ class WizardViewModel: ObservableObject {
         isEncoding = true
         logs = []
         workers = [:]
+        batchProgress = BatchProgress()
         completedCount = 0
         failedCount = 0
         totalToEncode = selectedIds.count
@@ -444,7 +446,8 @@ class WizardViewModel: ObservableObject {
                 "--files-from", fileListURL.path,
                 "--audio-mode", audioM,
                 "--codec", codec,
-                "--json-out", resultJsonPath
+                "--json-out", resultJsonPath,
+                "--events"
             ]
 
             if scale1080 {
@@ -523,74 +526,24 @@ class WizardViewModel: ObservableObject {
     private func parseBatchOutput(_ lines: [String]) {
         defer { DockProgress.show(isEncoding ? overallFraction : nil) }
         for line in lines {
-            logs.append(line)
-            if logs.count > 100 { logs.removeFirst() }
-
-            if let match = line.range(of: #"\s*\[(\d+)\]\s+(.*?)\s+(.*?)$"#, options: .regularExpression) {
-                let sub = String(line[match])
-                let scanner = Scanner(string: sub)
-                _ = scanner.scanString("[")
-                if let wid = scanner.scanInt() {
-                    _ = scanner.scanString("]")
-                    var status = "running"
-                    var prog = 0
-                    var q = 0
-
-                    if line.contains("✓ Done") {
-                        status = "done"
-                        prog = 100
-                    } else if line.contains("✗ Failed") {
-                        status = "failed"
-                    } else if line.contains("⊘ Skip") {
-                        status = "skipped"
-                    } else if line.contains("■ Cancelled") {
-                        status = "cancelled"
-                    }
-
-                    if let pctRange = line.range(of: #"(\d+)%"#, options: .regularExpression) {
-                        let pctStr = line[pctRange].replacingOccurrences(of: "%", with: "")
-                        prog = Int(pctStr) ?? prog
-                    }
-
-                    if let qRange = line.range(of: #"Q=(\d+)"#, options: .regularExpression) {
-                        let qStr = line[qRange].replacingOccurrences(of: "Q=", with: "")
-                        q = Int(qStr) ?? q
-                    }
-
-                    var curr = workers[wid] ?? WorkerStatus(id: wid, file: "", status: status, progress: prog, q: q)
-                    // "[2] clip.mov   Q=65 ..." — an idle slot has no name, only padding.
-                    if let nameRange = line.range(of: #"\[\d+\] \S.*?\s{2,}"#, options: .regularExpression) {
-                        let raw = line[nameRange]
-                        if let close = raw.firstIndex(of: "]") {
-                            let name = raw[raw.index(after: close)...].trimmingCharacters(in: .whitespaces)
-                            if !name.isEmpty { curr.file = name }
-                        }
-                    }
-                    curr.status = status
-                    curr.progress = prog
-                    if q > 0 { curr.q = q }
-                    workers[wid] = curr
-                }
+            guard let event = BatchEvent.decode(line) else {
+                // Anything else is a message (a traceback, a warning): keep it.
+                logs.append(line)
+                if logs.count > 100 { logs.removeFirst() }
+                continue
             }
-
-            if line.contains("✓") && line.contains("✗") {
-                if let succRange = line.range(of: #"✓\s*(\d+)"#, options: .regularExpression) {
-                    let sStr = line[succRange].replacingOccurrences(of: "✓", with: "").trimmingCharacters(in: .whitespaces)
-                    self.completedCount = Int(sStr) ?? self.completedCount
-                }
-                if let failRange = line.range(of: #"✗\s*(\d+)"#, options: .regularExpression) {
-                    let fStr = line[failRange].replacingOccurrences(of: "✗", with: "").trimmingCharacters(in: .whitespaces)
-                    self.failedCount = Int(fStr) ?? self.failedCount
-                }
-            }
+            batchProgress.apply(event)
         }
+        workers = batchProgress.workers
+        completedCount = batchProgress.completed
+        failedCount = batchProgress.failed
     }
 
     private func finishBatch(report: BatchReport?) {
         self.batchResults = report?.results ?? []
         self.actualSavedBytes = self.batchResults.reduce(0) { $0 + ($1.saved_bytes ?? 0) }
-        // The live counters come from batch.py's table, which may stop
-        // redrawing before the last file is counted; the report is final.
+        // The report is final: it also knows a file the events never
+        // finished (batch.py killed mid-run).
         if report != nil {
             self.completedCount = self.batchResults.filter { $0.status == "success" }.count
             self.failedCount = self.batchResults.filter { $0.status == "failed" }.count

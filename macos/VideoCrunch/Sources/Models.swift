@@ -80,6 +80,80 @@ struct WorkerStatus: Identifiable {
     var status: String
     var progress: Int
     var q: Int
+    var path: String = ""
+    var phase: String = "prepare"
+    var pass: Int = 0
+
+    /// How far this file is, across its passes. A file usually takes about
+    /// three (a binary search over four quality rungs), each an encode and
+    /// then a quality check — so one pass's 100 % is not the file's 100 %.
+    var fileFraction: Double {
+        switch status {
+        case "running":
+            let step = Double(progress) / 100
+            let within = phase == "check" ? 0.8 + 0.2 * step : (phase == "encode" ? 0.8 * step : 0)
+            return min(0.95, (Double(max(pass, 1) - 1) + within) / 3)
+        default:
+            return 1
+        }
+    }
+}
+
+/// One line of `batch.py --events`.
+struct BatchEvent: Decodable {
+    let event: String
+    let worker: Int?
+    let file: String?
+    let name: String?
+    let status: String?
+    let phase: String?
+    let pass: Int?
+    let q: Int?
+    let percent: Int?
+    let succeeded: Int?
+    let failed: Int?
+
+    static func decode(_ line: String) -> BatchEvent? {
+        guard line.hasPrefix("{"), let data = line.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(BatchEvent.self, from: data)
+    }
+}
+
+/// The live state of a batch, built from its events.
+struct BatchProgress {
+    var workers: [Int: WorkerStatus] = [:]
+    var completed = 0
+    var failed = 0
+
+    mutating func apply(_ e: BatchEvent) {
+        switch e.event {
+        case "file_start":
+            guard let wid = e.worker else { return }
+            workers[wid] = WorkerStatus(id: wid, file: e.name ?? "", status: "running",
+                                        progress: 0, q: 0, path: e.file ?? "")
+        case "progress":
+            guard let wid = e.worker, var w = workers[wid] else { return }
+            w.phase = e.phase ?? w.phase
+            w.pass = e.pass ?? w.pass
+            w.progress = e.percent ?? w.progress
+            if let q = e.q { w.q = q }
+            workers[wid] = w
+        case "file_done":
+            guard let wid = e.worker else { return }
+            // batch.py counts a skipped file as handled, not as a failure.
+            let status = e.status ?? "failed"
+            if status == "success" || status == "skipped" { completed += 1 } else { failed += 1 }
+            guard var w = workers[wid] else { return }
+            w.status = status == "success" ? "done" : status
+            w.progress = 100
+            workers[wid] = w
+        case "summary":
+            completed = e.succeeded ?? completed
+            failed = e.failed ?? failed
+        default:
+            break
+        }
+    }
 }
 
 struct BatchItemResult: Codable, Identifiable {

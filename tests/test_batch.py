@@ -140,3 +140,111 @@ class TestAbort:
             ("/v/a.mov", None, "standard", None, None, False, "hevc", None, None, 1))
         assert not ok
         assert result["status"] == "cancelled"
+
+
+class TestProgressTracker:
+    """Per-file progress, read from videocrunch.py's output into plain fields.
+
+    The app used to regex its way through the redrawn terminal table: names
+    cut to 30 characters, no idea which pass or phase a percentage belonged to.
+    """
+
+    def _feed(self, *lines):
+        tracker = batch.ProgressTracker()
+        changes = [tracker.feed(line) for line in lines]
+        return tracker, changes
+
+    def test_a_pass_starts_with_its_quality(self):
+        tracker, _ = self._feed("\x1b[0;32mPass:\x1b[0m Q=65 (maxrate 8M)")
+        assert tracker.state() == {"phase": "encode", "pass": 1, "q": 65, "percent": 0}
+
+    def test_encode_percent_belongs_to_the_pass(self):
+        tracker, _ = self._feed("Pass: Q=75", " hevc_videotoolbox [==>   ] 42% | 3.1x | 8M")
+        assert tracker.state()["percent"] == 42
+
+    def test_colour_codes_do_not_hide_the_figure(self):
+        # videocrunch.py colours the number: "] \x1b[1;32m42%" — on real
+        # encodes the bar stood at 0 % for the whole pass.
+        tracker, _ = self._feed("Pass: Q=65",
+                                " \x1b[0;32mhevc_videotoolbox\x1b[0m [####----] \x1b[1;32m42%\x1b[0m | 2x")
+        assert tracker.state()["percent"] == 42
+
+    def test_the_quality_check_is_its_own_phase(self):
+        tracker, _ = self._feed("Pass: Q=75", " hevc [=====] 100%",
+                                " -> Checking quality... [==>  ] 30%")
+        assert tracker.state()["phase"] == "check"
+        assert tracker.state()["percent"] == 30
+
+    def test_the_next_pass_counts_up_and_restarts(self):
+        tracker, _ = self._feed("Pass: Q=75", " hevc [=====] 100%", "Pass: Q=65")
+        assert tracker.state() == {"phase": "encode", "pass": 2, "q": 65, "percent": 0}
+
+    def test_savings_lines_are_not_progress(self):
+        tracker, changes = self._feed("Pass: Q=75", " -> Result: Q=75 | Saved: 45.23% | SSIM: 0.98")
+        assert tracker.state()["percent"] == 0
+        assert changes[-1] is False
+
+    def test_result_percentages_are_not_progress(self):
+        # "(54.1%)" once read as 1 %: the bar fell back at the very end.
+        tracker, _ = self._feed("Pass: Q=45", " hevc [=====] 100%",
+                                "   -> Early exit: 54.1% savings is excellent!",
+                                ">>> SUCCESS! 7.4 MB (54.1%) saved in 0:09.")
+        assert tracker.state()["percent"] == 100
+
+    def test_unchanged_percent_reports_no_change(self):
+        _, changes = self._feed("Pass: Q=75", " hevc [=] 10%", " hevc [=] 10%")
+        assert changes == [True, True, False]
+
+    def test_before_the_first_pass_it_is_preparing(self):
+        tracker, _ = self._feed("Analysing source...")
+        assert tracker.state()["phase"] == "prepare"
+
+
+EVENT_WORKER = r"""
+import sys
+for line in ["Pass: Q=75", " hevc [==] 50%", " hevc [====] 100%",
+             " -> Checking quality... [=] 60%", ">>> SUCCESS! 12.0 MB saved"]:
+    print(line, flush=True)
+"""
+
+
+class TestEvents:
+    """`--events`: one JSON object per line on stdout, for the app."""
+
+    @pytest.fixture(autouse=True)
+    def capture(self, monkeypatch):
+        import io
+        out = io.StringIO()
+        monkeypatch.setattr(batch, "event_stream", out)
+        batch.abort_requested.clear()
+        batch.file_results.clear()
+        yield out
+        batch.event_stream = None
+
+    def _events(self, out):
+        import json
+        return [json.loads(line) for line in out.getvalue().splitlines()]
+
+    def test_a_file_reports_start_progress_and_result(self, capture, monkeypatch):
+        monkeypatch.setattr(batch, "build_optimizer_command",
+                            lambda *a, **kw: [sys.executable, "-c", EVENT_WORKER])
+        batch.run_optimizer(("/v/Urlaub, Tag 1 mit langem Namen.mov", None, "standard",
+                             None, None, False, "hevc", None, None, 2))
+        events = self._events(capture)
+        kinds = [e["event"] for e in events]
+        assert kinds[0] == "file_start"
+        assert kinds[-1] == "file_done"
+        assert events[0]["file"] == "/v/Urlaub, Tag 1 mit langem Namen.mov"
+        assert events[0]["worker"] == 2
+        progress = [e for e in events if e["event"] == "progress"]
+        assert {"phase": "check", "pass": 1, "q": 75, "percent": 60}.items() <= progress[-1].items()
+        assert events[-1]["status"] == "success"
+
+    def test_without_the_flag_nothing_is_emitted(self, capture, monkeypatch):
+        monkeypatch.setattr(batch, "event_stream", None)
+        batch.emit("start", total=1)  # must not raise
+        assert capture.getvalue() == ""
+
+    def test_the_flag_is_part_of_the_cli(self):
+        args = batch.build_parser().parse_args(["--files=/a.mp4", "--events"])
+        assert args.events is True

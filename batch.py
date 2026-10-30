@@ -50,6 +50,57 @@ active_workers = set()
 workers_lock = threading.Lock()
 abort_requested = threading.Event()
 
+# --events: one JSON object per line goes here instead of the redrawn table.
+event_stream = None
+event_lock = threading.Lock()
+
+# Only a progress bar's figure: "] 42%". Result lines carry percentages too.
+PERCENT_RE = re.compile(r'\]\s*(\d+)%')
+PASS_RE = re.compile(r'Pass:\s+Q=(\d+)')
+ANSI_RE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
+
+
+def emit(event: str, **fields) -> None:
+    """Write one machine-readable event, if --events asked for them."""
+    stream = event_stream
+    if stream is None:
+        return
+    with event_lock:
+        stream.write(json.dumps({"event": event, **fields}, ensure_ascii=False) + "\n")
+        stream.flush()
+
+
+class ProgressTracker:
+    """Where one videocrunch.py run is: phase, pass, quality and percent.
+
+    A pass starts with its "Pass: Q=…" line; the SSIM check that follows each
+    pass reports its own percentage, so the two are told apart rather than
+    read as one bar jumping back and forth.
+    """
+
+    def __init__(self):
+        self.phase, self.passes, self.q, self.percent = "prepare", 0, None, 0
+
+    def state(self) -> dict:
+        return {"phase": self.phase, "pass": self.passes, "q": self.q,
+                "percent": self.percent}
+
+    def feed(self, line: str) -> bool:
+        """Take one output line; True when the state changed."""
+        before = self.state()
+        line = ANSI_RE.sub('', line)
+        match = PASS_RE.search(line)
+        if match:
+            self.phase, self.passes = "encode", self.passes + 1
+            self.q, self.percent = int(match.group(1)), 0
+        else:
+            match = PERCENT_RE.search(line)
+            if match:
+                if "Checking quality" in line:
+                    self.phase = "check"
+                self.percent = min(100, int(match.group(1)))
+        return self.state() != before
+
 
 def truncate(text, max_len=35):
     """Truncate text with ellipsis."""
@@ -270,6 +321,17 @@ def abort_workers(signum=None, frame=None):
 
 def run_optimizer(args_tuple):
     """Worker function - captures output and updates shared state. Returns detailed results for logging."""
+    file_path, worker_id = args_tuple[0], args_tuple[-1]
+    emit("file_start", worker=worker_id, file=file_path, name=Path(file_path).name)
+    outcome = _run_optimizer(args_tuple)
+    result = outcome[2]
+    emit("file_done", worker=worker_id, file=file_path, status=result["status"],
+         quality=result.get("quality"), ssim=result.get("ssim"),
+         saved_pct=result.get("saved_pct"), reason=result.get("reason"))
+    return outcome
+
+
+def _run_optimizer(args_tuple):
     file_path, port, audio_mode, min_ssim, scale_height, replace, codec, ss, to, worker_id = args_tuple
 
     filename = Path(file_path).name
@@ -315,24 +377,24 @@ def run_optimizer(args_tuple):
         last_saved_bytes = None
         failure_reason = None
 
+        tracker = ProgressTracker()
         for line in process.stdout:
             line = line.strip()
             verdict, verdict_reason = terminal_verdict(line)
 
-            # Parse progress: look for percentage
-            if '%' in line and 'Saved' not in line:
-                match = re.search(r'(\d+)%', line)
-                if match:
-                    with display_lock:
-                        worker_status[worker_id]["progress"] = int(match.group(1))
+            if tracker.feed(line):
+                state = tracker.state()
+                with display_lock:
+                    worker_status[worker_id]["progress"] = state["percent"]
+                    if state["q"] is not None:
+                        worker_status[worker_id]["q"] = state["q"]
+                emit("progress", worker=worker_id, file=file_path, **state)
 
-            # Parse Q value: "Q=75" or "-> Result: Q=65"
+            # The quality of the last result: "-> Result: Q=65"
             if 'Q=' in line:
                 match = re.search(r'Q=(\d+)', line)
                 if match:
                     last_quality = int(match.group(1))
-                    with display_lock:
-                        worker_status[worker_id]["q"] = last_quality
 
             # Parse SSIM: "SSIM: 0.9823"
             if 'SSIM:' in line:
@@ -521,6 +583,9 @@ def build_parser():
                         help='End time, forwarded per file')
     parser.add_argument('--replace', action='store_true',
                         help='Replace each source with its encode (original to the trash)')
+    parser.add_argument('--events', action='store_true',
+                        help='Print one JSON object per line (start, progress, file '
+                             'results, summary) instead of the live table')
     parser.add_argument('--min-ssim', type=quality_floor, metavar='S',
                         help='Override the hard quality floor for every file in this batch '
                              '(0 < S <= 1). Forwarded to videocrunch.py per file.')
@@ -536,8 +601,11 @@ def file_list(args) -> list:
 
 
 def main():
+    global event_stream
     args = build_parser().parse_args()
     signal.signal(signal.SIGTERM, abort_workers)
+    if args.events:
+        event_stream = sys.stdout
 
     files = file_list(args)
 
@@ -554,14 +622,14 @@ def main():
     for i in range(1, max_workers + 1):
         worker_status[i] = {"file": "", "status": "idle", "progress": 0, "q": 0}
 
-    # Print initial info
-    print(f"\n{Y}Each file: Q=75→65→55→45 loop + SSIM quality check{NC}\n")
-
     start_time = time.time()
+    emit("start", total=len(files), workers=max_workers, files=files)
 
-    # Start display thread
-    display_thread = threading.Thread(target=display_loop, args=(start_time, max_workers), daemon=True)
-    display_thread.start()
+    if not args.events:
+        print(f"\n{Y}Each file: Q=75→65→55→45 loop + SSIM quality check{NC}\n")
+        display_thread = threading.Thread(target=display_loop, args=(start_time, max_workers),
+                                          daemon=True)
+        display_thread.start()
 
     # Prepare work items
     work_items = [(f, args.port, args.audio_mode, args.min_ssim, args.scale_height,
@@ -588,9 +656,17 @@ def main():
 
     # Stop display and show final
     stop_display.set()
-    time.sleep(0.6)
-
     elapsed = time.time() - start_time
+    log_file = write_log(start_time, elapsed, encoder)
+    if args.json_out:
+        write_batch_results(args.json_out, file_results)
+
+    if args.events:
+        emit("summary", succeeded=stats["succeeded"], failed=stats["failed"],
+             elapsed_sec=round(elapsed, 1), log=str(log_file))
+        return
+
+    time.sleep(0.6)
     print(f"\n\n{BG}╔{'═'*62}╗{NC}")
     print(f"{BG}║{NC}                    📊 {CYAN}BATCH COMPLETE{NC} 📊                       {BG}║{NC}")
     print(f"{BG}╠{'═'*62}╣{NC}")
@@ -599,12 +675,7 @@ def main():
     print(f"{BG}║{NC}  ⏱ Time:       {Y}{format_time(elapsed)}{NC}                            {BG}║{NC}")
     print(f"{BG}╚{'═'*62}╝{NC}")
 
-    # Write detailed log file
-    log_file = write_log(start_time, elapsed, encoder)
     print(f"\n{G}📝 Log saved:{NC} {log_file}")
-
-    if args.json_out:
-        write_batch_results(args.json_out, file_results)
 
     hold = window_hold_seconds(sys.stdout.isatty())
     if hold:
