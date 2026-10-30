@@ -31,18 +31,23 @@ from scan import (  # noqa: E402
     disk_shortfall,
     display_name,
     downscale_candidates,
+    downscale_gain_mb,
+    downscale_offer,
+    expected_saved_mb,
     find_videos,
     format_duration,
     has_optimized_sibling,
     outcome_lines,
     parse_selection,
     probe_to_media,
+    resolve_selection,
     retry_floor,
     retry_paths,
     run_batch,
     select_candidates,
     summary_lines,
     table_name_width,
+    table_note,
 )
 
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
@@ -692,6 +697,56 @@ class TestWizardQuestions:
     def test_nothing_to_downscale_means_no_question(self):
         entries = [{"height": 1080}, {"height": 720}]
         assert downscale_candidates(entries, 1080) == 0
+
+
+class TestWizardRecommendations:
+    """The terminal wizard ticks what the app ticks.
+
+    The app preselects recommended files and offers the ones that only pay
+    off at 1080p; the wizard listed everything alike and Enter meant
+    "nothing", so the same folder got two different answers.
+    """
+
+    CANDIDATES = [
+        {"estimated_saved_mb": 40.0, "recommended": True, "recommended_1080": False,
+         "advice": None, "reason": "Heuristik"},
+        {"estimated_saved_mb": 10.0, "estimated_saved_mb_1080": 42.0,
+         "recommended": False, "recommended_1080": True,
+         "advice": "Lohnt sich erst mit 1080p (ca. 61 % statt 15 %)", "reason": "Heuristik"},
+        {"estimated_saved_mb": 2.0, "recommended": False, "recommended_1080": False,
+         "advice": "Spart nur ca. 2.0 MB", "reason": "Heuristik"},
+        {"estimated_saved_mb": 30.0, "recommended": True, "recommended_1080": False,
+         "advice": None, "reason": "aus 3 Encodes"},
+    ]
+    NAMES = ["a.mp4", "b.mov", "c.mp4", "d.mp4"]
+
+    def test_enter_takes_the_recommended_files(self):
+        assert resolve_selection("", self.NAMES, self.CANDIDATES, interactive=True) == [1, 4]
+
+    def test_piped_empty_input_still_selects_nothing(self):
+        # A script piping in nothing has always meant "no encode".
+        assert resolve_selection("", self.NAMES, self.CANDIDATES, interactive=False) == []
+
+    def test_typed_selection_wins_over_the_recommendation(self):
+        assert resolve_selection("3", self.NAMES, self.CANDIDATES, interactive=True) == [3]
+
+    def test_files_worth_it_only_at_1080p_are_offered(self):
+        assert downscale_offer(self.CANDIDATES, [1, 4]) == [2]
+
+    def test_nothing_is_offered_when_already_picked(self):
+        assert downscale_offer(self.CANDIDATES, [1, 2]) == []
+
+    def test_1080p_gain_counts_only_what_downscaling_adds(self):
+        assert downscale_gain_mb(self.CANDIDATES) == pytest.approx(32.0)
+
+    def test_the_expected_total_follows_the_1080p_choice(self):
+        picked = self.CANDIDATES[:2]
+        assert expected_saved_mb(picked, None) == pytest.approx(50.0)
+        assert expected_saved_mb(picked, 1080) == pytest.approx(82.0)
+
+    def test_the_table_explains_why_a_file_is_not_ticked(self):
+        assert "1080p" in table_note(self.CANDIDATES[1])
+        assert table_note(self.CANDIDATES[0]) == "Heuristik"
 
 
 class TestFormatDuration:
