@@ -40,6 +40,7 @@ from savings import (
 )
 from videocrunch import (
     MIN_QUALITY,
+    MIN_SAVINGS,
     downscale_bitrate_scale,
     ladder_top_factor,
     suggested_floor,
@@ -52,6 +53,9 @@ VIDEO_EXTENSIONS = frozenset({
     '.mpg', '.mpeg', '.ts',
 })
 MIN_LISTED_SAVED_PCT = 10.0
+# Below this a file is listed but not ticked: a few megabytes are not worth
+# the encode time.
+RECOMMEND_MIN_SAVED_MB = 5.0
 
 # --- COLORS ---
 G = '\033[0;32m'
@@ -386,6 +390,28 @@ def _reason(m: dict, saved_pct: float, source: str, samples: int,
     return f"{codec}, {res}, {rate} — Codec-Wechsel lohnt"
 
 
+def recommendation(saved_pct: float, saved_mb: float,
+                   pct_1080: Optional[float], mb_1080: Optional[float]) -> tuple:
+    """(tick it?, worth it with the 1080p downscale?, why not — or None).
+
+    Listed is not the same as worth encoding: a pass saving under MIN_SAVINGS
+    is thrown away at the end, so a file estimated below it costs encode time
+    for nothing. A file that only pays off downscaled is named as such.
+    """
+    def worth(pct, mb):
+        return pct is not None and pct >= MIN_SAVINGS and (mb or 0) >= RECOMMEND_MIN_SAVED_MB
+
+    if worth(saved_pct, saved_mb):
+        return (True, False, None)
+    if worth(pct_1080, mb_1080):
+        return (False, True, f"Lohnt sich erst mit 1080p (ca. {pct_1080:.0f} % statt "
+                             f"{saved_pct:.0f} %)")
+    if saved_pct < MIN_SAVINGS:
+        return (False, False, f"Spart vermutlich unter {MIN_SAVINGS:.0f} % – "
+                              f"so ein Ergebnis würde verworfen")
+    return (False, False, f"Spart nur ca. {saved_mb:.1f} MB")
+
+
 def rank(media: list[dict], target_codec: str, exclude_paths: set,
         history: EncodeHistory, limit: int = 100) -> dict:
     """Rank re-encode candidates by absolute expected savings (MB, desc)."""
@@ -421,6 +447,10 @@ def rank(media: list[dict], target_codec: str, exclude_paths: set,
         source_kbps = (m["bitrate_mbps"] or 0.0) * 1000.0
         ref_kbps = _reference_kbps(m["height"] or 0, target_codec, m["frame_rate"] or 0.0)
         downscaled = downscaled_saved_pct(m, target_codec)
+        saved_mb = m["size_mb"] * saved_pct / 100.0
+        mb_1080 = m["size_mb"] * downscaled / 100.0 if downscaled is not None else None
+        recommended, recommended_1080, advice = recommendation(
+            saved_pct, saved_mb, downscaled, mb_1080)
         above_reference = source_kbps > ref_kbps
         candidates.append({
             "file_path": m["file_path"],
@@ -436,6 +466,11 @@ def rank(media: list[dict], target_codec: str, exclude_paths: set,
                                         if downscaled is not None else None),
             "estimated_saved_pct_1080": (round(downscaled, 1)
                                          if downscaled is not None else None),
+            # Ticked in the app before the user does anything; `advice` says
+            # why a listed file is not.
+            "recommended": recommended,
+            "recommended_1080": recommended_1080,
+            "advice": advice,
             "confidence": confidence,
             "source": source,
             "reason": _reason(m, saved_pct, source, samples, is_same_codec, above_reference),

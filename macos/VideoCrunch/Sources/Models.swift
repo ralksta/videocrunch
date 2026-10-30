@@ -18,6 +18,11 @@ struct Candidate: Identifiable, Codable, Hashable {
     let estimated_saved_pct_1080: Double?
     /// Encode time from past runs of this resolution class; nil without history.
     let estimated_runtime_sec: Double?
+    /// Ticked before the user does anything; `advice` says why not.
+    let recommended: Bool?
+    /// Only worth it with the 1080p downscale.
+    let recommended_1080: Bool?
+    let advice: String?
     let confidence: String
     let source: String
     let reason: String
@@ -44,6 +49,11 @@ struct Candidate: Identifiable, Codable, Hashable {
 
     var savedFormatted: String {
         formatMB(estimated_saved_mb)
+    }
+
+    /// Older scan.py output has no recommendation: then everything counts.
+    var isRecommended: Bool {
+        recommended ?? true
     }
 
     var canDownscale: Bool {

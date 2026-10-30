@@ -205,12 +205,12 @@ class WizardViewModel: ObservableObject {
             let known = Set(candidates.map(\.id))
             let added = response.results.filter { !known.contains($0.id) }
             candidates += added
-            selectedIds.formUnion(added.map(\.id))
+            selectedIds.formUnion(added.filter(\.isRecommended).map(\.id))
             notice = added.isEmpty ? "Nichts Neues, das sich lohnt." : nil
         } else {
             candidates = response.results
             scanSummary = response.summary
-            selectedIds = Set(response.results.map { $0.id })
+            selectedIds = Set(response.results.filter(\.isRecommended).map(\.id))
             currentStep = .candidateSelection
         }
         let backlog = scanBacklog
@@ -301,6 +301,30 @@ class WizardViewModel: ObservableObject {
 
     var tallCandidatesCount: Int {
         selectedCandidates.filter { $0.canDownscale }.count
+    }
+
+    var recommendedIds: Set<String> {
+        Set(candidates.filter(\.isRecommended).map(\.id))
+    }
+
+    func selectRecommended() {
+        selectedIds = recommendedIds
+    }
+
+    /// Not ticked because they only pay off downscaled to 1080p.
+    var downscaleOnlyUnselected: [Candidate] {
+        candidates.filter { $0.recommended_1080 == true && !selectedIds.contains($0.id) }
+    }
+
+    /// Selected files that are worth it only with the downscale on.
+    var selectedNeedingDownscale: Int {
+        selectedCandidates.filter { $0.recommended_1080 == true }.count
+    }
+
+    /// Takes the downscale-only files along and turns the downscale on.
+    func takeDownscaleOnly() {
+        selectedIds.formUnion(downscaleOnlyUnselected.map(\.id))
+        scaleTo1080p = true
     }
 
     func selectAll() {

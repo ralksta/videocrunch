@@ -439,6 +439,49 @@ class TestJsonOutput:
         assert ANSI_ESCAPE_RE.search(text) is None
 
 
+class TestRecommendation:
+    """Which candidates the app ticks before the user does.
+
+    Everything above the listing threshold used to be ticked. A pass that
+    saves under MIN_SAVINGS is thrown away at the end, so ticking such a file
+    only costs the user the encode time — IMG_3465 (est. 15 %) was exactly
+    that.
+    """
+
+    def test_worth_it_is_recommended(self):
+        from scan import recommendation
+        assert recommendation(35.0, 11.6, None, None) == (True, False, None)
+
+    def test_below_the_savings_goal_is_not(self):
+        from scan import recommendation
+        recommended, _, advice = recommendation(14.7, 2.0, None, None)
+        assert recommended is False
+        assert "20 %" in advice
+
+    def test_a_few_megabytes_are_not_worth_the_time(self):
+        from scan import recommendation
+        recommended, _, advice = recommendation(40.0, 1.5, None, None)
+        assert recommended is False
+        assert "MB" in advice
+
+    def test_only_worth_it_with_1080p(self):
+        # IMG_0886: 15 % as it is, 61 % downscaled to 1080p.
+        from scan import recommendation
+        recommended, with_1080, advice = recommendation(15.0, 10.4, 61.0, 42.3)
+        assert recommended is False
+        assert with_1080 is True
+        assert "1080p" in advice
+
+    def test_rank_carries_the_recommendation(self):
+        from scan import EncodeHistory, rank
+        media = [dict(file_path="/v/a.mp4", size_mb=1000.0, bitrate_mbps=12.0, codec="h264",
+                      duration_sec=600.0, width=1920, height=1080, frame_rate=25.0)]
+        result = rank(media, "hevc", set(), EncodeHistory(Path("/nonexistent")), 10)["results"][0]
+        assert result["recommended"] is True
+        assert result["recommended_1080"] is False
+        assert result["advice"] is None
+
+
 class TestRuntimeInJson:
     """The app shows "dauert ca. …" before the start, from what past runs took."""
 
