@@ -38,7 +38,12 @@ from savings import (
     estimate_savings_pct,
     resolution_class,
 )
-from videocrunch import MIN_QUALITY, suggested_floor
+from videocrunch import (
+    MIN_QUALITY,
+    downscale_bitrate_scale,
+    ladder_top_factor,
+    suggested_floor,
+)
 
 # Extensions worth probing. Deliberately inlined: a standalone tool should not
 # need a config module for a constant list.
@@ -202,7 +207,37 @@ def downscale_candidates(entries: list, target: int = DOWNSCALE_TARGET) -> int:
     only via --scale-height. Asking makes sense only when the selection holds
     material it would apply to.
     """
-    return sum(1 for e in entries if (e.get("height") or 0) > target)
+    return sum(1 for e in entries if short_side(e) > target)
+
+
+def downscaled_saved_pct(m: dict, target_codec: str,
+                         target: int = DOWNSCALE_TARGET) -> Optional[float]:
+    """Expected saving if the encode also brings the short side down to `target`.
+
+    Follows what videocrunch budgets for a downscaled encode: the source
+    bitrate scaled by the short-side ratio, then the usual estimate at the
+    target resolution, never above the ladder's best rung. None when there is
+    nothing to downscale. Heuristic only: history records cannot tell a native
+    1080p encode from a downscaled one.
+    """
+    short = short_side(m)
+    source_kbps = (m.get("bitrate_mbps") or 0.0) * 1000.0
+    if short <= target or source_kbps <= 0:
+        return None
+    scaled_kbps = source_kbps * downscale_bitrate_scale(target, short)
+    heur = estimate_savings_pct(scaled_kbps, target, m.get("frame_rate") or 0.0,
+                                m.get("codec") or "", target_codec)
+    if heur is None:
+        return None
+    predicted_kbps = min(scaled_kbps * (1 - heur[0] / 100.0),
+                         scaled_kbps * ladder_top_factor())
+    return max(0.0, (1.0 - predicted_kbps / source_kbps) * 100.0)
+
+
+def short_side(entry: dict) -> int:
+    """The side "1080p" refers to — the shorter one, whatever the orientation."""
+    width, height = entry.get("width") or 0, entry.get("height") or 0
+    return min(width, height) if width and height else height
 
 
 def select_candidates(text: str, names: list) -> list:
@@ -385,6 +420,7 @@ def rank(media: list[dict], target_codec: str, exclude_paths: set,
             continue
         source_kbps = (m["bitrate_mbps"] or 0.0) * 1000.0
         ref_kbps = _reference_kbps(m["height"] or 0, target_codec, m["frame_rate"] or 0.0)
+        downscaled = downscaled_saved_pct(m, target_codec)
         above_reference = source_kbps > ref_kbps
         candidates.append({
             "file_path": m["file_path"],
@@ -395,6 +431,11 @@ def rank(media: list[dict], target_codec: str, exclude_paths: set,
             "bitrate_mbps": m["bitrate_mbps"] or 0.0,
             "estimated_saved_mb": round(m["size_mb"] * saved_pct / 100.0, 1),
             "estimated_saved_pct": round(saved_pct, 1),
+            # Same file with the 1080p downscale on; null when already 1080p.
+            "estimated_saved_mb_1080": (round(m["size_mb"] * downscaled / 100.0, 1)
+                                        if downscaled is not None else None),
+            "estimated_saved_pct_1080": (round(downscaled, 1)
+                                         if downscaled is not None else None),
             "confidence": confidence,
             "source": source,
             "reason": _reason(m, saved_pct, source, samples, is_same_codec, above_reference),

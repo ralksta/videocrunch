@@ -248,7 +248,7 @@ struct WizardView: View {
                                 icon: "arrow.down.right.and.arrow.up.left",
                                 tint: .blue,
                                 title: "Auf 1080p verkleinern",
-                                subtitle: "\(videoCount(vm.tallCandidatesCount)) höher als 1080p. Spart meist am meisten, Seitenverhältnis bleibt."
+                                subtitle: "\(videoCount(vm.tallCandidatesCount)) über 1080p. Spart zusätzlich ca. \(formatMB(vm.downscaleExtraSavedMB)), Seitenverhältnis bleibt."
                             ) {
                                 Toggle("", isOn: $vm.scaleTo1080p)
                                     .toggleStyle(.switch)
@@ -852,6 +852,12 @@ private struct CandidateRow: View {
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .monospacedDigit()
+                    if let pct1080 = candidate.estimated_saved_pct_1080 {
+                        Text("mit 1080p: \(Int(pct1080.rounded())) %")
+                            .font(.caption2.weight(.medium))
+                            .foregroundStyle(.blue)
+                            .monospacedDigit()
+                    }
                 }
             }
             .padding(12)

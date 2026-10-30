@@ -491,10 +491,20 @@ def meets_quality_targets(saved_pct: float, ssim: float) -> bool:
     return saved_pct >= MIN_SAVINGS and ssim >= MIN_QUALITY
 
 
+def ladder_top_factor() -> float:
+    """Share of the reference bitrate the ladder's best rung aims at.
+
+    Just inside the MIN_SAVINGS goal, with 2 % for audio and container: a rung
+    that could not reach the goal even at its target is a wasted full encode.
+    """
+    return min(0.85, 1.0 - MIN_SAVINGS / 100.0 - 0.02)
+
+
 def downscale_bitrate_scale(scale_height, source_height) -> float:
     """Share of the source bitrate a downscaled encode is budgeted.
 
-    Proportional to the height ratio, i.e. pixels^0.5. pixels^0.75 gave
+    `source_height` is the source's short side, the one --scale-height sets.
+    Proportional to that ratio, i.e. pixels^0.5. pixels^0.75 gave
     4K → 1080p only 0.35 of the source, and even the ladder's best rung could
     not reach MIN_QUALITY on detailed 60 fps footage.
     """
@@ -837,24 +847,50 @@ def measure_loudness(input_path, audio_mode):
 
 
 def apply_scale_to_filter(video_filter: str, target_height: int) -> str:
-    """Rewrite a profile's video_filter so the encode outputs at target_height.
+    """Rewrite a profile's video_filter so the encode's SHORT side is target_height.
+
+    "1080p" means the shorter side in either orientation: a vertical phone
+    video goes to 1080x1920, not 608x1080. ffmpeg rotates the frame upright
+    before the filters run, so the scaler decides by the frame it sees.
 
     Every profile filter already carries exactly one scaler (scale / scale_cuda /
     scale_vaapi) whose only job so far was forcing even dimensions. We swap that
-    scaler's dimension arguments; the width follows from the source aspect ratio
-    (-2 = keep AR, round to an even number). Everything else in the chain
+    scaler's dimension arguments; the long side follows from the source aspect
+    ratio (-2 = keep AR, round to an even number). Everything else in the chain
     (format=..., HDR pixel formats) is left untouched.
     """
     h = int(target_height)
     if h <= 0:
         return video_filter
+    # Quoted so the commas inside the expressions don't split the filter chain.
+    w_expr = f"'if(gte(iw,ih),-2,{h})'"
+    h_expr = f"'if(gte(iw,ih),{h},-2)'"
 
     if 'scale_cuda=' in video_filter:
-        return re.sub(r'scale_cuda=[^:,]+:[^:,]+', f'scale_cuda=-2:{h}', video_filter, count=1)
+        return re.sub(r'scale_cuda=[^:,]+:[^:,]+', f'scale_cuda=w={w_expr}:h={h_expr}',
+                      video_filter, count=1)
     if 'scale_vaapi=' in video_filter:
-        return re.sub(r'scale_vaapi=w=[^:,]+:h=[^:,]+', f'scale_vaapi=w=-2:h={h}', video_filter, count=1)
+        return re.sub(r'scale_vaapi=w=[^:,]+:h=[^:,]+', f'scale_vaapi=w={w_expr}:h={h_expr}',
+                      video_filter, count=1)
     # Software scaler: 'scale=' either at the start of the chain or after a comma
-    return re.sub(r'(^|,)scale=[^,]+', rf'\g<1>scale=-2:{h}', video_filter, count=1)
+    return re.sub(r'(^|,)scale=[^,]+', lambda m: f"{m.group(1)}scale=w={w_expr}:h={h_expr}",
+                  video_filter, count=1)
+
+
+def downscaled_size(width: int, height: int, target: int) -> Optional[Tuple[int, int]]:
+    """Output size when the short side goes to `target`, or None if it already is.
+
+    Only ever downscales: upscaling would grow the file and invent detail.
+    """
+    short = min(width or 0, height or 0)
+    if not target or short <= target:
+        return None
+    scale = target / short
+
+    def even(v: int) -> int:
+        return max(2, int(round(v * scale / 2)) * 2)
+
+    return (even(width), even(height))
 
 
 def probe_stream_inventory(path) -> list:
@@ -1530,17 +1566,21 @@ def prepare_encode(input_path, profile, min_size_mb=0, copy_audio=False,
 
     # --- DOWNSCALE REQUEST ---
     # Only ever downscale: upscaling would grow the file and invent detail.
+    scaled_size = None
     if scale_height and video_mode == 'compress':
-        if info['height'] and scale_height >= info['height']:
-            print(f"{Y}Scale ignored:{NC} target {scale_height}p ≥ source {info['height']}p (no upscaling)")
+        scaled_size = downscaled_size(info['width'], info['height'], scale_height)
+        if scaled_size is None:
+            print(f"{Y}Scale ignored:{NC} source {info['width']}x{info['height']} is already "
+                  f"{scale_height}p or smaller (no upscaling)")
             scale_height = None
         else:
-            print(f"{Y}Downscale:{NC} {info['width']}x{info['height']} → {scale_height}p (Seitenverhältnis bleibt erhalten)")
+            print(f"{Y}Downscale:{NC} {info['width']}x{info['height']} → "
+                  f"{scaled_size[0]}x{scaled_size[1]} (Seitenverhältnis bleibt erhalten)")
     elif scale_height:
         scale_height = None  # copy mode never re-encodes
 
     # Height the output will actually have — history buckets key on this.
-    effective_height = scale_height or info['height']
+    effective_height = scaled_size[1] if scaled_size else info['height']
     last_encode_result['height'] = effective_height
     last_encode_result['source_kbps'] = (size_before * 8) / (info['duration'] * 1000)
     last_encode_result['size_mb'] = size_before / (1024 * 1024)
@@ -1734,7 +1774,7 @@ def prepare_encode(input_path, profile, min_size_mb=0, copy_audio=False,
     # When downscaling, the ladder must follow the TARGET resolution. Otherwise every
     # pass aims at source-resolution bitrates for a much smaller frame — the encode
     # passes SSIM trivially and the search leaves most of the savings on the table.
-    _br_scale = downscale_bitrate_scale(scale_height, info['height'])
+    _br_scale = downscale_bitrate_scale(scale_height, min(info['width'], info['height']))
     if _source_avg_kbps:
         _source_avg_kbps *= _br_scale
 
@@ -1743,7 +1783,7 @@ def prepare_encode(input_path, profile, min_size_mb=0, copy_audio=False,
         # Factor range: least compression (still inside the savings goal, with a
         # 2% margin for audio/container overhead) down to 0.45 (most compression)
         BR_BOT = 0.45
-        BR_TOP = min(0.85, 1.0 - MIN_SAVINGS / 100.0 - 0.02)
+        BR_TOP = ladder_top_factor()
         for i, _qv in enumerate(quality_values):
             # i=0 is highest quality (least compression), i=n-1 is lowest quality (most)
             frac = i / max(1, n - 1)  # 0.0 → 1.0
@@ -2690,8 +2730,9 @@ def build_parser():
                         help='Video processing mode: compress (default) or copy (passthrough)')
     parser.add_argument('--q', type=int, help='Manual starting quality value')
     parser.add_argument('--scale-height', type=int, metavar='H',
-                        help='Downscale video to H pixels height, keeping the source aspect '
-                             'ratio (e.g. 1080). Ignored when >= source height.')
+                        help='Downscale so the shorter side is H pixels, keeping the aspect '
+                             'ratio (1080 = 1080p in either orientation). Ignored when the '
+                             'source is already that small.')
     parser.add_argument('--port', type=int,
                         help='Notify a companion server on this port when a file is done, via GET /api/mark_optimized?path=<path>')
     parser.add_argument('--preset', choices=['fast', 'balanced', 'best'], default='balanced',

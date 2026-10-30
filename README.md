@@ -70,7 +70,8 @@ Key flags: `--codec {hevc,av1}` (default hevc), `--encoder
 {auto,av1_nvenc,av1_software,libx265,nvenc,qsv,vaapi,videotoolbox}` (default auto-detect), `--preset
 {fast,balanced,best}`, `--audio-mode {enhanced,moderate,standard}`, `--q N`
 (force a starting quality and search linearly from there instead of via
-binary search), `--scale-height H` (downscale before encoding), `--ss`/`--to`
+binary search), `--scale-height H` (downscale so the shorter side is H —
+1080 means 1080p in either orientation, a vertical 4K clip becomes 1080x1920), `--ss`/`--to`
 (trim), `--force` (encode even if the savings heuristic says it's not worth
 it), `--min-ssim S` (move the hard quality floor for this run — the default
 is 0.970; check by eye before lowering it),
@@ -100,7 +101,8 @@ their path relative to the scanned folder, because `IMG_1234.mov` in three
 import folders is three different videos.
 
 After the selection it asks only what the selection makes relevant:
-downscaling is offered when something taller than 1080p is in it, replacing
+downscaling is offered when something above 1080p is in it (by the shorter
+side: a vertical 1080x1920 clip is 1080p), replacing
 the originals is always offered, and the start is confirmed with the expected
 savings and — once your history holds enough comparable runs — how long it
 should take. Piping a selection in skips the questions entirely and starts
@@ -217,6 +219,13 @@ unless `--force` is given). It compares the source's bitrate against a
 reference bitrate for a clean encode at that resolution/codec, adjusted by a
 codec-efficiency table (e.g. HEVC needs roughly 65% of H.264's bitrate for
 the same perceived quality; AV1 roughly 55%).
+
+For material above 1080p, `scan.py --json` also reports what the file would
+save with the 1080p downscale on (`estimated_saved_pct_1080`,
+`estimated_saved_mb_1080`; null otherwise). It follows the encoder's own
+budget: the source bitrate scaled by the short-side ratio, never above the
+ladder's best rung. The app's options page switches to these numbers when the
+downscale is turned on.
 
 This heuristic is kept in sync with a matching implementation used elsewhere
 by a shared test fixture, `savings_parity.json` — a fixed set of
