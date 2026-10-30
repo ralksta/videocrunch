@@ -29,6 +29,7 @@ swiftc -parse-as-library \
     "$MACOS_DIR/Sources/Models.swift" \
     "$MACOS_DIR/Sources/WizardViewModel.swift" \
     "$MACOS_DIR/Sources/WizardView.swift" \
+    "$MACOS_DIR/Sources/DockAndNotifications.swift" \
     "$MACOS_DIR/Sources/main.swift" \
     -o "$MACOS_DIR/VideoCrunch.app/Contents/MacOS/VideoCrunch"
 

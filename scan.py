@@ -643,6 +643,20 @@ def batch_runtime_sec(entries: list, records: list) -> float | None:
     return total if entries else None
 
 
+def add_runtime_estimates(result: dict, records: list, workers: int) -> dict:
+    """Add each candidate's expected encode time and the batch's parallelism.
+
+    For the app's "dauert ca. …": per file, so the estimate follows the
+    selection; None where the file's resolution class has no history.
+    """
+    for candidate in result["results"]:
+        throughput = history_throughput(records, height=candidate.get("height") or 0)
+        candidate["estimated_runtime_sec"] = estimate_runtime_sec(
+            candidate.get("size_mb") or 0.0, throughput)
+    result["summary"]["parallel_workers"] = workers
+    return result
+
+
 def retry_paths(results: list) -> list:
     """Sources worth re-running with a lower floor.
 
@@ -790,6 +804,9 @@ def main() -> int:
     summary = result['summary']
 
     if args.json:
+        from encoders import get_optimal_workers
+        add_runtime_estimates(result, read_encode_history(),
+                              get_optimal_workers(log_fn=lambda _msg: None))
         print(json.dumps(result))
         return 0
 

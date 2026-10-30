@@ -234,7 +234,9 @@ save with the 1080p downscale on (`estimated_saved_pct_1080`,
 `estimated_saved_mb_1080`; null otherwise). It follows the encoder's own
 budget: the source bitrate scaled by the short-side ratio, never above the
 ladder's best rung. The app's options page switches to these numbers when the
-downscale is turned on.
+downscale is turned on. Each candidate also carries `estimated_runtime_sec` (from
+past encodes of its resolution class, null without them), and the summary
+`parallel_workers`.
 
 This heuristic is kept in sync with a matching implementation used elsewhere
 by a shared test fixture, `savings_parity.json` — a fixed set of
@@ -264,7 +266,12 @@ the Programme folder into the Dock to keep it there. Ways in:
 
 There is one window. What is opened while it holds a selection is added to
 it; what arrives during an encode is set aside and offered when the run is
-done. Run the installer while the app is closed — it refuses otherwise,
+done. While it encodes, the Dock icon carries a progress bar and the
+window says how much time is left; before the start, the options page says
+how long the selection should take (from past encodes of the same resolution,
+shown only when every selected file has that history). A run that finishes
+while the app is in the background ends with a macOS notification with *Im
+Finder zeigen*. Run the installer while the app is closed — it refuses otherwise,
 rather than cutting off an encode.
 
 The app walks through the same steps as the command-line wizard: **Scan**

@@ -338,6 +338,12 @@ struct WizardView: View {
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                         .monospacedDigit()
+                    if let runtime = vm.selectedRuntimeSec {
+                        Label("Dauert \(formatDuration(runtime))", systemImage: "clock")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .help("Aus der Dauer früherer Encodes in derselben Auflösung")
+                    }
                 }
                 Spacer()
                 VStack(alignment: .trailing, spacing: 2) {
@@ -433,12 +439,8 @@ struct WizardView: View {
 
     /// Whole-batch progress: finished files plus the running files' share.
     private var overallProgress: some View {
-        let total = max(vm.totalToEncode, 1)
         let finished = vm.completedCount + vm.failedCount
-        let running = vm.workers.values
-            .filter { $0.status == "running" }
-            .reduce(0.0) { $0 + Double($1.progress) / 100 }
-        let fraction = min(1, (Double(finished) + running) / Double(total))
+        let fraction = vm.overallFraction
         let runningCount = vm.workers.values.filter { $0.status == "running" }.count
         return VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .firstTextBaseline) {
@@ -450,7 +452,8 @@ struct WizardView: View {
                     if let start = vm.encodeStartedAt {
                         TimelineView(.periodic(from: start, by: 1)) { context in
                             Text((runningCount > 1 ? "\(runningCount) parallel · " : "")
-                                 + "läuft seit \(elapsedString(from: start, to: context.date))")
+                                 + "läuft seit \(elapsedString(from: start, to: context.date))"
+                                 + (vm.remainingSeconds(at: context.date).map { " · noch \(formatDuration($0))" } ?? ""))
                                 .font(.subheadline)
                                 .foregroundStyle(.secondary)
                                 .monospacedDigit()

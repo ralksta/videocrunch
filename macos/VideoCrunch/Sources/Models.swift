@@ -16,6 +16,8 @@ struct Candidate: Identifiable, Codable, Hashable {
     /// Same file with the 1080p downscale on; nil when it is already 1080p.
     let estimated_saved_mb_1080: Double?
     let estimated_saved_pct_1080: Double?
+    /// Encode time from past runs of this resolution class; nil without history.
+    let estimated_runtime_sec: Double?
     let confidence: String
     let source: String
     let reason: String
@@ -53,6 +55,7 @@ struct ScanSummary: Codable {
     let total_files: Int
     let total_estimated_saved_mb: Double
     let history_based: Int
+    let parallel_workers: Int?
 }
 
 struct ScanResponse: Codable {
