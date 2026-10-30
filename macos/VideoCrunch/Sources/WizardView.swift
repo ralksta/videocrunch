@@ -194,7 +194,8 @@ struct WizardView: View {
                 .accessibilityHidden(true)
             HStack(spacing: 8) {
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(vm.candidates.count == 1 ? "1 Kandidat" : "\(vm.candidates.count) Kandidaten")
+                    Text((vm.candidates.count == 1 ? "1 Kandidat" : "\(vm.candidates.count) Kandidaten")
+                         + " · \(vm.recommendedIds.count) empfohlen")
                         .font(.headline)
                     Text("Videos, die mindestens 10 % kleiner würden")
                         .font(.caption)
@@ -218,6 +219,9 @@ struct WizardView: View {
                 } label: {
                     Label("Hinzufügen", systemImage: "plus")
                 }
+                Button("Empfohlene") { vm.selectRecommended() }
+                    .disabled(vm.selectedIds == vm.recommendedIds)
+                    .help("Nur die Videos, bei denen sich das Encodieren voraussichtlich lohnt")
                 Button("Alle") { vm.selectAll() }
                     .disabled(vm.selectedIds.count == vm.candidates.count)
                 Button("Keine") { vm.deselectAll() }
@@ -306,11 +310,31 @@ struct WizardView: View {
 
                 OptionSection(title: "Dateien") {
                     VStack(spacing: 0) {
+                        if !vm.downscaleOnlyUnselected.isEmpty {
+                            // Left unticked because they only pay off downscaled:
+                            // offered here, where the downscale is decided.
+                            SettingRow(
+                                icon: "sparkles",
+                                tint: .indigo,
+                                title: "\(videoCount(vm.downscaleOnlyUnselected.count)) lohnt sich mit 1080p",
+                                subtitle: vm.downscaleOnlyUnselected.prefix(2).map(\.filename)
+                                    .joined(separator: ", ")
+                                    + " – ohne Verkleinern unter 20 %, darum nicht vorausgewählt."
+                            ) {
+                                Button("Mitnehmen") {
+                                    vm.takeDownscaleOnly()
+                                }
+                                .help("Auswählen und auf 1080p verkleinern")
+                            }
+                            Divider().padding(.leading, 54)
+                        }
                         if vm.hasTallCandidates {
                             SettingRow(
                                 icon: "arrow.down.right.and.arrow.up.left",
                                 tint: .blue,
-                                title: "Auf 1080p verkleinern",
+                                title: vm.selectedNeedingDownscale > 0 && !vm.scaleTo1080p
+                                    ? "Auf 1080p verkleinern – empfohlen"
+                                    : "Auf 1080p verkleinern",
                                 subtitle: "\(videoCount(vm.tallCandidatesCount)) über 1080p. Spart zusätzlich ca. \(formatMB(vm.downscaleExtraSavedMB)), Seitenverhältnis bleibt."
                             ) {
                                 Toggle("", isOn: $vm.scaleTo1080p)
@@ -994,10 +1018,18 @@ private struct CandidateRow: View {
                             Chip(text: "aus Verlauf", icon: "clock.arrow.circlepath", tint: .blue)
                         }
                     }
-                    Text(candidate.reasonDetail)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+                    if let advice = candidate.advice, !candidate.isRecommended {
+                        Label(advice, systemImage: candidate.recommended_1080 == true
+                              ? "arrow.down.right.and.arrow.up.left" : "lightbulb")
+                            .font(.caption)
+                            .foregroundStyle(candidate.recommended_1080 == true ? Color.blue : Color.secondary)
+                            .lineLimit(1)
+                    } else {
+                        Text(candidate.reasonDetail)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
                 }
                 Spacer(minLength: 12)
                 VStack(alignment: .trailing, spacing: 5) {

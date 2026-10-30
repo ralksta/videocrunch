@@ -273,6 +273,13 @@ shown only when every selected file has that history). A run that finishes
 while the app is in the background ends with a macOS notification with *Im
 Finder zeigen*.
 
+Only what is likely worth it is ticked: a file estimated under the 20 %
+savings goal would be thrown away after encoding, and a few megabytes are not
+worth the time. Unticked files say why; a file that only pays off downscaled
+to 1080p is offered on the options page (*Mitnehmen* ticks it and turns the
+downscale on). *Empfohlene* restores that selection. `scan.py --json` carries
+it as `recommended`, `recommended_1080` and `advice`.
+
 The selection list shows each video's thumbnail; the eye button or the space
 bar opens it in Quick Look. After a run, *Vergleichen* opens a window with the
 same frame of source and result behind a divider you drag — at the start,
