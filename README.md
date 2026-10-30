@@ -53,7 +53,12 @@ bash crunch.sh ~/Videos
 Point it at a folder and it scans, ranks, and lets you pick what to encode
 interactively (this is `scan.py` underneath — see below). Point it at a
 single file and it encodes that file directly (`videocrunch.py` underneath).
-Any extra flags are passed straight through:
+Any extra flags are passed straight through.
+
+It recommends what the app ticks: recommended files carry a ★ and Enter takes
+them, every other row says why it is not suggested. A file that only pays off
+at 1080p is offered after the selection, together with the downscale. Piping
+an empty line in still selects nothing.
 
 ```bash
 bash crunch.sh ~/Videos --audio-mode standard

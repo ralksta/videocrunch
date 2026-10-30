@@ -282,6 +282,44 @@ def select_candidates(text: str, names: list) -> list:
     return selected
 
 
+def resolve_selection(text: str, names: list, candidates: list,
+                      interactive: bool) -> list:
+    """The selection line, where Enter takes the recommended files.
+
+    Same ticks as the app. Only with someone at the keyboard: piping in an
+    empty line has always meant "encode nothing" and must keep meaning it.
+    """
+    if not text.strip() and interactive:
+        return [i for i, c in enumerate(candidates, start=1) if c.get("recommended")]
+    return select_candidates(text, names)
+
+
+def downscale_offer(candidates: list, picked: list) -> list:
+    """Unpicked rows that pay off only when brought down to 1080p."""
+    chosen = set(picked)
+    return [i for i, c in enumerate(candidates, start=1)
+            if c.get("recommended_1080") and i not in chosen]
+
+
+def downscale_gain_mb(entries: list) -> float:
+    """Extra megabytes the 1080p downscale is expected to save on these."""
+    return sum(max(0.0, e["estimated_saved_mb_1080"] - e["estimated_saved_mb"])
+               for e in entries if e.get("estimated_saved_mb_1080") is not None)
+
+
+def expected_saved_mb(entries: list, scale_height) -> float:
+    """What the selection should save, with the 1080p estimate where it applies."""
+    def one(e):
+        scaled = e.get("estimated_saved_mb_1080")
+        return scaled if scale_height and scaled is not None else e["estimated_saved_mb"]
+    return sum(one(e) for e in entries)
+
+
+def table_note(c: dict) -> str:
+    """The table's info column: why a file is not ticked, else where the estimate comes from."""
+    return c.get("advice") or c.get("reason") or ""
+
+
 def _parse_index(token: str, count: int) -> int:
     token = token.strip()
     if not token.isdigit():
@@ -630,9 +668,10 @@ def print_table(candidates: list[dict], root: Path, name_width: int = 46) -> Non
     for i, c in enumerate(candidates, start=1):
         name = display_name(Path(c['file_path']), root, name_width)
         conf = {"high": G, "medium": Y, "low": DIM}.get(c['confidence'], NC)
-        print(f"{CYAN}{i:>3}{NC}  {G}{format_size(c['estimated_saved_mb']):>10}{NC}  "
-              f"{c['estimated_saved_pct']:>3.0f}%  {name:<{name_width}}  "
-              f"{conf}{c['reason']}{NC}")
+        mark = f"{G}★{NC}" if c.get('recommended') else " "
+        note = f"{Y}{c['advice']}{NC}" if c.get('advice') else f"{conf}{table_note(c)}{NC}"
+        print(f"{CYAN}{i:>3}{NC}{mark} {G}{format_size(c['estimated_saved_mb']):>10}{NC}  "
+              f"{c['estimated_saved_pct']:>3.0f}%  {name:<{name_width}}  {note}")
 
 
 def retry_floor(results: list) -> float | None:
@@ -867,9 +906,17 @@ def main() -> int:
 
     shown = candidates
     names = [display_name(Path(c['file_path']), root, 999) for c in shown]
+    # Questions only make sense with someone there to answer them: piping a
+    # selection in has always started the run, and must keep doing so.
+    interactive = sys.stdin.isatty()
+    n_recommended = sum(1 for c in shown if c.get('recommended'))
+    enter = "keine"
+    if interactive and n_recommended:
+        enter = (f"die empfohlene ({G}★{NC})" if n_recommended == 1
+                 else f"die {n_recommended} empfohlenen ({G}★{NC})")
     print(f"\n{Y}Welche encodieren?{NC} z.B. {CYAN}1,3,7-10{NC} · "
           f"{CYAN}a{NC} = alle · {CYAN}a -3{NC} = alle außer 3 · "
-          f"{CYAN}Urlaub{NC} = nach Name · {CYAN}Enter{NC} = keine")
+          f"{CYAN}Urlaub{NC} = nach Name · {CYAN}Enter{NC} = {enter}")
     try:
         raw = input("  Auswahl: ")
     except (EOFError, KeyboardInterrupt):
@@ -877,17 +924,29 @@ def main() -> int:
         return 0
 
     try:
-        picked = select_candidates(raw, names)
+        picked = resolve_selection(raw, names, shown, interactive)
     except ValueError as e:
         print(f"{R}{e}{NC}")
         return 1
+
+    scale_height = None
+    offer = downscale_offer(shown, picked) if interactive else []
+    if offer:
+        extra = sum(shown[i - 1]['estimated_saved_mb_1080'] for i in offer)
+        n_label = "lohnt" if len(offer) == 1 else "lohnen"
+        print(f"\n  {len(offer)} weitere {_files(len(offer))} {n_label} sich erst "
+              f"mit 1080p (~{format_size(extra)}).")
+        if ask_yes_no("Mitnehmen und alles auf 1080p verkleinern?", default=False):
+            picked = sorted(set(picked) | set(offer))
+            scale_height = DOWNSCALE_TARGET
 
     if not picked:
         print(f"{Y}Nichts ausgewählt.{NC}")
         return 0
 
     selected = [shown[i - 1]['file_path'] for i in picked]
-    total_mb = sum(shown[i - 1]['estimated_saved_mb'] for i in picked)
+    chosen = [shown[i - 1] for i in picked]
+    total_mb = expected_saved_mb(chosen, scale_height)
     print(f"\n{G}{len(selected)} {_files(len(selected))}{NC}, erwartete Ersparnis "
           f"~{format_size(total_mb)}:")
     for i in picked:
@@ -895,11 +954,6 @@ def main() -> int:
         # different folders must not read as one entry listed twice.
         print(f"  {DIM}·{NC} {names[i - 1]}")
 
-    # Questions only make sense with someone there to answer them: piping a
-    # selection in has always started the run, and must keep doing so.
-    interactive = sys.stdin.isatty()
-    chosen = [shown[i - 1] for i in picked]
-    scale_height = None
     replace = False
 
     try:
@@ -919,15 +973,18 @@ def main() -> int:
     if interactive:
         print()
         tall = downscale_candidates(chosen)
-        if tall:
+        if tall and scale_height is None:
             n_label = "Datei ist" if tall == 1 else "Dateien sind"
+            gain = downscale_gain_mb(chosen)
+            more = f" Spart etwa {format_size(gain)} mehr." if gain >= 1 else ""
             if ask_yes_no(f"{tall} {n_label} höher als {DOWNSCALE_TARGET}p. "
-                          f"Auf {DOWNSCALE_TARGET}p verkleinern? Das spart meist am meisten.",
+                          f"Auf {DOWNSCALE_TARGET}p verkleinern?{more}",
                           default=False):
                 scale_height = DOWNSCALE_TARGET
         replace = ask_yes_no("Originale nach geprüftem Encode in den Papierkorb legen?",
                              default=False)
 
+        total_mb = expected_saved_mb(chosen, scale_height)
         runtime = batch_runtime_sec(chosen, read_encode_history())
         eta = f", geschätzt ~{format_duration(runtime)}" if runtime else ""
         if not ask_yes_no(f"Start? {len(selected)} {_files(len(selected))}, "
