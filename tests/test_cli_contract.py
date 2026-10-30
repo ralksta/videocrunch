@@ -122,6 +122,12 @@ class TestSingleFileInvocation:
             ["f.mp4", "--scale-height", "1080"]).scale_height == 1080
 
 
+class TestPreviewFlag:
+    def test_preview_dir_parses(self):
+        args = videocrunch.build_parser().parse_args(["f.mp4", "--preview", "/tmp/p"])
+        assert args.preview == "/tmp/p"
+
+
 class TestQualityFloorOverride:
     """`--min-ssim` lets a caller move the hard quality floor for one run.
 

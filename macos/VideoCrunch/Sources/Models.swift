@@ -106,6 +106,16 @@ struct DolbyVision: Codable {
     let kept_as: String?
 }
 
+/// What videocrunch.py --preview wrote to preview.json.
+struct PreviewResult: Codable {
+    let quality: Int
+    let ssim: Double
+    let meets_target: Bool
+    let saved_pct: Double
+    let source: String
+    let preview: String
+}
+
 struct BatchReport: Codable {
     let videocrunch: Int?
     let results: [BatchItemResult]?

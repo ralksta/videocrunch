@@ -488,3 +488,22 @@ class TestProgressCallback:
         seen = []
         _report_progress(lambda *a: seen.append(a), 30, 60, "encode Q=60")
         assert seen == [(30.0, 60.0, "encode Q=60")]
+
+
+class TestPreview:
+    """A short encode of the hardest part, to look at before the real run."""
+
+    def test_preview_writes_source_segment_and_encode(self, tiny_clip, tmp_path):
+        from videocrunch import ENCODER_PROFILES, make_preview
+        clip = tmp_path / "in.mp4"
+        shutil.copy(tiny_clip, clip)
+        out = tmp_path / "preview"
+        result = make_preview(clip, ENCODER_PROFILES["libx265"], out, audio_mode="standard")
+        assert Path(result["source"]).exists()
+        assert Path(result["preview"]).exists()
+        assert 0 < result["ssim"] <= 1
+        assert isinstance(result["quality"], int)
+        assert isinstance(result["meets_target"], bool)
+        assert json.loads((out / "preview.json").read_text())["preview"] == result["preview"]
+        # A preview never touches the source's folder.
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["in.mp4", "preview"]

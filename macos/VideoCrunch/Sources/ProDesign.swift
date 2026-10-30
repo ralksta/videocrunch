@@ -77,6 +77,10 @@ struct Comparison: Identifiable, Codable, Hashable {
     let encoded: URL
     /// Where the encode starts in the source (seconds) when it was trimmed.
     var offset: Double = 0
+    /// Shown instead of the file name, e.g. for a preview of a file.
+    var title: String? = nil
+    /// What was measured, shown under the title.
+    var note: String? = nil
     var id: String { encoded.path }
 }
 
@@ -104,9 +108,9 @@ struct ComparisonSheet: View {
         VStack(spacing: 0) {
             HStack(spacing: 12) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(comparison.source.lastPathComponent)
+                    Text(comparison.title ?? comparison.source.lastPathComponent)
                         .font(.headline)
-                    Text("Links das Original, rechts das Ergebnis – Trennlinie ziehen")
+                    Text(comparison.note ?? "Links das Original, rechts das Ergebnis – Trennlinie ziehen")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

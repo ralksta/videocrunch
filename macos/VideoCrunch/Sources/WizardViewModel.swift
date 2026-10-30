@@ -216,7 +216,11 @@ class WizardViewModel: ObservableObject {
         } else {
             candidates = response.results
             scanSummary = response.summary
-            selectedIds = Set(response.results.filter(\.isRecommended).map(\.id))
+            // A single video opened on its own is meant to be worked on, even
+            // where the recommendation would leave it unticked.
+            selectedIds = response.results.count == 1
+                ? Set(response.results.map(\.id))
+                : Set(response.results.filter(\.isRecommended).map(\.id))
             currentStep = .candidateSelection
         }
         let backlog = scanBacklog
@@ -285,7 +289,8 @@ class WizardViewModel: ObservableObject {
     }
 
     var isTrimmed: Bool {
-        guard let c = trimTarget, let duration = c.duration_sec else { return false }
+        // Only once the options page has set the range up for this video.
+        guard let c = trimTarget, c.id == trimId, let duration = c.duration_sec else { return false }
         return trimStart > 0.05 || trimEnd < duration - 0.05
     }
 
@@ -640,6 +645,66 @@ class WizardViewModel: ObservableObject {
     /// Colours and cursor moves (batch.py redraws its table in place).
     nonisolated static func stripANSI(_ text: String) -> String {
         text.replacingOccurrences(of: "\u{1B}\\[[0-9;]*[A-Za-z]", with: "", options: .regularExpression)
+    }
+
+    // MARK: - Preview
+
+    /// The file a preview is being made for, while it runs.
+    @Published var previewingId: String?
+    @Published var previewError: String?
+
+    /// Encodes the hardest few seconds of `candidate` with the current
+    /// settings (videocrunch.py --preview) and hands back what to compare.
+    func makePreview(for candidate: Candidate, completion: @escaping (Comparison) -> Void) {
+        guard previewingId == nil else { return }
+        previewingId = candidate.id
+        previewError = nil
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("videocrunch-preview-\(UUID().uuidString)")
+        var args = [scriptDir.appendingPathComponent("videocrunch.py").path, candidate.file_path,
+                    "--preview", dir.path, "--audio-mode", audioMode, "--codec", targetCodec]
+        if scaleTo1080p && candidate.canDownscale {
+            args += ["--scale-height", "1080"]
+        }
+        if isTrimmed, candidate.id == trimTarget?.id {
+            args += ["--ss", String(format: "%.3f", trimStart), "--to", String(format: "%.3f", trimEnd)]
+        }
+        if let floor = minSSIMOverride {
+            args += ["--min-ssim", String(floor)]
+        }
+        let python = resolvePythonPath()
+        let name = candidate.filename
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: python)
+            proc.arguments = args
+            proc.environment = WizardViewModel.toolEnvironment()
+            proc.standardOutput = FileHandle.nullDevice
+            proc.standardError = FileHandle.nullDevice
+            var result: PreviewResult?
+            if (try? proc.run()) != nil {
+                proc.waitUntilExit()
+                if let data = try? Data(contentsOf: dir.appendingPathComponent("preview.json")) {
+                    result = try? JSONDecoder().decode(PreviewResult.self, from: data)
+                }
+            }
+            DispatchQueue.main.async {
+                self.previewingId = nil
+                guard let result else {
+                    self.previewError = "Vorschau für \(name) ging nicht."
+                    return
+                }
+                let verdict = result.meets_target ? "erfüllt das Qualitätsziel"
+                                                  : "unter dem Qualitätsziel"
+                completion(Comparison(
+                    source: URL(fileURLWithPath: result.source),
+                    encoded: URL(fileURLWithPath: result.preview),
+                    title: "Vorschau: \(name)",
+                    note: String(format: "Schwierigste Stelle · Q %d · SSIM %.3f · %@ · ca. −%.0f %%",
+                                 result.quality, result.ssim, verdict, result.saved_pct)))
+            }
+        }
     }
 
     func resolvePythonPath() -> String {

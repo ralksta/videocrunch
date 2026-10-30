@@ -1221,6 +1221,77 @@ def estimate_optimal_q(input_path, profile, quality_values, bitrate_values,
             except OSError:
                 pass
 
+# Length of the preview segment: long enough to judge motion, short enough
+# that the preview is ready in seconds.
+PREVIEW_SEGMENT_SEC = 6.0
+
+
+def make_preview(input_path, profile, out_dir, audio_mode='enhanced', ss=None, to=None,
+                 scale_height=None, min_ssim=None) -> Optional[dict]:
+    """Encode the hardest few seconds the way the real run would, to look at first.
+
+    Takes the file's top bitrate hotspot, finds the quality level on it with
+    the same ladder and the same quality target as the full search, and
+    writes the untouched segment (source.mp4) and its encode (preview.mp4)
+    to `out_dir`, plus preview.json. Nothing is written next to the source.
+    Returns the result, or None when the file cannot be previewed.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    plan = prepare_encode(Path(input_path), profile, copy_audio=True, audio_mode=audio_mode,
+                          ss=ss, to=to, scale_height=scale_height, force=True, min_ssim=min_ssim)
+    if plan is None:
+        return None
+    start = plan.start_offset + (plan.sample_starts[0] if plan.sample_starts else 0.0)
+    # The full search aims at MIN_QUALITY; an explicit --min-ssim replaces it.
+    target = min_ssim or MIN_QUALITY
+    quality = estimate_optimal_q(
+        input_path, plan.profile, plan.quality_values, plan.bitrate_values, [start],
+        audio_mode, out_dir, scale_height=plan.scale_height,
+        source_avg_kbps=plan.source_avg_kbps, maxrate_kbps=plan.maxrate_kbps,
+        bufsize_kbps=plan.bufsize_kbps, min_ssim=target)
+    if quality is None:
+        quality = plan.quality_values[0]  # nothing passed: show the best rung
+
+    segment = extract_probe_clip(input_path, [start], PREVIEW_SEGMENT_SEC, out_dir)
+    if segment is None:
+        return None
+    source = out_dir / "source.mp4"
+    segment.replace(source)
+    for leftover in out_dir.glob("_probe*"):
+        leftover.unlink()
+
+    idx = nearest_quality_index(plan.quality_values, quality)
+    target_kbps = plan.bitrate_values[idx] if plan.bitrate_values else None
+    pass_maxrate, pass_bufsize = clamp_maxrate_to_pass(plan.maxrate_kbps, plan.bufsize_kbps,
+                                                       target_kbps)
+    preview = out_dir / "preview.mp4"
+    cmd = build_ffmpeg_command(source, preview, plan.profile, quality, True, audio_mode,
+                               video_mode='compress', maxrate_kbps=pass_maxrate,
+                               bufsize_kbps=pass_bufsize, target_bitrate_kbps=target_kbps,
+                               color_args=plan.profile.get('color_args'),
+                               scale_height=plan.scale_height)
+    if subprocess.run(cmd, capture_output=True).returncode != 0 or not preview.exists():
+        return None
+    seg_info = get_video_info(source) or {}
+    seg_duration = max(0.5, (seg_info.get('duration') or PREVIEW_SEGMENT_SEC) - 0.2)
+    ssim = get_multi_ssim(source, preview, [0.0], [0.0], seg_duration,
+                          ref_size=probe_ref_size(preview) if plan.scale_height else None)
+    result = {
+        'quality': int(quality),
+        'ssim': round(ssim, 4),
+        'meets_target': ssim >= target,
+        'target': target,
+        'saved_pct': round(100 - preview.stat().st_size * 100 / max(source.stat().st_size, 1), 1),
+        'start': round(start, 3),
+        'source': str(source.resolve()),
+        'preview': str(preview.resolve()),
+    }
+    (out_dir / "preview.json").write_text(json.dumps(result, indent=2), encoding='utf-8')
+    print(f"{G}Preview:{NC} Q={quality} | SSIM {ssim:.4f} | {result['preview']}")
+    return result
+
+
 def should_replace(replace: bool, video_mode: str, is_trim: bool) -> bool:
     """Whether this run may put its result in the source's place.
 
@@ -2744,6 +2815,10 @@ def build_parser():
                         help='Copy audio without re-encoding (faster, preserves original audio)')
     parser.add_argument('--audio-mode', choices=['enhanced', 'moderate', 'standard'], default='moderate',
                         help='Audio processing mode: moderate (default, -19 LUFS), enhanced (-16 LUFS), standard (no normalization)')
+    parser.add_argument('--preview', metavar='DIR',
+                        help='Encode only a short segment of the hardest part, the way the '
+                             'full run would, into DIR (source.mp4, preview.mp4, '
+                             'preview.json) — to look at before committing to the run')
     parser.add_argument('--ss', type=str, help='Start time (e.g. 00:00:10 or 10)')
     parser.add_argument('--to', type=str, help='End time (e.g. 00:00:20 or 20)')
     parser.add_argument('--video-mode', choices=['compress', 'copy'], default='compress',
@@ -2857,6 +2932,12 @@ def main():
 
     # Filter out flags from files
     files = [f for f in files if not f.startswith('-')]
+
+    if args.preview:
+        ok = all(make_preview(f, profile, args.preview, audio_mode=args.audio_mode, ss=args.ss,
+                              to=args.to, scale_height=args.scale_height,
+                              min_ssim=args.min_ssim) for f in files[:1])
+        sys.exit(0 if ok and files else 1)
 
     run_results: list = []
     for f in files:

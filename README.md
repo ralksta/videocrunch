@@ -280,6 +280,13 @@ to 1080p is offered on the options page (*Mitnehmen* ticks it and turns the
 downscale on). *Empfohlene* restores that selection. `scan.py --json` carries
 it as `recommended`, `recommended_1080` and `advice`.
 
+*Vorschau ansehen* on the options page encodes the hardest few seconds of a
+video (its top bitrate hotspot, within the trim) with the current settings —
+same ladder, same quality target as the full run — and opens it in the
+comparison window, so the result can be judged before an hour of encoding.
+On the command line: `videocrunch.py FILE --preview DIR` writes `source.mp4`,
+`preview.mp4` and `preview.json` there and nothing next to the source.
+
 With a single video selected, the options page offers *Kürzen*: a preview,
 a filmstrip and two handles to cut the start and end before encoding (the
 original always stays; the savings estimate follows the cut). `batch.py`

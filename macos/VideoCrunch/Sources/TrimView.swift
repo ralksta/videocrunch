@@ -15,7 +15,7 @@ struct TrimEditor: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             if let player {
-                VideoPlayer(player: player)
+                PlayerView(player: player)
                     .frame(height: 220)
                     .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
             }
@@ -56,6 +56,24 @@ struct TrimEditor: View {
                 .monospacedDigit()
         }
         .font(.caption)
+    }
+}
+
+/// AppKit's player view (the one QuickTime uses). SwiftUI's VideoPlayer
+/// aborted while being created on this system, before any video loaded.
+private struct PlayerView: NSViewRepresentable {
+    let player: AVPlayer
+
+    func makeNSView(context: Context) -> AVPlayerView {
+        let view = AVPlayerView()
+        view.player = player
+        view.controlsStyle = .inline
+        view.videoGravity = .resizeAspect
+        return view
+    }
+
+    func updateNSView(_ view: AVPlayerView, context: Context) {
+        view.player = player
     }
 }
 
