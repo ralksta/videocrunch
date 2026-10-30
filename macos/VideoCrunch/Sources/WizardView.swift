@@ -1148,7 +1148,17 @@ private struct WorkerRow: View {
         case "failed": return ("xmark.circle.fill", .red, "Fehlgeschlagen")
         case "skipped": return ("forward.circle.fill", .secondary, "Übersprungen")
         case "cancelled": return ("stop.circle.fill", .orange, "Abgebrochen")
-        default: return ("film", .accentColor, "\(worker.progress) %")
+        default: return ("film", .accentColor, "\(Int(worker.fileFraction * 100)) %")
+        }
+    }
+
+    /// What the running encode is doing right now.
+    private var step: String? {
+        guard worker.status == "running" else { return nil }
+        switch worker.phase {
+        case "encode": return "Durchgang \(worker.pass) · encodiert \(worker.progress) %"
+        case "check": return "Durchgang \(worker.pass) · prüft Qualität"
+        default: return "Analysiert …"
         }
     }
 
@@ -1171,8 +1181,14 @@ private struct WorkerRow: View {
                     .foregroundStyle(worker.status == "running" ? Color.primary : look.tint)
                     .monospacedDigit()
             }
-            ProgressView(value: Double(worker.progress), total: 100)
+            ProgressView(value: worker.fileFraction)
                 .tint(look.tint)
+            if let step {
+                Text(step)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
         }
         .padding(12)
         .cardBackground()
