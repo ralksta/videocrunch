@@ -286,7 +286,10 @@ same frame of source and result behind a divider you drag — at the start,
 middle or end of the clip, fitted or at 100 % — so the result is judged by
 eye, not only by its SSIM. (It needs the original, so it is not offered when
 originals went to the trash.) *Neue Videos …* goes back to the start; ⌘Q
-quits. Run the installer while the app is closed — it refuses otherwise,
+quits. Back (⌘[), the current step and *Hinzufügen* sit in the title bar;
+the bar at the bottom always shows what the selection will come to — size,
+saving and, where history allows, how long it takes — next to the button that
+starts it. Run the installer while the app is closed — it refuses otherwise,
 rather than cutting off an encode.
 
 The app walks through the same steps as the command-line wizard: **Scan**
