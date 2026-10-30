@@ -568,6 +568,13 @@ class TestBatchCarriesLosses:
         assert result["dropped"] == ["3 data tracks (mebx): metadata mp4 cannot hold"]
         assert result["dolby_vision"] == {"profile": "8.4", "kept_as": "HLG"}
 
+    def test_output_path_reaches_the_report(self):
+        # The app's before/after comparison opens the encode next to its source.
+        result = {"status": "failed"}
+        batch.merge_worker_result(result, {"status": "success",
+                                           "output_path": "/v/clip_opt.mp4"})
+        assert result["output_path"] == "/v/clip_opt.mp4"
+
 
 class TestBatchQualityFloorForwarding:
     """`batch.py --min-ssim=…` must reach every per-file `videocrunch.py` call.

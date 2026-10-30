@@ -1,3 +1,4 @@
+import QuickLook
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -26,6 +27,8 @@ struct WizardView: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .transition(.opacity)
+            .animation(.easeInOut(duration: 0.2), value: vm.currentStep)
 
             Divider()
             // Bottom Action Bar
@@ -173,8 +176,22 @@ struct WizardView: View {
     }
 
     // MARK: - Step 2: Selection
+    @State private var previewURL: URL?
+    @State private var hoveredCandidate: String?
+
+    /// Space previews the row under the pointer, as in Finder.
+    private func previewHovered() {
+        guard let id = hoveredCandidate ?? vm.candidates.first?.id else { return }
+        previewURL = previewURL == nil ? URL(fileURLWithPath: id) : nil
+    }
+
     private var selectionView: some View {
         VStack(spacing: 0) {
+            Button("Vorschau", action: previewHovered)
+                .keyboardShortcut(.space, modifiers: [])
+                .frame(width: 0, height: 0)
+                .opacity(0)
+                .accessibilityHidden(true)
             HStack(spacing: 8) {
                 VStack(alignment: .leading, spacing: 1) {
                     Text(vm.candidates.count == 1 ? "1 Kandidat" : "\(vm.candidates.count) Kandidaten")
@@ -222,9 +239,10 @@ struct WizardView: View {
                 ScrollView {
                     LazyVStack(spacing: 8) {
                         ForEach(vm.candidates) { c in
-                            CandidateRow(candidate: c, selected: vm.selectedIds.contains(c.id)) {
-                                vm.toggleSelection(for: c.id)
-                            }
+                            CandidateRow(candidate: c, selected: vm.selectedIds.contains(c.id),
+                                         toggle: { vm.toggleSelection(for: c.id) },
+                                         preview: { previewURL = URL(fileURLWithPath: c.file_path) },
+                                         hover: { inside in hoveredCandidate = inside ? c.id : nil })
                         }
                     }
                     .frame(maxWidth: 760)
@@ -234,6 +252,7 @@ struct WizardView: View {
                 }
             }
         }
+        .quickLookPreview($previewURL)
     }
 
     // MARK: - Step 3: Options View
@@ -349,7 +368,7 @@ struct WizardView: View {
                 VStack(alignment: .trailing, spacing: 2) {
                     Text("−\(formatMB(saved))")
                         .font(.system(size: 26, weight: .bold, design: .rounded))
-                        .foregroundStyle(.green)
+                        .foregroundStyle(Color.savings)
                         .monospacedDigit()
                     Text(before > 0 ? "ca. \(Int((1 - fraction) * 100)) % kleiner" : "geschätzt")
                         .font(.caption)
@@ -467,7 +486,7 @@ struct WizardView: View {
             }
             ProgressView(value: fraction)
             HStack(spacing: 8) {
-                Chip(text: "\(vm.completedCount) fertig", icon: "checkmark.circle.fill", tint: .green)
+                Chip(text: "\(vm.completedCount) fertig", icon: "checkmark.circle.fill", tint: .savings)
                 if vm.failedCount > 0 {
                     Chip(text: "\(vm.failedCount) fehlgeschlagen", icon: "xmark.circle.fill", tint: .red)
                 }
@@ -483,6 +502,18 @@ struct WizardView: View {
     }
 
     // MARK: - Step 5: Completed
+    @Environment(\.openWindow) private var openWindow
+
+    /// Source and encode of a finished file, if both are still there to look
+    /// at (with "Originale in den Papierkorb" the source is gone).
+    private func comparison(for result: BatchItemResult) -> Comparison? {
+        guard result.status == "success", let source = result.path,
+              let encoded = result.output_path, source != encoded,
+              FileManager.default.fileExists(atPath: source),
+              FileManager.default.fileExists(atPath: encoded) else { return nil }
+        return Comparison(source: URL(fileURLWithPath: source), encoded: URL(fileURLWithPath: encoded))
+    }
+
     private var completedView: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
@@ -494,7 +525,7 @@ struct WizardView: View {
                 }
 
                 HStack(spacing: 12) {
-                    StatTile(title: "Gespart", value: formatBytes(vm.actualSavedBytes), tint: .green)
+                    StatTile(title: "Gespart", value: formatBytes(vm.actualSavedBytes), tint: .savings)
                     StatTile(title: "Optimiert", value: "\(vm.completedCount) von \(vm.totalToEncode)", tint: .primary)
                     if vm.wasCancelled {
                         StatTile(title: "Abgebrochen", value: "\(vm.cancelledCount)", tint: .orange)
@@ -538,7 +569,9 @@ struct WizardView: View {
                         VStack(spacing: 0) {
                             ForEach(Array(vm.batchResults.enumerated()), id: \.offset) { index, r in
                                 if index > 0 { Divider().padding(.leading, 46) }
-                                ResultRow(result: r)
+                                ResultRow(result: r, compare: comparison(for: r).map { item in
+                                    { openWindow(value: item) }
+                                })
                             }
                         }
                         .cardBackground()
@@ -655,8 +688,12 @@ struct WizardView: View {
                 .controlSize(.large)
                 .keyboardShortcut(.defaultAction)
             } else if vm.currentStep == .completed {
-                Button("Schließen") {
-                    NSApplication.shared.terminate(nil)
+                // Back to the start rather than quitting: the app lives in
+                // the Dock now, and ⌘Q is there for leaving.
+                Button {
+                    vm.startOver()
+                } label: {
+                    Label("Neue Videos …", systemImage: "plus")
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
@@ -898,13 +935,52 @@ private struct CandidateRow: View {
     let candidate: Candidate
     let selected: Bool
     let toggle: () -> Void
+    let preview: () -> Void
+    let hover: (Bool) -> Void
+    @State private var hovering = false
 
     var body: some View {
-        Button(action: toggle) {
+        HStack(spacing: 0) {
+            Button(action: toggle) {
+                content
+            }
+            .buttonStyle(.plain)
+            .accessibilityAddTraits(selected ? .isSelected : [])
+
+            Button(action: preview) {
+                Image(systemName: "eye")
+                    .font(.body)
+                    .frame(width: 30, height: 30)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(hovering ? Color.accentColor : Color.secondary.opacity(0.6))
+            .help("Vorschau (Leertaste)")
+            .accessibilityLabel("Vorschau von \(candidate.filename)")
+            .padding(.trailing, 8)
+        }
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(selected
+                      ? Color.accentColor.opacity(0.08)
+                      : Color(nsColor: .controlBackgroundColor).opacity(0.55))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(selected ? Color.accentColor.opacity(0.6) : Color(nsColor: .separatorColor))
+        )
+        .onHover { inside in
+            hovering = inside
+            hover(inside)
+        }
+    }
+
+    private var content: some View {
             HStack(spacing: 14) {
                 Image(systemName: selected ? "checkmark.circle.fill" : "circle")
                     .font(.title3)
                     .foregroundStyle(selected ? Color.accentColor : Color.secondary.opacity(0.5))
+                VideoThumbnail(url: URL(fileURLWithPath: candidate.file_path))
                 VStack(alignment: .leading, spacing: 5) {
                     Text(candidate.filename)
                         .fontWeight(.medium)
@@ -927,7 +1003,7 @@ private struct CandidateRow: View {
                 VStack(alignment: .trailing, spacing: 5) {
                     Text("−\(candidate.savedFormatted)")
                         .font(.system(.headline, design: .rounded))
-                        .foregroundStyle(.green)
+                        .foregroundStyle(Color.savings)
                         .monospacedDigit()
                     SavingsBar(fraction: candidate.estimated_saved_pct / 100)
                         .frame(width: 90, height: 5)
@@ -944,20 +1020,7 @@ private struct CandidateRow: View {
                 }
             }
             .padding(12)
-            .background(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(selected
-                          ? Color.accentColor.opacity(0.08)
-                          : Color(nsColor: .controlBackgroundColor).opacity(0.55))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .strokeBorder(selected ? Color.accentColor.opacity(0.6) : Color(nsColor: .separatorColor))
-            )
-            .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-        }
-        .buttonStyle(.plain)
-        .accessibilityAddTraits(selected ? .isSelected : [])
+            .contentShape(Rectangle())
     }
 }
 
@@ -1029,6 +1092,8 @@ private struct StatTile: View {
 /// One file's outcome from batch.py's report.
 private struct ResultRow: View {
     let result: BatchItemResult
+    /// Opens the before/after comparison; nil when there is nothing to compare.
+    var compare: (() -> Void)? = nil
 
     private var look: (icon: String, tint: Color) {
         switch result.status {
@@ -1074,10 +1139,17 @@ private struct ResultRow: View {
                 }
             }
             Spacer(minLength: 12)
+            if let compare {
+                Button(action: compare) {
+                    Label("Vergleichen", systemImage: "rectangle.split.2x1")
+                }
+                .controlSize(.small)
+                .help("Original und Ergebnis nebeneinander ansehen")
+            }
             if result.status == "success", let bytes = result.saved_bytes {
                 Text("−\(formatBytes(bytes))")
                     .font(.system(.callout, design: .rounded).weight(.semibold))
-                    .foregroundStyle(.green)
+                    .foregroundStyle(Color.savings)
                     .monospacedDigit()
             }
         }
