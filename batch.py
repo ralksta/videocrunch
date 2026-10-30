@@ -201,7 +201,7 @@ def merge_worker_result(result: dict, data: dict | None) -> bool:
 
 
 def build_optimizer_command(file_path, port, audio_mode, min_ssim=None, json_out=None,
-                            scale_height=None, replace=False, codec=None):
+                            scale_height=None, replace=False, codec=None, ss=None, to=None):
     """The per-file `videocrunch.py` invocation — see tests/test_cli_contract.py.
 
     Every batch-level option a caller sets has to appear here; anything the
@@ -226,6 +226,10 @@ def build_optimizer_command(file_path, port, audio_mode, min_ssim=None, json_out
         cmd.append("--replace")
     if codec:
         cmd.extend(["--codec", codec])
+    if ss:
+        cmd.extend(["--ss", str(ss)])
+    if to:
+        cmd.extend(["--to", str(to)])
     return cmd
 
 
@@ -266,7 +270,7 @@ def abort_workers(signum=None, frame=None):
 
 def run_optimizer(args_tuple):
     """Worker function - captures output and updates shared state. Returns detailed results for logging."""
-    file_path, port, audio_mode, min_ssim, scale_height, replace, codec, worker_id = args_tuple
+    file_path, port, audio_mode, min_ssim, scale_height, replace, codec, ss, to, worker_id = args_tuple
 
     filename = Path(file_path).name
     file_start = time.time()
@@ -291,7 +295,7 @@ def run_optimizer(args_tuple):
     result_file = Path(tempfile.gettempdir()) / f"videocrunch_w{worker_id}_{os.getpid()}.json"
     cmd = build_optimizer_command(file_path, port, audio_mode, min_ssim,
                                   json_out=result_file, scale_height=scale_height,
-                                  replace=replace, codec=codec)
+                                  replace=replace, codec=codec, ss=ss, to=to)
 
     try:
         process = start_worker(cmd)
@@ -511,6 +515,10 @@ def build_parser():
                         help='Downscale every file to H pixels height (forwarded per file)')
     parser.add_argument('--codec', choices=['hevc', 'av1'], default='hevc',
                         help='Target codec, forwarded per file (default: hevc)')
+    parser.add_argument('--ss', metavar='TIME',
+                        help='Start time, forwarded per file (the app trims a single video)')
+    parser.add_argument('--to', metavar='TIME',
+                        help='End time, forwarded per file')
     parser.add_argument('--replace', action='store_true',
                         help='Replace each source with its encode (original to the trash)')
     parser.add_argument('--min-ssim', type=quality_floor, metavar='S',
@@ -557,7 +565,7 @@ def main():
 
     # Prepare work items
     work_items = [(f, args.port, args.audio_mode, args.min_ssim, args.scale_height,
-                   args.replace, args.codec, (i % max_workers) + 1)
+                   args.replace, args.codec, args.ss, args.to, (i % max_workers) + 1)
                   for i, f in enumerate(files)]
 
     # Process files

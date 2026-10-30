@@ -280,6 +280,11 @@ to 1080p is offered on the options page (*Mitnehmen* ticks it and turns the
 downscale on). *Empfohlene* restores that selection. `scan.py --json` carries
 it as `recommended`, `recommended_1080` and `advice`.
 
+With a single video selected, the options page offers *Kürzen*: a preview,
+a filmstrip and two handles to cut the start and end before encoding (the
+original always stays; the savings estimate follows the cut). `batch.py`
+forwards `--ss`/`--to` per file for this.
+
 The selection list shows each video's thumbnail; the eye button or the space
 bar opens it in Quick Look. After a run, *Vergleichen* opens a window with the
 same frame of source and result behind a divider you drag — at the start,

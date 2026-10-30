@@ -11,6 +11,7 @@ struct Candidate: Identifiable, Codable, Hashable {
     let width: Int
     let height: Int
     let bitrate_mbps: Double
+    let duration_sec: Double?
     let estimated_saved_mb: Double
     let estimated_saved_pct: Double
     /// Same file with the 1080p downscale on; nil when it is already 1080p.

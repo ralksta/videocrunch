@@ -611,6 +611,17 @@ class TestBatchQualityFloorForwarding:
                                             scale_height=1080)
         assert cmd[cmd.index("--scale-height") + 1] == "1080"
 
+    def test_trim_reaches_the_per_file_command(self):
+        # The app trims a single video before encoding it.
+        cmd = batch.build_optimizer_command("/a.mp4", port=None, audio_mode="standard",
+                                            ss="3.5", to="42")
+        assert cmd[cmd.index("--ss") + 1] == "3.5"
+        assert cmd[cmd.index("--to") + 1] == "42"
+
+    def test_trim_parses(self):
+        args = batch.build_parser().parse_args(["--files=/a.mp4", "--ss=3.5", "--to=42"])
+        assert (args.ss, args.to) == ("3.5", "42")
+
     def test_codec_reaches_the_per_file_command(self):
         # The wizard offers AV1; without forwarding every file was HEVC anyway.
         cmd = batch.build_optimizer_command("/a.mp4", port=None, audio_mode="standard",
