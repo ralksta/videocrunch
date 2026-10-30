@@ -439,6 +439,23 @@ class TestJsonOutput:
         assert ANSI_ESCAPE_RE.search(text) is None
 
 
+class TestRuntimeInJson:
+    """The app shows "dauert ca. …" before the start, from what past runs took."""
+
+    RECORDS = [{"height": 1080, "size_mb": 100.0, "duration": 50.0}] * 3  # 2 MB/s at 1080p
+
+    def test_each_candidate_gets_its_own_estimate(self):
+        from scan import add_runtime_estimates
+        result = {"summary": {}, "results": [
+            {"file_path": "/a.mov", "height": 1080, "size_mb": 60.0},
+            {"file_path": "/b.mov", "height": 2160, "size_mb": 60.0},  # no 4K history
+        ]}
+        add_runtime_estimates(result, self.RECORDS, workers=4)
+        assert result["results"][0]["estimated_runtime_sec"] == pytest.approx(30.0)
+        assert result["results"][1]["estimated_runtime_sec"] is None
+        assert result["summary"]["parallel_workers"] == 4
+
+
 class TestSeveralPaths:
     """The app hands over everything dropped or picked at once, in one window."""
 

@@ -218,6 +218,37 @@ class WizardViewModel: ObservableObject {
         scanBacklog = []
     }
 
+    /// Whole-batch progress: finished files plus the running files' share.
+    var overallFraction: Double {
+        let total = max(totalToEncode, 1)
+        let finished = completedCount + failedCount
+        let running = workers.values
+            .filter { $0.status == "running" }
+            .reduce(0.0) { $0 + Double($1.progress) / 100 }
+        return min(1, (Double(finished) + running) / Double(total))
+    }
+
+    /// Time left, extrapolated from the time spent so far. Nil until there
+    /// is enough progress for the number to mean something.
+    func remainingSeconds(at now: Date) -> Double? {
+        guard let start = encodeStartedAt, isEncoding else { return nil }
+        let elapsed = now.timeIntervalSince(start)
+        let fraction = overallFraction
+        guard elapsed > 10, fraction > 0.05 else { return nil }
+        return elapsed * (1 - fraction) / fraction
+    }
+
+    /// Expected wall time for the selection, from past runs; nil when any
+    /// selected file's class has no history (a partial number misleads).
+    var selectedRuntimeSec: Double? {
+        let selection = selectedCandidates
+        guard !selection.isEmpty else { return nil }
+        let times = selection.compactMap(\.estimated_runtime_sec)
+        guard times.count == selection.count else { return nil }
+        let parallel = Double(min(max(scanSummary?.parallel_workers ?? 1, 1), selection.count))
+        return max(times.max() ?? 0, times.reduce(0, +) / parallel)
+    }
+
     var selectedCandidates: [Candidate] {
         candidates.filter { selectedIds.contains($0.id) }
     }
@@ -298,6 +329,7 @@ class WizardViewModel: ObservableObject {
         totalToEncode = selectedIds.count
         wasCancelled = false
         encodeStartedAt = Date()
+        DockProgress.show(0)
         batchResults = []
         suggestedFloor = nil
         retryEligibleCandidates = []
@@ -406,6 +438,7 @@ class WizardViewModel: ObservableObject {
     }
 
     private func parseBatchOutput(_ lines: [String]) {
+        defer { DockProgress.show(isEncoding ? overallFraction : nil) }
         for line in lines {
             logs.append(line)
             if logs.count > 100 { logs.removeFirst() }
@@ -492,9 +525,10 @@ class WizardViewModel: ObservableObject {
 
         self.currentStep = .completed
 
-        sendNotification(
-            title: wasCancelled ? "videocrunch abgebrochen" : "videocrunch fertig",
-            body: "\(completedCount) von \(totalToEncode) Videos optimiert. \(formatBytes(actualSavedBytes)) gespart."
+        DockProgress.show(nil)
+        Notifier.notify(
+            title: wasCancelled ? "VideoCrunch abgebrochen" : "VideoCrunch fertig",
+            body: "\(completedCount) von \(totalToEncode) Videos optimiert, \(formatBytes(actualSavedBytes)) gespart."
         )
     }
 
@@ -503,14 +537,6 @@ class WizardViewModel: ObservableObject {
         self.minSSIMOverride = floor
         self.selectedIds = Set(retryEligibleCandidates.map { $0.id })
         self.startEncoding()
-    }
-
-    private func sendNotification(title: String, body: String) {
-        let script = "display notification \"\(body)\" with title \"\(title)\" sound name \"Glass\""
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        proc.arguments = ["-e", script]
-        try? proc.run()
     }
 
     /// Apps started from Finder only get /usr/bin:/bin:/usr/sbin:/sbin, so the
