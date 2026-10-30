@@ -11,6 +11,7 @@ struct Candidate: Identifiable, Codable, Hashable {
     let width: Int
     let height: Int
     let bitrate_mbps: Double
+    let duration_sec: Double?
     let estimated_saved_mb: Double
     let estimated_saved_pct: Double
     /// Same file with the 1080p downscale on; nil when it is already 1080p.
@@ -103,6 +104,16 @@ struct BatchItemResult: Codable, Identifiable {
 struct DolbyVision: Codable {
     let profile: String
     let kept_as: String?
+}
+
+/// What videocrunch.py --preview wrote to preview.json.
+struct PreviewResult: Codable {
+    let quality: Int
+    let ssim: Double
+    let meets_target: Bool
+    let saved_pct: Double
+    let source: String
+    let preview: String
 }
 
 struct BatchReport: Codable {

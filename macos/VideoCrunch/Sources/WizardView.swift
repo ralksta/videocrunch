@@ -284,6 +284,15 @@ struct WizardView: View {
             VStack(alignment: .leading, spacing: 22) {
                 savingsSummary
 
+                previewCard
+
+                if let target = vm.trimTarget, let duration = target.duration_sec {
+                    OptionSection(title: "Kürzen") {
+                        TrimEditor(url: URL(fileURLWithPath: target.file_path), duration: duration,
+                                   start: $vm.trimStart, end: $vm.trimEnd)
+                    }
+                }
+
                 OptionSection(title: "Codec") {
                     HStack(spacing: 12) {
                         ChoiceCard(
@@ -364,15 +373,18 @@ struct WizardView: View {
                         }
                         SettingRow(
                             icon: "trash.fill",
-                            tint: vm.moveToTrash ? .red : .gray,
+                            tint: vm.moveToTrash && !vm.isTrimmed ? .red : .gray,
                             title: "Originale in den Papierkorb",
-                            subtitle: vm.moveToTrash
+                            subtitle: vm.isTrimmed
+                                ? "Beim Kürzen bleibt das Original immer erhalten."
+                                : vm.moveToTrash
                                 ? "Erst nach bestandenem SSIM-Qualitätscheck. Aus dem Papierkorb wiederherstellbar."
                                 : "Aus: Das Original bleibt neben der neuen _opt.mp4 liegen."
                         ) {
                             Toggle("", isOn: $vm.moveToTrash)
                                 .toggleStyle(.switch)
                                 .labelsHidden()
+                                .disabled(vm.isTrimmed)
                         }
                     }
                     .cardBackground()
@@ -383,6 +395,49 @@ struct WizardView: View {
             .padding(.vertical, 22)
             .frame(maxWidth: .infinity)
         }
+    }
+
+    /// "So wird es aussehen": a few seconds encoded with these settings,
+    /// judged by eye before the full run.
+    private var previewCard: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "eye.fill")
+                .font(.title3)
+                .foregroundStyle(Color.accentColor)
+                .frame(width: 28)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("So wird es aussehen")
+                    .fontWeight(.medium)
+                Text(vm.previewError
+                     ?? "Kodiert die schwierigste Stelle mit diesen Einstellungen – in Sekunden statt Minuten.")
+                    .font(.caption)
+                    .foregroundStyle(vm.previewError == nil ? Color.secondary : Color.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer()
+            if vm.previewingId != nil {
+                ProgressView()
+                    .controlSize(.small)
+                Text("Erstelle Vorschau …")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if vm.selectedCandidates.count == 1, let only = vm.selectedCandidates.first {
+                Button("Vorschau ansehen") {
+                    vm.makePreview(for: only) { openWindow(value: $0) }
+                }
+            } else {
+                Menu("Vorschau ansehen") {
+                    ForEach(vm.selectedCandidates) { c in
+                        Button(c.filename) {
+                            vm.makePreview(for: c) { openWindow(value: $0) }
+                        }
+                    }
+                }
+                .fixedSize()
+            }
+        }
+        .padding(14)
+        .cardBackground()
     }
 
     /// Before/after at a glance: what the selection weighs now and after.
@@ -554,7 +609,9 @@ struct WizardView: View {
               let encoded = result.output_path, source != encoded,
               FileManager.default.fileExists(atPath: source),
               FileManager.default.fileExists(atPath: encoded) else { return nil }
-        return Comparison(source: URL(fileURLWithPath: source), encoded: URL(fileURLWithPath: encoded))
+        let offset = vm.lastRunTrim.flatMap { $0.path == source ? $0.start : nil } ?? 0
+        return Comparison(source: URL(fileURLWithPath: source), encoded: URL(fileURLWithPath: encoded),
+                          offset: offset)
     }
 
     private var completedView: some View {

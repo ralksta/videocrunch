@@ -459,6 +459,7 @@ def rank(media: list[dict], target_codec: str, exclude_paths: set,
             "width": m["width"] or 0,
             "height": m["height"] or 0,
             "bitrate_mbps": m["bitrate_mbps"] or 0.0,
+            "duration_sec": m.get("duration_sec") or 0.0,
             "estimated_saved_mb": round(m["size_mb"] * saved_pct / 100.0, 1),
             "estimated_saved_pct": round(saved_pct, 1),
             # Same file with the 1080p downscale on; null when already 1080p.

@@ -75,6 +75,12 @@ struct VideoThumbnail: View {
 struct Comparison: Identifiable, Codable, Hashable {
     let source: URL
     let encoded: URL
+    /// Where the encode starts in the source (seconds) when it was trimmed.
+    var offset: Double = 0
+    /// Shown instead of the file name, e.g. for a preview of a file.
+    var title: String? = nil
+    /// What was measured, shown under the title.
+    var note: String? = nil
     var id: String { encoded.path }
 }
 
@@ -102,9 +108,9 @@ struct ComparisonSheet: View {
         VStack(spacing: 0) {
             HStack(spacing: 12) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(comparison.source.lastPathComponent)
+                    Text(comparison.title ?? comparison.source.lastPathComponent)
                         .font(.headline)
-                    Text("Links das Original, rechts das Ergebnis – Trennlinie ziehen")
+                    Text(comparison.note ?? "Links das Original, rechts das Ergebnis – Trennlinie ziehen")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -174,7 +180,8 @@ struct ComparisonSheet: View {
             do {
                 frames = try await FrameGrabber.frames(source: comparison.source,
                                                        encoded: comparison.encoded,
-                                                       at: position.fraction)
+                                                       at: position.fraction,
+                                                       sourceOffset: comparison.offset)
             } catch {
                 failure = "Bild konnte nicht gelesen werden."
             }
@@ -251,7 +258,8 @@ private struct SplitImage: View {
 /// Pulls the same frame out of source and encode with ffmpeg, both through
 /// the same scaler and colour conversion so neither is favoured.
 enum FrameGrabber {
-    static func frames(source: URL, encoded: URL, at position: Double) async throws
+    static func frames(source: URL, encoded: URL, at position: Double,
+                       sourceOffset: Double = 0) async throws
         -> (source: NSImage, encoded: NSImage) {
         try await Task.detached(priority: .userInitiated) {
             let env = WizardViewModel.toolEnvironment()
@@ -264,8 +272,9 @@ enum FrameGrabber {
             let filter = "scale=\(width):\(height):flags=bicubic:out_color_matrix=bt709,format=rgb24"
             let sourcePNG = dir.appendingPathComponent("source.png")
             let encodedPNG = dir.appendingPathComponent("encoded.png")
-            for (input, output) in [(source, sourcePNG), (encoded, encodedPNG)] {
-                try run(["ffmpeg", "-v", "error", "-y", "-ss", String(format: "%.3f", time),
+            for (input, output, at) in [(source, sourcePNG, time + sourceOffset),
+                                        (encoded, encodedPNG, time)] {
+                try run(["ffmpeg", "-v", "error", "-y", "-ss", String(format: "%.3f", at),
                          "-i", input.path, "-frames:v", "1", "-vf", filter, output.path], env: env)
             }
             guard let sourceImage = NSImage(contentsOf: sourcePNG),

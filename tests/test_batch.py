@@ -121,7 +121,7 @@ class TestAbort:
                             lambda *a, **kw: [sys.executable, "-c", FAKE_WORKER])
         outcome = {}
         worker = threading.Thread(target=lambda: outcome.update(
-            r=batch.run_optimizer(("/v/a.mov", None, "standard", None, None, False, "hevc", 1))))
+            r=batch.run_optimizer(("/v/a.mov", None, "standard", None, None, False, "hevc", None, None, 1))))
         worker.start()
         for _ in range(100):
             if batch.active_workers:
@@ -137,6 +137,6 @@ class TestAbort:
     def test_file_never_started_is_cancelled_too(self):
         batch.abort_workers()
         _, ok, result = batch.run_optimizer(
-            ("/v/a.mov", None, "standard", None, None, False, "hevc", 1))
+            ("/v/a.mov", None, "standard", None, None, False, "hevc", None, None, 1))
         assert not ok
         assert result["status"] == "cancelled"

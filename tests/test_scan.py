@@ -472,6 +472,14 @@ class TestRecommendation:
         assert with_1080 is True
         assert "1080p" in advice
 
+    def test_rank_carries_the_duration(self):
+        # The app's trim timeline needs the clip length.
+        from scan import EncodeHistory, rank
+        media = [dict(file_path="/v/a.mp4", size_mb=1000.0, bitrate_mbps=12.0, codec="h264",
+                      duration_sec=600.0, width=1920, height=1080, frame_rate=25.0)]
+        result = rank(media, "hevc", set(), EncodeHistory(Path("/nonexistent")), 10)["results"][0]
+        assert result["duration_sec"] == 600.0
+
     def test_rank_carries_the_recommendation(self):
         from scan import EncodeHistory, rank
         media = [dict(file_path="/v/a.mp4", size_mb=1000.0, bitrate_mbps=12.0, codec="h264",

@@ -39,6 +39,12 @@ class WizardViewModel: ObservableObject {
     @Published var scaleTo1080p: Bool = false
     @Published var moveToTrash: Bool = false
     @Published var minSSIMOverride: Double? = nil
+    /// Trim for a single selected video, in seconds of the source.
+    @Published var trimStart: Double = 0
+    @Published var trimEnd: Double = 0
+    private var trimId: String?
+    /// Where the last run's output starts in its source, for the comparison.
+    private(set) var lastRunTrim: (path: String, start: Double)?
 
     // Step 4: Encoding
     @Published var workers: [Int: WorkerStatus] = [:]
@@ -210,7 +216,11 @@ class WizardViewModel: ObservableObject {
         } else {
             candidates = response.results
             scanSummary = response.summary
-            selectedIds = Set(response.results.filter(\.isRecommended).map(\.id))
+            // A single video opened on its own is meant to be worked on, even
+            // where the recommendation would leave it unticked.
+            selectedIds = response.results.count == 1
+                ? Set(response.results.map(\.id))
+                : Set(response.results.filter(\.isRecommended).map(\.id))
             currentStep = .candidateSelection
         }
         let backlog = scanBacklog
@@ -255,7 +265,7 @@ class WizardViewModel: ObservableObject {
     var selectedRuntimeSec: Double? {
         let selection = selectedCandidates
         guard !selection.isEmpty else { return nil }
-        let times = selection.compactMap(\.estimated_runtime_sec)
+        let times = selection.compactMap { c in c.estimated_runtime_sec.map { $0 * keptFraction(c) } }
         guard times.count == selection.count else { return nil }
         let parallel = Double(min(max(scanSummary?.parallel_workers ?? 1, 1), selection.count))
         return max(times.max() ?? 0, times.reduce(0, +) / parallel)
@@ -271,11 +281,35 @@ class WizardViewModel: ObservableObject {
 
     /// Follows the 1080p switch: with it on, downscalable files count with
     /// their downscaled estimate.
+    /// The one selected video, when the selection allows trimming.
+    var trimTarget: Candidate? {
+        let selection = selectedCandidates
+        guard selection.count == 1, let c = selection.first, (c.duration_sec ?? 0) > 1 else { return nil }
+        return c
+    }
+
+    var isTrimmed: Bool {
+        // Only once the options page has set the range up for this video.
+        guard let c = trimTarget, c.id == trimId, let duration = c.duration_sec else { return false }
+        return trimStart > 0.05 || trimEnd < duration - 0.05
+    }
+
+    /// Share of a file the encode keeps: all of it, unless trimmed.
+    private func keptFraction(_ c: Candidate) -> Double {
+        guard isTrimmed, c.id == trimTarget?.id, let duration = c.duration_sec, duration > 0 else { return 1 }
+        return max(0, min(1, (trimEnd - trimStart) / duration))
+    }
+
+    /// Expected size of one file's result, with downscale and trim.
+    private func estimatedAfterMB(_ c: Candidate) -> Double {
+        let pct = scaleTo1080p ? (c.estimated_saved_pct_1080 ?? c.estimated_saved_pct)
+                               : c.estimated_saved_pct
+        return c.size_mb * keptFraction(c) * (1 - pct / 100)
+    }
+
+    /// Follows the 1080p switch and the trim.
     var selectedEstimatedSavedMB: Double {
-        selectedCandidates.reduce(0.0) { sum, c in
-            sum + (scaleTo1080p ? (c.estimated_saved_mb_1080 ?? c.estimated_saved_mb)
-                                : c.estimated_saved_mb)
-        }
+        selectedCandidates.reduce(0.0) { sum, c in sum + (c.size_mb - estimatedAfterMB(c)) }
     }
 
     /// What switching the 1080p downscale on adds to the selection's saving.
@@ -286,7 +320,7 @@ class WizardViewModel: ObservableObject {
     }
 
     var selectedTotalAfterMB: Double {
-        max(0, selectedTotalMB - selectedEstimatedSavedMB)
+        selectedCandidates.reduce(0.0) { $0 + estimatedAfterMB($1) }
     }
 
     var cancelledCount: Int {
@@ -346,6 +380,12 @@ class WizardViewModel: ObservableObject {
     // Step navigation
     func proceedToOptions() {
         if selectedIds.isEmpty { return }
+        // A different single video starts untrimmed.
+        if let c = trimTarget, c.id != trimId {
+            trimId = c.id
+            trimStart = 0
+            trimEnd = c.duration_sec ?? 0
+        }
         currentStep = .options
     }
 
@@ -380,7 +420,10 @@ class WizardViewModel: ObservableObject {
         let batchScript = self.scriptDir.appendingPathComponent("batch.py").path
         let audioM = self.audioMode
         let scale1080 = self.scaleTo1080p
-        let trash = self.moveToTrash
+        // Trimming never replaces the original (videocrunch keeps it anyway).
+        let trash = self.moveToTrash && !isTrimmed
+        let trim = isTrimmed ? (start: trimStart, end: trimEnd) : nil
+        lastRunTrim = trim.flatMap { t in trimTarget.map { (path: $0.file_path, start: t.start) } }
         let ssimFloor = self.minSSIMOverride
         let codec = self.targetCodec
 
@@ -409,6 +452,10 @@ class WizardViewModel: ObservableObject {
             }
             if trash {
                 args.append("--replace")
+            }
+            if let trim {
+                args.append(contentsOf: ["--ss", String(format: "%.3f", trim.start),
+                                         "--to", String(format: "%.3f", trim.end)])
             }
             if let floor = ssimFloor {
                 args.append(contentsOf: ["--min-ssim", String(floor)])
@@ -598,6 +645,66 @@ class WizardViewModel: ObservableObject {
     /// Colours and cursor moves (batch.py redraws its table in place).
     nonisolated static func stripANSI(_ text: String) -> String {
         text.replacingOccurrences(of: "\u{1B}\\[[0-9;]*[A-Za-z]", with: "", options: .regularExpression)
+    }
+
+    // MARK: - Preview
+
+    /// The file a preview is being made for, while it runs.
+    @Published var previewingId: String?
+    @Published var previewError: String?
+
+    /// Encodes the hardest few seconds of `candidate` with the current
+    /// settings (videocrunch.py --preview) and hands back what to compare.
+    func makePreview(for candidate: Candidate, completion: @escaping (Comparison) -> Void) {
+        guard previewingId == nil else { return }
+        previewingId = candidate.id
+        previewError = nil
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("videocrunch-preview-\(UUID().uuidString)")
+        var args = [scriptDir.appendingPathComponent("videocrunch.py").path, candidate.file_path,
+                    "--preview", dir.path, "--audio-mode", audioMode, "--codec", targetCodec]
+        if scaleTo1080p && candidate.canDownscale {
+            args += ["--scale-height", "1080"]
+        }
+        if isTrimmed, candidate.id == trimTarget?.id {
+            args += ["--ss", String(format: "%.3f", trimStart), "--to", String(format: "%.3f", trimEnd)]
+        }
+        if let floor = minSSIMOverride {
+            args += ["--min-ssim", String(floor)]
+        }
+        let python = resolvePythonPath()
+        let name = candidate.filename
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: python)
+            proc.arguments = args
+            proc.environment = WizardViewModel.toolEnvironment()
+            proc.standardOutput = FileHandle.nullDevice
+            proc.standardError = FileHandle.nullDevice
+            var result: PreviewResult?
+            if (try? proc.run()) != nil {
+                proc.waitUntilExit()
+                if let data = try? Data(contentsOf: dir.appendingPathComponent("preview.json")) {
+                    result = try? JSONDecoder().decode(PreviewResult.self, from: data)
+                }
+            }
+            DispatchQueue.main.async {
+                self.previewingId = nil
+                guard let result else {
+                    self.previewError = "Vorschau für \(name) ging nicht."
+                    return
+                }
+                let verdict = result.meets_target ? "erfüllt das Qualitätsziel"
+                                                  : "unter dem Qualitätsziel"
+                completion(Comparison(
+                    source: URL(fileURLWithPath: result.source),
+                    encoded: URL(fileURLWithPath: result.preview),
+                    title: "Vorschau: \(name)",
+                    note: String(format: "Schwierigste Stelle · Q %d · SSIM %.3f · %@ · ca. −%.0f %%",
+                                 result.quality, result.ssim, verdict, result.saved_pct)))
+            }
+        }
     }
 
     func resolvePythonPath() -> String {
