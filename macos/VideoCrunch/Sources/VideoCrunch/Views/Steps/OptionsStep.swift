@@ -10,7 +10,7 @@ struct OptionsStep: View {
     /// Choices are compact switches with one line of explanation; the
     /// settings column scrolls on its own only in a very small window.
     var body: some View {
-        VStack(spacing: 16) {
+        VStack(spacing: 12) {
             if vm.isGif {
                 gifSummary
             } else {
@@ -41,7 +41,7 @@ struct OptionsStep: View {
         .onAppear { vm.requestGifEstimate() }
         .onChange(of: vm.gifEstimateKey) { vm.requestGifEstimate() }
         .padding(.horizontal, 24)
-        .padding(.vertical, 16)
+        .padding(.vertical, 12)
         .frame(maxWidth: 1100)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -169,7 +169,7 @@ struct OptionsStep: View {
     }
 
     private var videoSettings: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 10) {
             OptionSection(title: "Codec") {
                 Picker("Codec", selection: $vm.targetCodec) {
                     Text("HEVC / H.265").tag("hevc")
@@ -324,7 +324,7 @@ struct OptionsStep: View {
             Text(vm.previewError
                  ?? (vm.previewingId != nil
                      ? "Erstelle Vorschau …"
-                     : "Kodiert die schwierigste Stelle in Sekunden – zum Prüfen vor dem Encode."))
+                     : "Die schwierigste Stelle, in Sekunden kodiert – zum Prüfen vorab."))
                 .font(.caption)
                 .foregroundStyle(vm.previewError == nil ? Color.secondary : Color.orange)
                 .fixedSize(horizontal: false, vertical: true)

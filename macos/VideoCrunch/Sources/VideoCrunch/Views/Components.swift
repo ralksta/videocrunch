@@ -71,7 +71,7 @@ struct SettingRow<Trailing: View>: View {
             trailing
         }
         .padding(.horizontal, 12)
-        .padding(.vertical, 9)
+        .padding(.vertical, 7)
     }
 }
 
