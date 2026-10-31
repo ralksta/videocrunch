@@ -407,6 +407,7 @@ def get_video_info(file_path: Path) -> Optional[Dict[str, Any]]:
             'height': height,
             'codec': codec,
             'fps': int(fps_val + 0.5),
+            'fps_frac': fps if '/' in fps else None,
             'pix_fmt': video_stream.get('pix_fmt', ''),
             'color_transfer': video_stream.get('color_transfer', ''),
             'color_primaries': video_stream.get('color_primaries', ''),
@@ -615,6 +616,7 @@ def get_multi_ssim(
     opt_starts: list,
     duration: float,
     ref_size: Optional[Tuple[int, int]] = None,
+    edits: Optional["Edits"] = None,
 ) -> float:
     """
     Calculate quality score across N sample segments in ONE ffmpeg pass.
@@ -639,6 +641,9 @@ def get_multi_ssim(
     total_sample_duration = n * duration  # total frames to compare
 
     ref_scale = f",scale={int(ref_size[0])}:{int(ref_size[1])}:flags=bicubic" if ref_size else ""
+    # The reference gets the encode's crop and frame rate first, so frame N
+    # is compared with the frame the encoder actually kept as frame N.
+    ref_prefix = (edits.video_prefix() + ",") if edits and edits.video_prefix() else ""
 
     # Frame-accurate sampling. A time-based trim picks the first frame whose
     # timestamp reaches the mark — and the two files' timestamp grids drift
@@ -648,20 +653,22 @@ def get_multi_ssim(
     # frame N with frame N. Falls back to time trims when fps is unknown.
     src_info = get_video_info(original)
     fps = (src_info or {}).get('fps') or 0
+    if edits and edits.fps:
+        fps = edits.fps_value()  # both sides are at the halved rate when cut
 
-    def _seg(stream: int, start: float, tail: str, label: str) -> str:
+    def _seg(stream: int, start: float, tail: str, label: str, head: str = "") -> str:
         if fps > 0:
             sf = int(round(start * fps))
             ef = sf + int(round(duration * fps))
             cut = f"trim=start_frame={sf}:end_frame={ef},settb=AVTB,setpts=N/{fps}/TB"
         else:
             cut = f"trim=start={start:.3f}:end={start + duration:.3f},setpts=PTS-STARTPTS"
-        return f"[{stream}:v]{cut}{tail}[{label}]"
+        return f"[{stream}:v]{head}{cut}{tail}[{label}]"
 
     # Build filter_complex: trim segments, concat pairs, compare once
     fc: list = []
     for i, s in enumerate(orig_starts):
-        fc.append(_seg(0, s, ref_scale, f"oa{i}"))
+        fc.append(_seg(0, s, ref_scale, f"oa{i}", ref_prefix))
     for i, s in enumerate(opt_starts):
         fc.append(_seg(1, s, "", f"na{i}"))
     fc.append(''.join(f'[oa{i}]' for i in range(n)) + f"concat=n={n}:v=1:a=0[ocat]")
@@ -849,6 +856,149 @@ def measure_loudness(input_path, audio_mode):
     return None
 
 
+# Halving 60 fps does not halve the bitrate a quality level needs: what
+# changes between the frames that are left is larger. On a 4K 60 fps iPhone
+# clip the halved encode came out at 0.75x the full-rate one; the ladder aims
+# a little lower so the search can find that.
+HALF_FPS_BITRATE = 0.65
+# What scan.py expects of the halved file, from the same clip.
+HALF_FPS_SIZE = 0.75
+
+
+@dataclass(frozen=True)
+class EditRequest:
+    """What was asked for on the command line, before the source is known."""
+    half_fps: bool = False
+    crop_bars: bool = False
+    mute: bool = False
+
+
+@dataclass(frozen=True)
+class Edits:
+    """What the encode changes besides quality, settled for one source.
+
+    fps: output frame rate as an ffmpeg rate ("30000/1001"), when 50/60 fps
+        footage is halved. crop: "w:h:x:y" of the picture without its black
+        bars. mute: no audio in the output.
+    """
+    fps: Optional[str] = None
+    crop: Optional[str] = None
+    mute: bool = False
+
+    def video_prefix(self) -> str:
+        """Filters that run before the profile's own chain (and the SSIM reference's)."""
+        steps = []
+        if self.crop:
+            steps.append(f"crop={self.crop}")
+        if self.fps:
+            steps.append(f"fps={self.fps}")
+        return ",".join(steps)
+
+    def fps_value(self) -> Optional[float]:
+        if not self.fps:
+            return None
+        n, _, d = self.fps.partition('/')
+        return float(n) / float(d or 1)
+
+
+def half_frame_rate(info: dict) -> Optional[str]:
+    """Half of a 48/50/60 fps source's rate, or None.
+
+    Slow-motion footage (100 fps and up) is left alone: its frames are the
+    slow motion. 30 fps and below have nothing to spare.
+    """
+    frac = info.get('fps_frac')
+    if not frac:
+        return None
+    n, _, d = frac.partition('/')
+    try:
+        num, den = int(n), int(d or 1)
+    except ValueError:
+        return None
+    if den <= 0 or not 45 <= num / den < 100:
+        return None
+    return f"{num}/{den * 2}"
+
+
+CROPDETECT_RE = re.compile(r"crop=(-?\d+):(-?\d+):(-?\d+):(-?\d+)")
+
+
+def bars_crop(found: list, width: int, height: int) -> Optional[str]:
+    """One crop from cropdetect's verdicts at several points, or None.
+
+    The union of what each point kept, so a dark scene that looks like
+    "all bars" cannot cut into the picture elsewhere; and only when every
+    point saw bars of at least 2 % — a few rows of noise are not bars.
+    """
+    valid = [(w, h, x, y) for w, h, x, y in found if w > 0 and h > 0]
+    if len(valid) < 3 or len(valid) < len(found):
+        return None
+    x0 = min(x for _, _, x, _ in valid)
+    y0 = min(y for _, _, _, y in valid)
+    x1 = max(x + w for w, _, x, _ in valid)
+    y1 = max(y + h for _, h, _, y in valid)
+    w, h = (x1 - x0) // 2 * 2, (y1 - y0) // 2 * 2
+    if w * h < width * height * 0.5:
+        return None  # more than half "bars": a dark video, not a letterbox
+    if w > width * 0.98 and h > height * 0.98:
+        return None
+    return f"{w}:{h}:{x0}:{y0}"
+
+
+def detect_black_bars(path, info: dict, start: float = 0.0, length: Optional[float] = None,
+                      points: int = 5) -> Optional[str]:
+    """Black bars around the picture (letterbox, pillarbox) as a crop, or None."""
+    length = length if length is not None else info.get('duration') or 0
+    if length <= 2:
+        return None
+    found = []
+    for i in range(points):
+        t = start + length * (i + 0.5) / points
+        r = subprocess.run(
+            ['ffmpeg', '-hide_banner', '-nostdin', '-ss', f'{t:.3f}', '-i', str(path),
+             '-frames:v', '12', '-an', '-vf', 'cropdetect=limit=24:round=2:reset=0',
+             '-f', 'null', '-'],
+            capture_output=True, text=True, timeout=120)
+        hits = CROPDETECT_RE.findall(r.stderr)
+        if hits:
+            found.append(tuple(int(v) for v in hits[-1]))
+    return bars_crop(found, info.get('width') or 0, info.get('height') or 0)
+
+
+def settle_edits(request: Optional[EditRequest], info: dict, path, profile,
+                 start: float = 0.0, length: Optional[float] = None) -> Edits:
+    """Turn the request into what this source gets, saying what was left out."""
+    if request is None:
+        return Edits()
+    fps = None
+    if request.half_fps:
+        fps = half_frame_rate(info)
+        if fps is None:
+            print(f"{Y}Frame rate kept:{NC} {info.get('fps')} fps has nothing to halve")
+        else:
+            print(f"{Y}Frame rate:{NC} {info.get('fps')} → {Edits(fps=fps).fps_value():g} fps")
+    crop = None
+    if request.crop_bars:
+        if '-hwaccel_output_format' in profile.get('hwaccel_input', []):
+            print(f"{Y}Bars kept:{NC} this encoder decodes on the GPU, where crop does not run")
+        else:
+            crop = detect_black_bars(path, info, start, length)
+            print(f"{Y}Black bars:{NC} " + (f"cropped to {crop.split(':')[0]}x{crop.split(':')[1]}"
+                                            if crop else "none found"))
+    if request.mute:
+        print(f"{Y}Audio:{NC} removed")
+    return Edits(fps=fps, crop=crop, mute=request.mute)
+
+
+def edits_bitrate_scale(edits: Edits, info: dict) -> float:
+    """How much of the source bitrate the edited picture still needs."""
+    scale = HALF_FPS_BITRATE if edits.fps else 1.0
+    if edits.crop and info.get('width') and info.get('height'):
+        w, h = (int(v) for v in edits.crop.split(':')[:2])
+        scale *= (w * h) / (info['width'] * info['height'])
+    return scale
+
+
 def apply_scale_to_filter(video_filter: str, target_height: int) -> str:
     """Rewrite a profile's video_filter so the encode's SHORT side is target_height.
 
@@ -941,7 +1091,7 @@ def probe_ref_size(path) -> Optional[Tuple[int, int]]:
     return (out_info['width'], out_info['height'])
 
 
-def build_ffmpeg_command(input_path, output_path, profile, quality_value, copy_audio=False, audio_mode='enhanced', ss=None, to=None, video_mode='compress', maxrate_kbps=None, bufsize_kbps=None, target_bitrate_kbps=None, color_args=None, loudnorm_measured=None, scale_height=None, streams=None):
+def build_ffmpeg_command(input_path, output_path, profile, quality_value, copy_audio=False, audio_mode='enhanced', ss=None, to=None, video_mode='compress', maxrate_kbps=None, bufsize_kbps=None, target_bitrate_kbps=None, color_args=None, loudnorm_measured=None, scale_height=None, streams=None, edits=None):
     """Build the ffmpeg command based on encoder profile.
 
     Args:
@@ -957,7 +1107,12 @@ def build_ffmpeg_command(input_path, output_path, profile, quality_value, copy_a
         streams: Optional stream inventory (probe_stream_inventory). Given one,
             every usable track is mapped explicitly instead of letting ffmpeg
             keep just one audio stream and drop the rest.
+        edits: Optional Edits — crop and frame rate run before the profile's
+            filters; mute drops every audio track.
     """
+    mute = bool(edits and edits.mute)
+    if mute and streams:
+        streams = [s for s in streams if s.get('codec_type') != 'audio']
     cmd = ['ffmpeg', '-y']
 
     # Trim input if needed (fast seek)
@@ -993,6 +1148,8 @@ def build_ffmpeg_command(input_path, output_path, profile, quality_value, copy_a
         video_filter = profile['video_filter']
         if scale_height:
             video_filter = apply_scale_to_filter(video_filter, scale_height)
+        if edits and edits.video_prefix():
+            video_filter = f"{edits.video_prefix()},{video_filter}"
         cmd.extend(['-vf', video_filter])
 
         # Bitrate-controlled VBR: -b:v sets the average target, -maxrate caps the peak.
@@ -1012,10 +1169,12 @@ def build_ffmpeg_command(input_path, output_path, profile, quality_value, copy_a
     # moderate = -19 LUFS (gentle midpoint), enhanced = -16 LUFS (streaming target).
     # With a loudness measurement (two-pass), loudnorm runs in linear mode.
     audio_filters = None
-    if not copy_audio:
+    if not copy_audio and not mute:
         audio_filters = build_audio_filter_chain(audio_mode, measured=loudnorm_measured)
 
-    if streams:
+    if mute and not streams:
+        cmd.append('-an')
+    elif streams:
         # Explicit mapping: keep every usable track, not just the one ffmpeg
         # would pick by default.
         stream_args, _ = build_stream_args(streams, copy_audio, audio_filters,
@@ -1124,7 +1283,7 @@ def extract_probe_clip(input_path, sample_starts, segment_sec, work_dir):
 def estimate_optimal_q(input_path, profile, quality_values, bitrate_values,
                        sample_starts, audio_mode, work_dir, scale_height=None,
                        source_avg_kbps=None, maxrate_kbps=None, bufsize_kbps=None,
-                       min_ssim=SSIM_MIN):
+                       min_ssim=SSIM_MIN, edits=None):
     """Binary-search Q on a short probe clip instead of the full file.
 
     Full-file binary search encodes the whole video per pass; probing on a
@@ -1173,13 +1332,14 @@ def estimate_optimal_q(input_path, profile, quality_values, bitrate_values,
                 target_bitrate_kbps=target,
                 color_args=profile.get('color_args'),
                 scale_height=scale_height,
+                edits=edits,
             )
             r = subprocess.run(cmd, capture_output=True, timeout=600)
             if r.returncode != 0 or not out.exists() or out.stat().st_size == 0:
                 return None  # encoder trouble -> let the real search handle it
             ref_size = probe_ref_size(out) if scale_height else None
             ssim = get_multi_ssim(probe, out, probe_ssim_starts, probe_ssim_starts, SAMPLE_DURATION,
-                                  ref_size=ref_size)
+                                  ref_size=ref_size, edits=edits)
             out_kbps = (out.stat().st_size * 8) / (probe_dur * 1000) if probe_dur > 0 else 0.0
             ratio = out.stat().st_size / probe_size if probe_size else 1.0
             if target and target > 0:
@@ -1227,7 +1387,7 @@ PREVIEW_SEGMENT_SEC = 6.0
 
 
 def make_preview(input_path, profile, out_dir, audio_mode='enhanced', ss=None, to=None,
-                 scale_height=None, min_ssim=None) -> Optional[dict]:
+                 scale_height=None, min_ssim=None, edit_request=None) -> Optional[dict]:
     """Encode the hardest few seconds the way the real run would, to look at first.
 
     Takes the file's top bitrate hotspot, finds the quality level on it with
@@ -1239,7 +1399,8 @@ def make_preview(input_path, profile, out_dir, audio_mode='enhanced', ss=None, t
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     plan = prepare_encode(Path(input_path), profile, copy_audio=True, audio_mode=audio_mode,
-                          ss=ss, to=to, scale_height=scale_height, force=True, min_ssim=min_ssim)
+                          ss=ss, to=to, scale_height=scale_height, force=True, min_ssim=min_ssim,
+                          edit_request=edit_request)
     if plan is None:
         return None
     start = plan.start_offset + (plan.sample_starts[0] if plan.sample_starts else 0.0)
@@ -1249,7 +1410,7 @@ def make_preview(input_path, profile, out_dir, audio_mode='enhanced', ss=None, t
         input_path, plan.profile, plan.quality_values, plan.bitrate_values, [start],
         audio_mode, out_dir, scale_height=plan.scale_height,
         source_avg_kbps=plan.source_avg_kbps, maxrate_kbps=plan.maxrate_kbps,
-        bufsize_kbps=plan.bufsize_kbps, min_ssim=target)
+        bufsize_kbps=plan.bufsize_kbps, min_ssim=target, edits=plan.edits)
     if quality is None:
         quality = plan.quality_values[0]  # nothing passed: show the best rung
 
@@ -1270,13 +1431,14 @@ def make_preview(input_path, profile, out_dir, audio_mode='enhanced', ss=None, t
                                video_mode='compress', maxrate_kbps=pass_maxrate,
                                bufsize_kbps=pass_bufsize, target_bitrate_kbps=target_kbps,
                                color_args=plan.profile.get('color_args'),
-                               scale_height=plan.scale_height)
+                               scale_height=plan.scale_height, edits=plan.edits)
     if subprocess.run(cmd, capture_output=True).returncode != 0 or not preview.exists():
         return None
     seg_info = get_video_info(source) or {}
     seg_duration = max(0.5, (seg_info.get('duration') or PREVIEW_SEGMENT_SEC) - 0.2)
     ssim = get_multi_ssim(source, preview, [0.0], [0.0], seg_duration,
-                          ref_size=probe_ref_size(preview) if plan.scale_height else None)
+                          ref_size=probe_ref_size(preview) if plan.scale_height else None,
+                          edits=plan.edits)
     result = {
         'quality': int(quality),
         'ssim': round(ssim, 4),
@@ -1550,10 +1712,12 @@ class EncodePlan:
     fallback_floor: Any
     source_avg_kbps: Any
     q_override: Any
+    edits: Any = None
 
 def prepare_encode(input_path, profile, min_size_mb=0, copy_audio=False,
                    audio_mode='enhanced', ss=None, to=None, video_mode='compress',
-                   q_override=None, scale_height=None, force=False, min_ssim=None):
+                   q_override=None, scale_height=None, force=False, min_ssim=None,
+                   edit_request=None):
     """Everything that has to be settled before the first encode pass.
 
     Probing, HDR handling, stream inventory, the pre-flight savings gate,
@@ -1654,6 +1818,15 @@ def prepare_encode(input_path, profile, min_size_mb=0, copy_audio=False,
     elif scale_height:
         scale_height = None  # copy mode never re-encodes
 
+    # --- EDITS: half frame rate, black bars, no audio ---
+    edits = Edits()
+    if video_mode == 'compress':
+        _edit_start = parse_time_to_seconds(ss) if ss else 0.0
+        _edit_end = parse_time_to_seconds(to) if to else info['duration']
+        edits = settle_edits(edit_request, info, input_path, profile,
+                             _edit_start, max(0.0, _edit_end - _edit_start))
+    last_encode_result['edits'] = ({k: v for k, v in vars(edits).items() if v} or None)
+
     # Height the output will actually have — history buckets key on this.
     effective_height = scaled_size[1] if scaled_size else info['height']
     last_encode_result['height'] = effective_height
@@ -1710,6 +1883,9 @@ def prepare_encode(input_path, profile, min_size_mb=0, copy_audio=False,
     # audio_filters plays no part in the skip decision, so passing None here
     # yields exactly the notes the real encode produces.
     source_streams = probe_stream_inventory(input_path)
+    if edits.mute:
+        # Removed on request: neither mapped nor expected in the output.
+        source_streams = [s for s in source_streams if s.get('codec_type') != 'audio']
     _stream_map, skipped_streams = build_stream_args(source_streams, copy_audio, None,
                                                      decodable=available_decoders())
     for note in skipped_streams:
@@ -1866,6 +2042,8 @@ def prepare_encode(input_path, profile, min_size_mb=0, copy_audio=False,
     # pass aims at source-resolution bitrates for a much smaller frame — the encode
     # passes SSIM trivially and the search leaves most of the savings on the table.
     _br_scale = downscale_bitrate_scale(scale_height, min(info['width'], info['height']))
+    # Fewer frames or a smaller picture need fewer bits for the same quality.
+    _br_scale *= edits_bitrate_scale(edits, info)
     if _source_avg_kbps:
         _source_avg_kbps *= _br_scale
 
@@ -1930,10 +2108,11 @@ def prepare_encode(input_path, profile, min_size_mb=0, copy_audio=False,
         # Corrected here when it was out of range: letting the caller
         # keep the original value would put a bogus Q back in play.
         q_override=q_override,
+        edits=edits,
     )
 
 
-def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None, audio_mode='enhanced', ss=None, to=None, video_mode='compress', q_override=None, presearch=True, scale_height=None, force=False, min_ssim=None, replace=False, progress_callback=None):
+def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None, audio_mode='enhanced', ss=None, to=None, video_mode='compress', q_override=None, presearch=True, scale_height=None, force=False, min_ssim=None, replace=False, edit_request=None, progress_callback=None):
     """Process a single video file. Returns (success, bytes_saved).
 
     `progress_callback(done_seconds, total_seconds, label)` is called while
@@ -1945,7 +2124,8 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
     """
     input_path = Path(input_path)
     plan = prepare_encode(input_path, profile, min_size_mb, copy_audio, audio_mode,
-                          ss, to, video_mode, q_override, scale_height, force, min_ssim)
+                          ss, to, video_mode, q_override, scale_height, force, min_ssim,
+                          edit_request)
     if plan is None:
         return (False, 0)
 
@@ -1953,6 +2133,7 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
     profile = plan.profile
     output_path = plan.output_path
     scale_height = plan.scale_height
+    edits = plan.edits
     source_streams = plan.source_streams
     size_before = plan.size_before
     size_to_compare = plan.size_to_compare
@@ -2064,6 +2245,7 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
         ssim = get_multi_ssim(
             input_path, effective_out, orig_starts, opt_starts, SAMPLE_DURATION,
             ref_size=probe_ref_size(effective_out) if scale_height else None,
+            edits=edits,
         )
         quality_label = _detect_quality_filter().upper()
 
@@ -2091,7 +2273,7 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
 
         print(f"{G}Pass:{NC} Q={quality_val}{maxrate_info}")
 
-        cmd = build_ffmpeg_command(input_path, effective_out, profile, quality_val, copy_audio, audio_mode, ss, to, video_mode='compress', maxrate_kbps=pass_maxrate, bufsize_kbps=pass_bufsize, target_bitrate_kbps=target_bitrate_kbps, color_args=profile.get('color_args'), loudnorm_measured=loudnorm_measured, scale_height=scale_height, streams=source_streams)
+        cmd = build_ffmpeg_command(input_path, effective_out, profile, quality_val, copy_audio, audio_mode, ss, to, video_mode='compress', maxrate_kbps=pass_maxrate, bufsize_kbps=pass_bufsize, target_bitrate_kbps=target_bitrate_kbps, color_args=profile.get('color_args'), loudnorm_measured=loudnorm_measured, scale_height=scale_height, streams=source_streams, edits=edits)
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
         cur_stats = {"bitrate": "0kb/s", "speed": "0x"}
@@ -2281,7 +2463,7 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
                 sample_starts, audio_mode, input_path.parent, scale_height=scale_height,
                 source_avg_kbps=_source_avg_kbps,
                 maxrate_kbps=maxrate_kbps, bufsize_kbps=bufsize_kbps,
-                min_ssim=ssim_min)
+                min_ssim=ssim_min, edits=edits)
             if predicted_q is not None:
                 idx = nearest_quality_index(quality_values, predicted_q)
                 low, high = narrow_quality_window(len(quality_values), idx, radius=1)
@@ -2828,6 +3010,11 @@ def build_parser():
                         help='Downscale so the shorter side is H pixels, keeping the aspect '
                              'ratio (1080 = 1080p in either orientation). Ignored when the '
                              'source is already that small.')
+    parser.add_argument('--half-fps', action='store_true',
+                        help='Halve 48/50/60 fps footage (slow motion stays as it is)')
+    parser.add_argument('--crop-bars', action='store_true',
+                        help='Cut away black bars around the picture, where there are any')
+    parser.add_argument('--no-audio', action='store_true', help='Leave every audio track out')
     parser.add_argument('--port', type=int,
                         help='Notify a companion server on this port when a file is done, via GET /api/mark_optimized?path=<path>')
     parser.add_argument('--preset', choices=['fast', 'balanced', 'best'], default='balanced',
@@ -2933,10 +3120,13 @@ def main():
     # Filter out flags from files
     files = [f for f in files if not f.startswith('-')]
 
+    edit_request = EditRequest(half_fps=args.half_fps, crop_bars=args.crop_bars,
+                               mute=args.no_audio)
     if args.preview:
         ok = all(make_preview(f, profile, args.preview, audio_mode=args.audio_mode, ss=args.ss,
                               to=args.to, scale_height=args.scale_height,
-                              min_ssim=args.min_ssim) for f in files[:1])
+                              min_ssim=args.min_ssim, edit_request=edit_request)
+                 for f in files[:1])
         sys.exit(0 if ok and files else 1)
 
     run_results: list = []
@@ -2957,7 +3147,8 @@ def main():
                 scale_height=args.scale_height,
                 force=args.force,
                 min_ssim=args.min_ssim,
-                replace=args.replace
+                replace=args.replace,
+                edit_request=edit_request,
             )
         except KeyboardInterrupt:
             print(f"\n{R}>>> Abort.{NC}")
