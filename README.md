@@ -88,6 +88,15 @@ search on the whole file), `--json-out PATH` (write the result as JSON — statu
 quality, SSIM, savings, in and out paths — whatever the outcome), `--replace`
 (put the result in the source's place; the original goes to the trash).
 
+Three switches change the video itself, not only its encoding:
+`--half-fps` halves 48–60 fps footage to 24–30 fps (slow motion above that
+is left alone; the bitrate ladder drops with it, and the result comes out
+about a quarter smaller), `--crop-bars` cuts away black bars that
+`cropdetect` finds at five points through the video (only when all agree,
+and never more than half the picture), and `--no-audio` leaves the sound
+out. The quality check compares against the source with the same edits, so
+SSIM measures the encode, not the edit. `batch.py` forwards all three.
+
 ### 3. `scan.py` — rank folders and files without encoding anything
 
 ```bash
@@ -157,7 +166,28 @@ Writes `clip.gif` next to the video (`clip 2.gif` if that exists; nothing is
 replaced). ffmpeg cuts the range, drops to the frame rate, scales (never up)
 and tone-maps HDR (iPhone HLG, HDR10) to BT.709; gifski makes the GIF, or
 ffmpeg's `palettegen`/`paletteuse` when gifski is not installed
-(`--encoder` picks one). `--json-out` and `--events` work as in `batch.py`.
+(`--encoder` picks one). `--speed 0.5` plays it in slow motion, `--speed 2`
+as a time-lapse (same frame rate, half or double the frames). `--json-out`
+and `--events` work as in `batch.py`.
+
+### 5. `fit.py` — under a size, for mail or chat
+
+```bash
+python3 fit.py clip.mov --max-mb 25
+python3 fit.py --files-from list.txt --max-mb 10 --no-audio
+```
+
+The other question: not "how small can it get and look the same", but "it
+has to fit in 25 MB — what is the best it can look". The bitrate follows from
+the size and the length; the resolution follows from the bitrate (the
+largest of the source, 2160, 1440, 1080, 720, 540, 360 that the bitrate can
+fill without turning to mush), and 48–60 fps footage is halved when even
+360p would be too much. A first try usually lands; when it comes out over,
+the bitrate drops by what was missing and it tries again (three times at
+most). Writes `clip_25MB.mp4` next to the video; the original stays. A video
+already under the size is skipped, one too long for it says so with the
+longest length that would fit. Takes `--codec`, `--half-fps`, `--crop-bars`,
+`--no-audio`, `--ss`/`--to`, and `--json-out`/`--events` as in `batch.py`.
 
 ## How the quality search works
 
@@ -316,6 +346,15 @@ With a single video selected, the options page can also make a GIF instead
 (*Video verkleinern | GIF erstellen*): width, frame rate and quality, the
 trim as its range, and the expected size next to the button, like Gifski.
 The finished GIF plays on the last page, next to *Öffnen* and *Teilen*.
+*Tempo* makes it a slow motion (½×) or a time-lapse (2×).
+
+*Ziel* on the options page switches from the quality search to a size:
+10, 25, 50 or 100 MB per video, for a mail or a chat. The run goes through
+`fit.py` then, and the results lie next to the originals as `_10MB.mp4`.
+*Ohne Ton* drops the sound; *Auf 30 Bilder/s* (offered only for 48–60 fps
+videos) halves the frame rate, which saves about a quarter more — or, with
+a size target, leaves more bits for each frame; *Schwarze Balken
+abschneiden* crops letterbox bars where there are any.
 
 With a single video selected, the options page offers *Kürzen*: a preview,
 a filmstrip and two handles to cut the start and end before encoding (the
@@ -339,8 +378,9 @@ rather than cutting off an encode.
 
 The app walks through the same steps as the command-line wizard: **Scan**
 (`scan.py --json`), **Auswahl** (pick files, with the expected savings per
-file), **Optionen** (codec, audio (original sound by default, loudness levelling on request), downscaling to 1080p, originals to the
-trash), **Encode** (`batch.py`, with live progress per file and a Cancel
+file), **Optionen** (target, codec, audio (original sound by default, loudness
+levelling or none on request), downscaling to 1080p, 30 fps, black bars,
+originals to the trash), **Encode** (`batch.py`, with live progress per file and a Cancel
 button that stops and cleans up) and **Fertig** (what each file saved, with a
 retry for files just under the quality floor). Started without a file, it
 asks for one.
