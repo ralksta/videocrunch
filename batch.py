@@ -252,7 +252,8 @@ def merge_worker_result(result: dict, data: dict | None) -> bool:
 
 
 def build_optimizer_command(file_path, port, audio_mode, min_ssim=None, json_out=None,
-                            scale_height=None, replace=False, codec=None, ss=None, to=None):
+                            scale_height=None, replace=False, codec=None, ss=None, to=None,
+                            edit_flags=()):
     """The per-file `videocrunch.py` invocation — see tests/test_cli_contract.py.
 
     Every batch-level option a caller sets has to appear here; anything the
@@ -281,7 +282,17 @@ def build_optimizer_command(file_path, port, audio_mode, min_ssim=None, json_out
         cmd.extend(["--ss", str(ss)])
     if to:
         cmd.extend(["--to", str(to)])
+    cmd.extend(edit_flags)
     return cmd
+
+
+# Switches that pass through to every file unchanged.
+EDIT_FLAGS = ("half_fps", "crop_bars", "no_audio")
+
+
+def edit_flags(args) -> tuple:
+    """--half-fps / --crop-bars / --no-audio as set on the batch."""
+    return tuple("--" + name.replace("_", "-") for name in EDIT_FLAGS if getattr(args, name, False))
 
 
 def start_worker(cmd):
@@ -332,7 +343,8 @@ def run_optimizer(args_tuple):
 
 
 def _run_optimizer(args_tuple):
-    file_path, port, audio_mode, min_ssim, scale_height, replace, codec, ss, to, worker_id = args_tuple
+    (file_path, port, audio_mode, min_ssim, scale_height, replace, codec, ss, to, flags,
+     worker_id) = args_tuple
 
     filename = Path(file_path).name
     file_start = time.time()
@@ -357,7 +369,8 @@ def _run_optimizer(args_tuple):
     result_file = Path(tempfile.gettempdir()) / f"videocrunch_w{worker_id}_{os.getpid()}.json"
     cmd = build_optimizer_command(file_path, port, audio_mode, min_ssim,
                                   json_out=result_file, scale_height=scale_height,
-                                  replace=replace, codec=codec, ss=ss, to=to)
+                                  replace=replace, codec=codec, ss=ss, to=to,
+                                  edit_flags=flags)
 
     try:
         process = start_worker(cmd)
@@ -583,6 +596,12 @@ def build_parser():
                         help='End time, forwarded per file')
     parser.add_argument('--replace', action='store_true',
                         help='Replace each source with its encode (original to the trash)')
+    parser.add_argument('--half-fps', action='store_true',
+                        help='Halve 48/50/60 fps footage (forwarded per file)')
+    parser.add_argument('--crop-bars', action='store_true',
+                        help='Cut away black bars (forwarded per file)')
+    parser.add_argument('--no-audio', action='store_true',
+                        help='Leave the audio out (forwarded per file)')
     parser.add_argument('--events', action='store_true',
                         help='Print one JSON object per line (start, progress, file '
                              'results, summary) instead of the live table')
@@ -633,7 +652,8 @@ def main():
 
     # Prepare work items
     work_items = [(f, args.port, args.audio_mode, args.min_ssim, args.scale_height,
-                   args.replace, args.codec, args.ss, args.to, (i % max_workers) + 1)
+                   args.replace, args.codec, args.ss, args.to, edit_flags(args),
+                   (i % max_workers) + 1)
                   for i, f in enumerate(files)]
 
     # Process files

@@ -10,7 +10,7 @@ struct OptionsStep: View {
     /// Choices are compact switches with one line of explanation; the
     /// settings column scrolls on its own only in a very small window.
     var body: some View {
-        VStack(spacing: 16) {
+        VStack(spacing: 12) {
             if vm.isGif {
                 gifSummary
             } else {
@@ -41,7 +41,7 @@ struct OptionsStep: View {
         .onAppear { vm.requestGifEstimate() }
         .onChange(of: vm.gifEstimateKey) { vm.requestGifEstimate() }
         .padding(.horizontal, 24)
-        .padding(.vertical, 16)
+        .padding(.vertical, 12)
         .frame(maxWidth: 1100)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -89,6 +89,21 @@ struct OptionsStep: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            OptionSection(title: "Tempo") {
+                Picker("Tempo", selection: $vm.gifSpeed) {
+                    Text("½×").tag(0.5)
+                    Text("1×").tag(1.0)
+                    Text("2×").tag(2.0)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .fixedSize()
+                Text(vm.gifSpeed < 1 ? "Zeitlupe: doppelt so lang, doppelt so viele Bilder."
+                     : vm.gifSpeed > 1 ? "Zeitraffer: halb so lang, halb so groß."
+                     : "So schnell wie das Video.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             OptionSection(title: "Qualität") {
                 HStack {
                     Slider(value: $vm.gifQuality, in: 30...100, step: 5)
@@ -100,8 +115,8 @@ struct OptionsStep: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            if let range = vm.gifRange, range.end - range.start > 15 {
-                Label("\(formatDuration(range.end - range.start)) sind lang für ein GIF – links kürzen.",
+            if let range = vm.gifRange, (range.end - range.start) / vm.gifSpeed > 15 {
+                Label("\(formatDuration((range.end - range.start) / vm.gifSpeed)) sind lang für ein GIF – links kürzen.",
                       systemImage: "scissors")
                     .font(.caption)
                     .foregroundStyle(.orange)
@@ -122,7 +137,7 @@ struct OptionsStep: View {
                     if let e = vm.gifEstimate {
                         Text("\(e.width) × \(e.height) · \(e.frames) Bilder · \(e.encoder)")
                     } else if let range = vm.gifRange {
-                        Text("\(formatDuration(range.end - range.start)) · \(vm.gifFPS) Bilder/s")
+                        Text("\(formatDuration((range.end - range.start) / vm.gifSpeed)) · \(vm.gifFPS) Bilder/s")
                     }
                 }
                 .font(.subheadline)
@@ -153,43 +168,74 @@ struct OptionsStep: View {
         .cardBackground()
     }
 
-    private var videoSettings: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            OptionSection(title: "Codec") {
-                Picker("Codec", selection: $vm.targetCodec) {
-                    Text("HEVC / H.265").tag("hevc")
-                    Text("AV1 (experimentell)").tag("av1")
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                Text(vm.targetCodec == "av1"
-                     ? "Kleinere Dateien, deutlich langsamer. Braucht neuere Geräte."
-                     : "Hardware-Encoder, schnell. Läuft auf praktisch jedem Gerät.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                if vm.targetCodec != vm.scannedCodec {
-                    Label("Die Ersparnis oben wurde für \(codecName(vm.scannedCodec)) geschätzt.",
-                          systemImage: "info.circle")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
+    private func rowLabel(_ text: String) -> some View {
+        Text(text)
+            .font(.subheadline.weight(.medium))
+            .foregroundStyle(.secondary)
+            .gridColumnAlignment(.trailing)
+    }
 
-            OptionSection(title: "Audio") {
-                Picker("Audio", selection: $vm.audioMode) {
-                    Text("Original").tag("standard")
-                    Text("Lautheit angleichen").tag("enhanced")
+    /// The one line under the switches: what the choice above means.
+    private var settingsNote: String {
+        if vm.sizeLimitMB > 0 {
+            return "Jedes Video unter \(vm.sizeLimitMB) MB – für Mail oder Chat. Die Auflösung passt sich an."
+        }
+        if vm.targetCodec != vm.scannedCodec {
+            return "Die Ersparnis oben wurde für \(codecName(vm.scannedCodec)) geschätzt."
+        }
+        return vm.targetCodec == "av1"
+            ? "AV1: kleinere Dateien, deutlich langsamer, braucht neuere Geräte."
+            : "So klein, wie es ohne sichtbaren Verlust geht."
+    }
+
+    private var videoSettings: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            // One line each, label on the left: the explanations are in the
+            // tooltips, so the page still fits a laptop screen.
+            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 8) {
+                GridRow {
+                    rowLabel("Ziel")
+                    Picker("Ziel", selection: $vm.sizeLimitMB) {
+                        Text("Qualität").tag(0)
+                        ForEach([10, 25, 50, 100], id: \.self) { Text("\($0) MB").tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .help("Qualität: so klein, wie es ohne sichtbaren Verlust geht. "
+                          + "MB: jedes Video darunter, für Mail oder Chat.")
                 }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                Text(vm.audioMode == "enhanced"
-                     ? "Auf −16 LUFS: leise Handyvideos werden hörbar, laute gezähmt."
-                     : "Der Ton bleibt, wie er ist. Nur neu kodiert.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                GridRow {
+                    rowLabel("Codec")
+                    Picker("Codec", selection: $vm.targetCodec) {
+                        Text("HEVC / H.265").tag("hevc")
+                        Text("AV1 (experimentell)").tag("av1")
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .help(vm.targetCodec == "av1"
+                          ? "Kleinere Dateien, deutlich langsamer. Braucht neuere Geräte."
+                          : "Hardware-Encoder, schnell. Läuft auf praktisch jedem Gerät.")
+                }
+                GridRow {
+                    rowLabel("Audio")
+                    Picker("Audio", selection: $vm.audioMode) {
+                        Text("Original").tag("standard")
+                        Text("Angleichen").tag("enhanced")
+                        Text("Ohne Ton").tag("none")
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .help(vm.audioMode == "enhanced"
+                          ? "Lautheit auf −16 LUFS: leise Handyvideos werden hörbar, laute gezähmt."
+                          : vm.audioMode == "none"
+                          ? "Die neue Datei ist stumm."
+                          : "Der Ton bleibt, wie er ist. Nur neu kodiert.")
+                }
             }
+            Text(settingsNote)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
 
             OptionSection(title: "Dateien") {
                 VStack(spacing: 0) {
@@ -211,7 +257,7 @@ struct OptionsStep: View {
                         }
                         Divider().padding(.leading, 50)
                     }
-                    if vm.hasTallCandidates {
+                    if vm.hasTallCandidates && vm.sizeLimitMB == 0 {
                         SettingRow(
                             icon: "arrow.down.right.and.arrow.up.left",
                             tint: .blue,
@@ -227,26 +273,58 @@ struct OptionsStep: View {
                         .help("\(videoCount(vm.tallCandidatesCount)) über 1080p. Das Seitenverhältnis bleibt.")
                         Divider().padding(.leading, 50)
                     }
+                    if vm.canHalveFrameRate {
+                        SettingRow(
+                            icon: "speedometer",
+                            tint: .orange,
+                            title: "Auf 30 Bilder/s",
+                            subtitle: vm.sizeLimitMB > 0
+                                ? "Mehr Schärfe in derselben Größe. Zeitlupen bleiben."
+                                : "Spart zusätzlich ca. \(formatMB(vm.halfFrameRateExtraSavedMB)). Zeitlupen bleiben."
+                        ) {
+                            Toggle("", isOn: $vm.halveFrameRate)
+                                .toggleStyle(.switch)
+                                .labelsHidden()
+                        }
+                        .help("60-fps-Videos werden zu 30, 50 zu 25. Schnelle Bewegung wirkt etwas weniger flüssig.")
+                        Divider().padding(.leading, 50)
+                    }
                     SettingRow(
-                        icon: "trash.fill",
-                        tint: vm.moveToTrash && !vm.isTrimmed ? .red : .gray,
-                        title: "Originale in den Papierkorb",
-                        subtitle: vm.isTrimmed
-                            ? "Beim Kürzen bleibt das Original erhalten."
-                            : vm.moveToTrash
-                            ? "Erst nach bestandenem Qualitätscheck."
-                            : "Aus: Original bleibt neben der _opt.mp4."
+                        icon: "rectangle.compress.vertical",
+                        tint: .teal,
+                        title: "Schwarze Balken abschneiden",
+                        subtitle: "Nur wo welche sind. Das Bild selbst bleibt ganz."
                     ) {
-                        Toggle("", isOn: $vm.moveToTrash)
+                        Toggle("", isOn: $vm.cropBars)
                             .toggleStyle(.switch)
                             .labelsHidden()
-                            .disabled(vm.isTrimmed)
+                    }
+                    // Under a size the original always stays: the small copy is for sending.
+                    if vm.sizeLimitMB == 0 {
+                        Divider().padding(.leading, 50)
+                        SettingRow(
+                            icon: "trash.fill",
+                            tint: vm.moveToTrash && !vm.isTrimmed ? .red : .gray,
+                            title: "Originale in den Papierkorb",
+                            subtitle: vm.isTrimmed
+                                ? "Beim Kürzen bleibt das Original erhalten."
+                                : vm.moveToTrash
+                                ? "Erst nach bestandenem Qualitätscheck."
+                                : "Aus: Original bleibt neben der _opt.mp4."
+                        ) {
+                            Toggle("", isOn: $vm.moveToTrash)
+                                .toggleStyle(.switch)
+                                .labelsHidden()
+                                .disabled(vm.isTrimmed)
+                        }
                     }
                 }
                 .cardBackground()
             }
 
-            previewCard
+            if vm.sizeLimitMB == 0 {
+                previewCard
+            }
         }
     }
 
@@ -281,7 +359,7 @@ struct OptionsStep: View {
             Text(vm.previewError
                  ?? (vm.previewingId != nil
                      ? "Erstelle Vorschau …"
-                     : "Kodiert die schwierigste Stelle in Sekunden – zum Prüfen vor dem Encode."))
+                     : "Die schwierigste Stelle, in Sekunden kodiert – zum Prüfen vorab."))
                 .font(.caption)
                 .foregroundStyle(vm.previewError == nil ? Color.secondary : Color.orange)
                 .fixedSize(horizontal: false, vertical: true)

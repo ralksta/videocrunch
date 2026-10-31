@@ -38,6 +38,15 @@ class WizardViewModel: ObservableObject {
     /// The sound as recorded unless the user asks for loudness levelling.
     @Published var audioMode: String = "standard"
     @Published var scaleTo1080p: Bool = false
+    /// 48–60 fps footage at half the rate (slow motion is never touched).
+    @Published var halveFrameRate: Bool = false
+    /// Letterbox/pillarbox bars cut away, where the encode finds any.
+    @Published var cropBars: Bool = false
+    /// 0: the quality search decides the size. Otherwise every video comes
+    /// in under this many MB (fit.py), for a mail or a chat.
+    @Published var sizeLimitMB: Int = 0
+    /// The limit the last run had, for the last page's wording.
+    @Published var lastRunSizeLimitMB: Int = 0
     @Published var moveToTrash: Bool = false
     @Published var minSSIMOverride: Double? = nil
     /// Trim for a single selected video, in seconds of the source.
@@ -49,6 +58,8 @@ class WizardViewModel: ObservableObject {
     @Published var gifWidth: Int = 480
     @Published var gifFPS: Int = 15
     @Published var gifQuality: Double = 90
+    /// Playback speed: 0.5 slow motion, 2 twice as fast.
+    @Published var gifSpeed: Double = 1
     @Published var gifEstimate: GifEstimate?
     @Published var isEstimatingGif = false
     /// The finished GIF (or why there is none), for the last step.
@@ -320,11 +331,28 @@ class WizardViewModel: ObservableObject {
         return max(0, min(1, (trimEnd - trimStart) / duration))
     }
 
-    /// Expected size of one file's result, with downscale and trim.
-    private func estimatedAfterMB(_ c: Candidate) -> Double {
+    /// Expected size of one file's result, with downscale, frame rate and trim.
+    private func estimatedAfterMB(_ c: Candidate, halving: Bool? = nil) -> Double {
+        if sizeLimitMB > 0 {
+            // What fits, or the file as it is when it already does.
+            return min(c.size_mb * keptFraction(c), Double(sizeLimitMB))
+        }
         let pct = scaleTo1080p ? (c.estimated_saved_pct_1080 ?? c.estimated_saved_pct)
                                : c.estimated_saved_pct
-        return c.size_mb * keptFraction(c) * (1 - pct / 100)
+        let rate = (halving ?? halveFrameRate) ? (c.half_fps_size_factor ?? 1) : 1
+        return c.size_mb * keptFraction(c) * (1 - pct / 100) * rate
+    }
+
+    /// Some of the selection is 48–60 fps.
+    var canHalveFrameRate: Bool {
+        selectedCandidates.contains { $0.half_fps_size_factor != nil }
+    }
+
+    /// What halving the frame rate adds to the saving, with the other settings as they are.
+    var halfFrameRateExtraSavedMB: Double {
+        selectedCandidates.reduce(0.0) { sum, c in
+            sum + estimatedAfterMB(c, halving: false) - estimatedAfterMB(c, halving: true)
+        }
     }
 
     /// Follows the 1080p switch and the trim.
@@ -438,14 +466,35 @@ class WizardViewModel: ObservableObject {
         let trim = isTrimmed ? (start: trimStart, end: trimEnd) : nil
         lastRunTrim = trim.flatMap { t in trimTarget.map { (path: $0.file_path, start: t.start) } }
 
+        lastRunSizeLimitMB = sizeLimitMB
+        if sizeLimitMB > 0 {
+            // Under a size: fit.py picks bitrate and resolution itself.
+            var args = [
+                scriptDir.appendingPathComponent("fit.py").path,
+                "--files-from", fileListURL.path,
+                "--max-mb", String(sizeLimitMB),
+                "--codec", targetCodec,
+                "--json-out", resultJsonPath,
+                "--events"
+            ] + editArguments
+            if let trim {
+                args.append(contentsOf: ["--ss", String(format: "%.3f", trim.start),
+                                         "--to", String(format: "%.3f", trim.end)])
+            }
+            launchWithEvents(args, script: "fit.py", resultPath: resultJsonPath) { data in
+                try? FileManager.default.removeItem(at: fileListURL)
+                self.finishBatch(report: data.flatMap { try? JSONDecoder().decode(BatchReport.self, from: $0) })
+            }
+            return
+        }
+
         var args = [
             scriptDir.appendingPathComponent("batch.py").path,
             "--files-from", fileListURL.path,
-            "--audio-mode", audioMode,
             "--codec", targetCodec,
             "--json-out", resultJsonPath,
             "--events"
-        ]
+        ] + editArguments
         if scaleTo1080p {
             args.append(contentsOf: ["--scale-height", "1080"])
         }
@@ -464,6 +513,16 @@ class WizardViewModel: ObservableObject {
             try? FileManager.default.removeItem(at: fileListURL)
             self.finishBatch(report: data.flatMap { try? JSONDecoder().decode(BatchReport.self, from: $0) })
         }
+    }
+
+    /// Audio, frame rate and bars, the same for the run and its preview.
+    /// "none" is the audio picker's third choice: original sound, left out.
+    var editArguments: [String] {
+        var args = ["--audio-mode", audioMode == "none" ? "standard" : audioMode]
+        if audioMode == "none" { args.append("--no-audio") }
+        if halveFrameRate && canHalveFrameRate { args.append("--half-fps") }
+        if cropBars { args.append("--crop-bars") }
+        return args
     }
 
     /// Clears the encode page for a run of `total` files.
@@ -638,13 +697,15 @@ class WizardViewModel: ObservableObject {
     /// Changes whenever the expected GIF size would.
     var gifEstimateKey: String {
         guard isGif, let range = gifRange else { return "" }
-        return String(format: "%d-%d-%.0f-%.2f-%.2f", gifWidth, gifFPS, gifQuality, range.start, range.end)
+        return String(format: "%d-%d-%.0f-%.2f-%.2f-%.2f", gifWidth, gifFPS, gifQuality, gifSpeed,
+                      range.start, range.end)
     }
 
     private func gifArguments(for c: Candidate, range: (start: Double, end: Double)) -> [String] {
         [scriptDir.appendingPathComponent("gif.py").path, c.file_path,
          "--ss", String(format: "%.3f", range.start), "--to", String(format: "%.3f", range.end),
-         "--width", String(gifWidth), "--fps", String(gifFPS), "--quality", String(Int(gifQuality))]
+         "--width", String(gifWidth), "--fps", String(gifFPS), "--quality", String(Int(gifQuality)),
+         "--speed", String(gifSpeed)]
     }
 
     /// Re-estimates the GIF size half a second after the last change — the
@@ -727,7 +788,7 @@ class WizardViewModel: ObservableObject {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("videocrunch-preview-\(UUID().uuidString)")
         var args = [scriptDir.appendingPathComponent("videocrunch.py").path, candidate.file_path,
-                    "--preview", dir.path, "--audio-mode", audioMode, "--codec", targetCodec]
+                    "--preview", dir.path, "--codec", targetCodec] + editArguments
         if scaleTo1080p && candidate.canDownscale {
             args += ["--scale-height", "1080"]
         }

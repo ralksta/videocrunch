@@ -7,6 +7,7 @@ are what make Gifski's GIFs look good). Without gifski, ffmpeg's
 palettegen/paletteuse stand in.
 
     gif.py clip.mov --ss 3 --to 7 --width 480 --fps 15 --quality 90
+    gif.py clip.mov --speed 2           # twice as fast (0.5: slow motion)
     gif.py clip.mov --estimate          # expected size, from a short sample
     gif.py clip.mov --events            # JSON lines, as batch.py --events
 
@@ -65,9 +66,10 @@ def is_hdr(info: dict) -> bool:
     return str(info.get("color_transfer") or "") in HDR_TRANSFERS
 
 
-def video_filter(fps: int, width: int, hdr: bool) -> str:
-    """Frame rate first (fewer frames to scale), never wider than the source."""
-    steps = [f"fps={fps}", f"scale=w='min({width},iw)':h=-2:flags=lanczos"]
+def video_filter(fps: int, width: int, hdr: bool, speed: float = 1.0) -> str:
+    """Speed, then frame rate (fewer frames to scale), never wider than the source."""
+    steps = [f"setpts=PTS/{speed:g}"] if speed != 1 else []
+    steps += [f"fps={fps}", f"scale=w='min({width},iw)':h=-2:flags=lanczos"]
     if hdr:
         steps.append(TONEMAP)
     # 8-bit 4:2:0: what yuv4mpegpipe hands gifski (10-bit or NV12 it refuses).
@@ -118,10 +120,10 @@ def _pump(stream, sink: list) -> None:
         sink.append(chunk.decode("utf-8", "replace"))
 
 
-def _run_gifski(src, out, start, end, fps, width, quality, hdr, on_frames, procs):
+def _run_gifski(src, out, start, end, fps, width, quality, hdr, speed, on_frames, procs):
     reader = subprocess.Popen(
         _input_args(src, start, end, hdr)
-        + ["-vf", video_filter(fps, width, hdr), "-f", "yuv4mpegpipe", "-"],
+        + ["-vf", video_filter(fps, width, hdr, speed), "-f", "yuv4mpegpipe", "-"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     writer = subprocess.Popen(
         ["gifski", "--fps", str(fps), "--quality", str(quality), "--width", str(width),
@@ -145,8 +147,8 @@ def _run_gifski(src, out, start, end, fps, width, quality, hdr, on_frames, procs
                            or "gifski failed")
 
 
-def _run_ffmpeg(src, out, start, end, fps, width, hdr, on_frames, procs):
-    graph = (f"{video_filter(fps, width, hdr)},split[a][b];"
+def _run_ffmpeg(src, out, start, end, fps, width, hdr, speed, on_frames, procs):
+    graph = (f"{video_filter(fps, width, hdr, speed)},split[a][b];"
              f"[a]palettegen=stats_mode=diff[p];[b][p]paletteuse=dither=sierra2_4a")
     proc = subprocess.Popen(
         _input_args(src, start, end, hdr)
@@ -165,20 +167,21 @@ def _run_ffmpeg(src, out, start, end, fps, width, hdr, on_frames, procs):
         raise RuntimeError(err.strip()[-300:] or "ffmpeg failed")
 
 
-def encode(src, out, start, end, fps, width, quality, hdr, encoder, on_frames=lambda n: None):
+def encode(src, out, start, end, fps, width, quality, hdr, encoder, on_frames=lambda n: None,
+           speed=1.0):
     """Write the GIF to `out`. HDR falls back to no tone-mapping if OpenCL fails."""
     procs: list = []
     try:
         try:
             if encoder == "gifski":
-                _run_gifski(src, out, start, end, fps, width, quality, hdr, on_frames, procs)
+                _run_gifski(src, out, start, end, fps, width, quality, hdr, speed, on_frames, procs)
             else:
-                _run_ffmpeg(src, out, start, end, fps, width, hdr, on_frames, procs)
+                _run_ffmpeg(src, out, start, end, fps, width, hdr, speed, on_frames, procs)
         except RuntimeError:
             if not hdr:
                 raise
             # Washed-out colours beat no GIF at all.
-            encode(src, out, start, end, fps, width, quality, False, encoder, on_frames)
+            encode(src, out, start, end, fps, width, quality, False, encoder, on_frames, speed)
     finally:
         for p in procs:
             if p.poll() is None:
@@ -205,6 +208,8 @@ def build_parser():
     p.add_argument("--width", type=int, default=DEFAULT_WIDTH, help="Maximum width in pixels")
     p.add_argument("--fps", type=int, default=DEFAULT_FPS, help="Frames per second")
     p.add_argument("--quality", type=int, default=DEFAULT_QUALITY, help="1-100 (gifski)")
+    p.add_argument("--speed", type=float, default=1.0,
+                   help="Playback speed: 2 = twice as fast, 0.5 = slow motion")
     p.add_argument("--encoder", choices=["gifski", "ffmpeg"],
                    help="Default: gifski when installed, else ffmpeg")
     p.add_argument("--output", help="Where to write the GIF (default: next to the video)")
@@ -224,6 +229,8 @@ def main() -> int:
 
     src = Path(args.input)
     encoder = args.encoder or ("gifski" if shutil.which("gifski") else "ffmpeg")
+    if not 0.1 <= args.speed <= 10:
+        build_parser().error("--speed must be between 0.1 and 10")
     info = get_video_info(src) if src.is_file() else None
     start, end = clip_range(args.ss, args.to, (info or {}).get("duration") or 0.0)
     hdr = bool(info) and is_hdr(info)
@@ -236,7 +243,8 @@ def main() -> int:
         with tempfile.TemporaryDirectory(prefix="videocrunch_gif_") as tmp:
             sample = Path(tmp) / "sample.gif"
             try:
-                encode(src, sample, s0, s1, args.fps, args.width, args.quality, hdr, encoder)
+                encode(src, sample, s0, s1, args.fps, args.width, args.quality, hdr, encoder,
+                       speed=args.speed)
             except (RuntimeError, OSError) as e:
                 print(json.dumps({"error": str(e)}))
                 return 1
@@ -244,13 +252,13 @@ def main() -> int:
             print(json.dumps({
                 "estimated_bytes": extrapolate(sample.stat().st_size, s1 - s0, end - start),
                 "width": width, "height": height,
-                "frames": expected_frames(end - start, args.fps), "encoder": encoder,
+                "frames": expected_frames((end - start) / args.speed, args.fps), "encoder": encoder,
             }))
         return 0
 
     out = Path(args.output) if args.output else output_path_for(src)
     part = out.with_name(f".{out.name}.part")
-    total = expected_frames(end - start, args.fps)
+    total = expected_frames((end - start) / args.speed, args.fps)
     emit("start", total=1, workers=1, files=[str(src)])
     emit("file_start", worker=1, file=str(src), name=src.name)
 
@@ -262,11 +270,12 @@ def main() -> int:
     try:
         if not info or end <= start:
             raise RuntimeError("Video nicht lesbar oder leerer Bereich")
-        encode(src, part, start, end, args.fps, args.width, args.quality, hdr, encoder, on_frames)
+        encode(src, part, start, end, args.fps, args.width, args.quality, hdr, encoder, on_frames,
+               speed=args.speed)
         part.replace(out)
         width, height = gif_size(out)
         result.update(status="success", size_bytes=out.stat().st_size, width=width,
-                      height=height, frames=total, duration_sec=round(end - start, 3))
+                      height=height, frames=total, duration_sec=round((end - start) / args.speed, 3))
     except KeyboardInterrupt:
         result.update(status="cancelled", reason="Abgebrochen")
     except (RuntimeError, OSError) as e:

@@ -174,7 +174,9 @@ struct CompletedStep: View {
                        compact: true) { EmptyView() }
         } else {
             StatusHero(icon: "checkmark.circle.fill", tint: .green, title: "Fertig",
-                       message: vm.moveToTrash
+                       message: vm.lastRunSizeLimitMB > 0
+                           ? "Die Dateien liegen als _\(vm.lastRunSizeLimitMB)MB.mp4 neben den Originalen."
+                           : vm.moveToTrash
                            ? "Die Originale liegen im Papierkorb."
                            : "Die neuen Dateien liegen als _opt.mp4 neben den Originalen.",
                        compact: true) { EmptyView() }

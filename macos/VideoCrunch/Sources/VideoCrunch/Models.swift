@@ -17,6 +17,8 @@ struct Candidate: Identifiable, Codable, Hashable {
     /// Same file with the 1080p downscale on; nil when it is already 1080p.
     let estimated_saved_mb_1080: Double?
     let estimated_saved_pct_1080: Double?
+    /// 48–60 fps: the result's size with the frame rate halved, as a factor; nil otherwise.
+    var half_fps_size_factor: Double? = nil
     /// Encode time from past runs of this resolution class; nil without history.
     let estimated_runtime_sec: Double?
     /// Ticked before the user does anything; `advice` says why not.

@@ -121,7 +121,7 @@ class TestAbort:
                             lambda *a, **kw: [sys.executable, "-c", FAKE_WORKER])
         outcome = {}
         worker = threading.Thread(target=lambda: outcome.update(
-            r=batch.run_optimizer(("/v/a.mov", None, "standard", None, None, False, "hevc", None, None, 1))))
+            r=batch.run_optimizer(("/v/a.mov", None, "standard", None, None, False, "hevc", None, None, (), 1))))
         worker.start()
         for _ in range(100):
             if batch.active_workers:
@@ -137,7 +137,7 @@ class TestAbort:
     def test_file_never_started_is_cancelled_too(self):
         batch.abort_workers()
         _, ok, result = batch.run_optimizer(
-            ("/v/a.mov", None, "standard", None, None, False, "hevc", None, None, 1))
+            ("/v/a.mov", None, "standard", None, None, False, "hevc", None, None, (), 1))
         assert not ok
         assert result["status"] == "cancelled"
 
@@ -229,7 +229,7 @@ class TestEvents:
         monkeypatch.setattr(batch, "build_optimizer_command",
                             lambda *a, **kw: [sys.executable, "-c", EVENT_WORKER])
         batch.run_optimizer(("/v/Urlaub, Tag 1 mit langem Namen.mov", None, "standard",
-                             None, None, False, "hevc", None, None, 2))
+                             None, None, False, "hevc", None, None, (), 2))
         events = self._events(capture)
         kinds = [e["event"] for e in events]
         assert kinds[0] == "file_start"
