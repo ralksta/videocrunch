@@ -44,6 +44,17 @@ class WizardViewModel: ObservableObject {
     @Published var trimStart: Double = 0
     @Published var trimEnd: Double = 0
     private var trimId: String?
+    /// Video re-encode or GIF; the GIF needs the single video the trim is for.
+    @Published var outputMode: OutputMode = .video
+    @Published var gifWidth: Int = 480
+    @Published var gifFPS: Int = 15
+    @Published var gifQuality: Double = 90
+    @Published var gifEstimate: GifEstimate?
+    @Published var isEstimatingGif = false
+    /// The finished GIF (or why there is none), for the last step.
+    @Published var gifResult: GifResult?
+    private var estimateWork: DispatchWorkItem?
+    private var estimateGeneration = 0
     /// Where the last run's output starts in its source, for the comparison.
     private(set) var lastRunTrim: (path: String, start: Double)?
 
@@ -120,6 +131,7 @@ class WizardViewModel: ObservableObject {
         candidates = []
         selectedIds = []
         batchResults = []
+        gifResult = nil
         errorMessage = nil
         notice = nil
         scaleTo1080p = false
@@ -403,7 +415,59 @@ class WizardViewModel: ObservableObject {
 
     func startEncoding() {
         guard !selectedIds.isEmpty else { return }
+        if isGif {
+            startGif()
+            return
+        }
+        beginRun(total: selectedIds.count)
 
+        let toProcess = selectedCandidates.map { $0.file_path }
+        let tempDir = FileManager.default.temporaryDirectory
+        let resultJsonPath = tempDir.appendingPathComponent("videocrunch_batch_\(UUID().uuidString).json").path
+        // One path per line: --files splits on commas, and names contain them.
+        let fileListURL = tempDir.appendingPathComponent("videocrunch_files_\(UUID().uuidString).txt")
+        do {
+            try toProcess.map { $0 + "\n" }.joined().write(to: fileListURL, atomically: true, encoding: .utf8)
+        } catch {
+            isEncoding = false
+            errorMessage = "Dateiliste konnte nicht geschrieben werden: \(error.localizedDescription)"
+            return
+        }
+
+        // Trimming never replaces the original (videocrunch keeps it anyway).
+        let trim = isTrimmed ? (start: trimStart, end: trimEnd) : nil
+        lastRunTrim = trim.flatMap { t in trimTarget.map { (path: $0.file_path, start: t.start) } }
+
+        var args = [
+            scriptDir.appendingPathComponent("batch.py").path,
+            "--files-from", fileListURL.path,
+            "--audio-mode", audioMode,
+            "--codec", targetCodec,
+            "--json-out", resultJsonPath,
+            "--events"
+        ]
+        if scaleTo1080p {
+            args.append(contentsOf: ["--scale-height", "1080"])
+        }
+        if moveToTrash && !isTrimmed {
+            args.append("--replace")
+        }
+        if let trim {
+            args.append(contentsOf: ["--ss", String(format: "%.3f", trim.start),
+                                     "--to", String(format: "%.3f", trim.end)])
+        }
+        if let floor = minSSIMOverride {
+            args.append(contentsOf: ["--min-ssim", String(floor)])
+        }
+
+        launchWithEvents(args, script: "batch.py", resultPath: resultJsonPath) { data in
+            try? FileManager.default.removeItem(at: fileListURL)
+            self.finishBatch(report: data.flatMap { try? JSONDecoder().decode(BatchReport.self, from: $0) })
+        }
+    }
+
+    /// Clears the encode page for a run of `total` files.
+    private func beginRun(total: Int) {
         currentStep = .encoding
         isEncoding = true
         logs = []
@@ -411,66 +475,22 @@ class WizardViewModel: ObservableObject {
         batchProgress = BatchProgress()
         completedCount = 0
         failedCount = 0
-        totalToEncode = selectedIds.count
+        totalToEncode = total
         wasCancelled = false
         encodeStartedAt = Date()
         DockProgress.show(0)
         batchResults = []
+        gifResult = nil
         suggestedFloor = nil
         retryEligibleCandidates = []
+    }
 
-        let toProcess = selectedCandidates.map { $0.file_path }
-        let tempDir = FileManager.default.temporaryDirectory
-        let resultJsonPath = tempDir.appendingPathComponent("videocrunch_batch_\(UUID().uuidString).json").path
-        // One path per line: --files splits on commas, and names contain them.
-        let fileListURL = tempDir.appendingPathComponent("videocrunch_files_\(UUID().uuidString).txt")
-
-        let python = self.resolvePythonPath()
-        let batchScript = self.scriptDir.appendingPathComponent("batch.py").path
-        let audioM = self.audioMode
-        let scale1080 = self.scaleTo1080p
-        // Trimming never replaces the original (videocrunch keeps it anyway).
-        let trash = self.moveToTrash && !isTrimmed
-        let trim = isTrimmed ? (start: trimStart, end: trimEnd) : nil
-        lastRunTrim = trim.flatMap { t in trimTarget.map { (path: $0.file_path, start: t.start) } }
-        let ssimFloor = self.minSSIMOverride
-        let codec = self.targetCodec
-
+    /// Runs a script that speaks batch.py's --events, feeding the encode
+    /// page; `finish` gets its --json-out file once it exits (nil if none).
+    private func launchWithEvents(_ args: [String], script: String, resultPath: String,
+                                  finish: @escaping (Data?) -> Void) {
+        let python = resolvePythonPath()
         DispatchQueue.global(qos: .userInitiated).async {
-            do {
-                try toProcess.map { $0 + "\n" }.joined().write(to: fileListURL, atomically: true, encoding: .utf8)
-            } catch {
-                DispatchQueue.main.async {
-                    self.isEncoding = false
-                    self.errorMessage = "Dateiliste konnte nicht geschrieben werden: \(error.localizedDescription)"
-                }
-                return
-            }
-            defer { try? FileManager.default.removeItem(at: fileListURL) }
-
-            var args = [
-                batchScript,
-                "--files-from", fileListURL.path,
-                "--audio-mode", audioM,
-                "--codec", codec,
-                "--json-out", resultJsonPath,
-                "--events"
-            ]
-
-            if scale1080 {
-                args.append(contentsOf: ["--scale-height", "1080"])
-            }
-            if trash {
-                args.append("--replace")
-            }
-            if let trim {
-                args.append(contentsOf: ["--ss", String(format: "%.3f", trim.start),
-                                         "--to", String(format: "%.3f", trim.end)])
-            }
-            if let floor = ssimFloor {
-                args.append(contentsOf: ["--min-ssim", String(floor)])
-            }
-
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: python)
             proc.arguments = args
@@ -501,22 +521,17 @@ class WizardViewModel: ObservableObject {
                 try proc.run()
                 proc.waitUntilExit()
                 fileHandle.readabilityHandler = nil
-
-                var report: BatchReport? = nil
-                if let data = try? Data(contentsOf: URL(fileURLWithPath: resultJsonPath)) {
-                    report = try? JSONDecoder().decode(BatchReport.self, from: data)
-                }
-
-                let finalReport = report
+                let data = try? Data(contentsOf: URL(fileURLWithPath: resultPath))
+                try? FileManager.default.removeItem(atPath: resultPath)
                 DispatchQueue.main.async {
                     self.isEncoding = false
                     self.currentProcess = nil
-                    self.finishBatch(report: finalReport)
+                    finish(data)
                 }
             } catch {
                 DispatchQueue.main.async {
                     self.isEncoding = false
-                    self.errorMessage = "Fehler beim Ausführen von batch.py: \(error.localizedDescription)"
+                    self.errorMessage = "Fehler beim Ausführen von \(script): \(error.localizedDescription)"
                 }
             }
         }
@@ -605,6 +620,96 @@ class WizardViewModel: ObservableObject {
     /// Colours and cursor moves (batch.py redraws its table in place).
     nonisolated static func stripANSI(_ text: String) -> String {
         text.replacingOccurrences(of: "\u{1B}\\[[0-9;]*[A-Za-z]", with: "", options: .regularExpression)
+    }
+
+    // MARK: - GIF
+
+    /// GIF mode is on and there is one video to make it from.
+    var isGif: Bool {
+        outputMode == .gif && trimTarget != nil
+    }
+
+    /// The part of the video the GIF shows: the trim, set up on the options page.
+    var gifRange: (start: Double, end: Double)? {
+        guard let c = trimTarget, let duration = c.duration_sec else { return nil }
+        return c.id == trimId ? (trimStart, trimEnd) : (0, duration)
+    }
+
+    /// Changes whenever the expected GIF size would.
+    var gifEstimateKey: String {
+        guard isGif, let range = gifRange else { return "" }
+        return String(format: "%d-%d-%.0f-%.2f-%.2f", gifWidth, gifFPS, gifQuality, range.start, range.end)
+    }
+
+    private func gifArguments(for c: Candidate, range: (start: Double, end: Double)) -> [String] {
+        [scriptDir.appendingPathComponent("gif.py").path, c.file_path,
+         "--ss", String(format: "%.3f", range.start), "--to", String(format: "%.3f", range.end),
+         "--width", String(gifWidth), "--fps", String(gifFPS), "--quality", String(Int(gifQuality))]
+    }
+
+    /// Re-estimates the GIF size half a second after the last change — the
+    /// trim handles fire on every pixel they move.
+    func requestGifEstimate() {
+        estimateWork?.cancel()
+        estimateGeneration += 1
+        guard isGif, let c = trimTarget, let range = gifRange, range.end > range.start else {
+            gifEstimate = nil
+            isEstimatingGif = false
+            return
+        }
+        let generation = estimateGeneration
+        let args = gifArguments(for: c, range: range) + ["--estimate"]
+        let python = resolvePythonPath()
+        isEstimatingGif = true
+        let work = DispatchWorkItem {
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: python)
+            proc.arguments = args
+            proc.environment = WizardViewModel.toolEnvironment()
+            let pipe = Pipe()
+            proc.standardOutput = pipe
+            proc.standardError = FileHandle.nullDevice
+            var estimate: GifEstimate?
+            if (try? proc.run()) != nil {
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                proc.waitUntilExit()
+                estimate = try? JSONDecoder().decode(GifEstimate.self, from: data)
+            }
+            DispatchQueue.main.async {
+                guard generation == self.estimateGeneration else { return }
+                self.gifEstimate = estimate
+                self.isEstimatingGif = false
+            }
+        }
+        estimateWork = work
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.5, execute: work)
+    }
+
+    private func startGif() {
+        guard let c = trimTarget, let range = gifRange else { return }
+        beginRun(total: 1)
+        lastRunTrim = nil
+        let resultPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("videocrunch_gif_\(UUID().uuidString).json").path
+        let args = gifArguments(for: c, range: range) + ["--json-out", resultPath, "--events"]
+        launchWithEvents(args, script: "gif.py", resultPath: resultPath) { data in
+            self.finishGif(data.flatMap { try? JSONDecoder().decode(GifResult.self, from: $0) })
+        }
+    }
+
+    private func finishGif(_ result: GifResult?) {
+        gifResult = result ?? GifResult(status: wasCancelled ? "cancelled" : "failed",
+                                        output_path: nil, size_bytes: nil, width: nil, height: nil,
+                                        frames: nil, reason: wasCancelled ? "Abgebrochen" : "gif.py lieferte kein Ergebnis",
+                                        encoder: nil)
+        completedCount = gifResult?.isSuccess == true ? 1 : 0
+        failedCount = 1 - completedCount
+        currentStep = .completed
+        DockProgress.show(nil)
+        if let result, result.isSuccess, let path = result.output_path {
+            Notifier.notify(title: "GIF fertig",
+                            body: "\(URL(fileURLWithPath: path).lastPathComponent), \(formatBytes(result.size_bytes ?? 0))")
+        }
     }
 
     // MARK: - Preview

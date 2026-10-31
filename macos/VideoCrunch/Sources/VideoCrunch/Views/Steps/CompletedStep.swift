@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// Step 5: what the run achieved.
@@ -18,6 +19,54 @@ struct CompletedStep: View {
     }
 
     var body: some View {
+        if let gif = vm.gifResult {
+            gifView(gif)
+        } else {
+            batchView
+        }
+    }
+
+    /// A GIF run: the GIF itself, playing, with what it weighs.
+    private func gifView(_ gif: GifResult) -> some View {
+        VStack(spacing: 18) {
+            if gif.isSuccess, let path = gif.output_path {
+                let url = URL(fileURLWithPath: path)
+                AnimatedImage(url: url)
+                    .frame(maxWidth: CGFloat(gif.width ?? 480), maxHeight: .infinity)
+                    .aspectRatio(CGFloat(gif.width ?? 16) / CGFloat(max(gif.height ?? 9, 1)), contentMode: .fit)
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .shadow(radius: 6, y: 2)
+                VStack(spacing: 4) {
+                    Text(url.lastPathComponent)
+                        .font(.headline)
+                    Text("\(formatBytes(gif.size_bytes ?? 0)) · \(gif.width ?? 0) × \(gif.height ?? 0) · \(gif.frames ?? 0) Bilder")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+                HStack {
+                    Button {
+                        NSWorkspace.shared.open(url)
+                    } label: {
+                        Label("Öffnen", systemImage: "eye")
+                    }
+                    ShareLink(item: url) {
+                        Label("Teilen", systemImage: "square.and.arrow.up")
+                    }
+                }
+            } else if gif.status == "cancelled" {
+                StatusHero(icon: "stop.circle.fill", tint: .orange, title: "Abgebrochen",
+                           message: "Es wurde kein GIF geschrieben.", compact: true) { EmptyView() }
+            } else {
+                StatusHero(icon: "xmark.octagon.fill", tint: .red, title: "GIF fehlgeschlagen",
+                           message: gif.reason ?? "Unbekannter Fehler", compact: true) { EmptyView() }
+            }
+        }
+        .padding(24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var batchView: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 completedHeadline
@@ -131,4 +180,21 @@ struct CompletedStep: View {
                        compact: true) { EmptyView() }
         }
     }
+}
+
+/// A GIF that plays: NSImageView animates GIFs, SwiftUI's Image does not.
+struct AnimatedImage: NSViewRepresentable {
+    let url: URL
+
+    func makeNSView(context: Context) -> NSImageView {
+        let view = NSImageView()
+        view.animates = true
+        view.imageScaling = .scaleProportionallyUpOrDown
+        view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        view.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+        view.image = NSImage(contentsOf: url)
+        return view
+    }
+
+    func updateNSView(_ view: NSImageView, context: Context) {}
 }

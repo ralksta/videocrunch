@@ -89,6 +89,9 @@ struct WorkerStatus: Identifiable {
     /// then a quality check — so one pass's 100 % is not the file's 100 %.
     var fileFraction: Double {
         switch status {
+        case "running" where phase == "gif":
+            // One pass that gif.py measures in frames itself.
+            return min(0.99, Double(progress) / 100)
         case "running":
             let step = Double(progress) / 100
             let within = phase == "check" ? 0.8 + 0.2 * step : (phase == "encode" ? 0.8 * step : 0)
@@ -181,6 +184,33 @@ struct DolbyVision: Codable {
 }
 
 /// What videocrunch.py --preview wrote to preview.json.
+enum OutputMode: Hashable {
+    case video, gif
+}
+
+/// `gif.py --estimate`: the expected GIF, from a short sample.
+struct GifEstimate: Codable, Equatable {
+    let estimated_bytes: Int64
+    let width: Int
+    let height: Int
+    let frames: Int
+    let encoder: String
+}
+
+/// `gif.py --json-out`: the GIF that was made, or why not.
+struct GifResult: Codable, Equatable {
+    let status: String
+    let output_path: String?
+    let size_bytes: Int64?
+    let width: Int?
+    let height: Int?
+    let frames: Int?
+    let reason: String?
+    let encoder: String?
+
+    var isSuccess: Bool { status == "success" }
+}
+
 struct PreviewResult: Codable {
     let quality: Int
     let ssim: Double

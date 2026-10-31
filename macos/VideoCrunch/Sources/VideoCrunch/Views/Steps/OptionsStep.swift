@@ -11,7 +11,11 @@ struct OptionsStep: View {
     /// settings column scrolls on its own only in a very small window.
     var body: some View {
         VStack(spacing: 16) {
-            savingsSummary
+            if vm.isGif {
+                gifSummary
+            } else {
+                savingsSummary
+            }
 
             HStack(alignment: .top, spacing: 16) {
                 if let target = vm.trimTarget, let duration = target.duration_sec {
@@ -34,6 +38,8 @@ struct OptionsStep: View {
             }
             .frame(maxHeight: .infinity, alignment: .top)
         }
+        .onAppear { vm.requestGifEstimate() }
+        .onChange(of: vm.gifEstimateKey) { vm.requestGifEstimate() }
         .padding(.horizontal, 24)
         .padding(.vertical, 16)
         .frame(maxWidth: 1100)
@@ -41,6 +47,113 @@ struct OptionsStep: View {
     }
 
     private var settingsColumn: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            if vm.trimTarget != nil {
+                // One video: shrink it, or make a GIF of it, the Gifski way.
+                Picker("Ergebnis", selection: $vm.outputMode) {
+                    Label("Video verkleinern", systemImage: "film").tag(OutputMode.video)
+                    Label("GIF erstellen", systemImage: "photo.stack").tag(OutputMode.gif)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+            }
+            if vm.isGif {
+                gifSettings
+            } else {
+                videoSettings
+            }
+        }
+    }
+
+    private var gifSettings: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            OptionSection(title: "Breite") {
+                Picker("Breite", selection: $vm.gifWidth) {
+                    ForEach([320, 480, 640, 800], id: \.self) { Text("\($0)").tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(maxWidth: .infinity)
+                Text("Pixel. Kleiner wird nie hochskaliert.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            OptionSection(title: "Bildrate") {
+                Picker("Bildrate", selection: $vm.gifFPS) {
+                    ForEach([10, 15, 20, 25], id: \.self) { Text("\($0)").tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(maxWidth: .infinity)
+                Text("Bilder pro Sekunde. Mehr wirkt flüssiger und wiegt mehr.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            OptionSection(title: "Qualität") {
+                HStack {
+                    Slider(value: $vm.gifQuality, in: 30...100, step: 5)
+                    Text("\(Int(vm.gifQuality))")
+                        .monospacedDigit()
+                        .frame(width: 30, alignment: .trailing)
+                }
+                Text("Weniger Qualität: kleinere Datei, mehr Bildrauschen.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            if let range = vm.gifRange, range.end - range.start > 15 {
+                Label("\(formatDuration(range.end - range.start)) sind lang für ein GIF – links kürzen.",
+                      systemImage: "scissors")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    /// The GIF's expected size, from a two-second sample.
+    private var gifSummary: some View {
+        HStack(alignment: .firstTextBaseline) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("GIF aus \(vm.trimTarget?.filename ?? "")")
+                    .font(.headline)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Group {
+                    if let e = vm.gifEstimate {
+                        Text("\(e.width) × \(e.height) · \(e.frames) Bilder · \(e.encoder)")
+                    } else if let range = vm.gifRange {
+                        Text("\(formatDuration(range.end - range.start)) · \(vm.gifFPS) Bilder/s")
+                    }
+                }
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+            }
+            Spacer()
+            VStack(alignment: .trailing, spacing: 2) {
+                if let e = vm.gifEstimate {
+                    Text("ca. \(formatBytes(e.estimated_bytes))")
+                        .font(.system(size: 22, weight: .bold, design: .rounded))
+                        .monospacedDigit()
+                } else {
+                    Text("–")
+                        .font(.system(size: 22, weight: .bold, design: .rounded))
+                }
+                HStack(spacing: 4) {
+                    if vm.isEstimatingGif {
+                        ProgressView().controlSize(.mini)
+                    }
+                    Text(vm.isEstimatingGif ? "schätze …" : "geschätzt")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding(14)
+        .cardBackground()
+    }
+
+    private var videoSettings: some View {
         VStack(alignment: .leading, spacing: 14) {
             OptionSection(title: "Codec") {
                 Picker("Codec", selection: $vm.targetCodec) {

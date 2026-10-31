@@ -17,6 +17,9 @@ window.
   Silicon), NVIDIA NVENC, or Intel QuickSync. `libx265` (software) works as a
   fallback but is much slower.
 
+Optional: [gifski](https://gif.ski) (`brew install gifski`) for the GIF
+export; without it ffmpeg's palette filters make the GIF.
+
 For the macOS app only: macOS 14+ and the Swift toolchain from the Xcode
 Command Line Tools (`xcode-select --install`). The installer builds the app
 from source.
@@ -142,6 +145,19 @@ phase, pass, quality and percent, `file_done`, `summary`); the app reads
 those instead of the table. Sending it SIGTERM cancels
 the batch: running encodes stop and clean up, queued ones never start, and
 those files are reported as `cancelled`.
+
+### 4. `gif.py` — a GIF from a video
+
+```bash
+python3 gif.py clip.mov --ss 3 --to 7 --width 480 --fps 15 --quality 90
+python3 gif.py clip.mov --estimate     # expected size as JSON, from a 2 s sample
+```
+
+Writes `clip.gif` next to the video (`clip 2.gif` if that exists; nothing is
+replaced). ffmpeg cuts the range, drops to the frame rate, scales (never up)
+and tone-maps HDR (iPhone HLG, HDR10) to BT.709; gifski makes the GIF, or
+ffmpeg's `palettegen`/`paletteuse` when gifski is not installed
+(`--encoder` picks one). `--json-out` and `--events` work as in `batch.py`.
 
 ## How the quality search works
 
@@ -295,6 +311,11 @@ same ladder, same quality target as the full run — and opens it in the
 comparison window, so the result can be judged before an hour of encoding.
 On the command line: `videocrunch.py FILE --preview DIR` writes `source.mp4`,
 `preview.mp4` and `preview.json` there and nothing next to the source.
+
+With a single video selected, the options page can also make a GIF instead
+(*Video verkleinern | GIF erstellen*): width, frame rate and quality, the
+trim as its range, and the expected size next to the button, like Gifski.
+The finished GIF plays on the last page, next to *Öffnen* and *Teilen*.
 
 With a single video selected, the options page offers *Kürzen*: a preview,
 a filmstrip and two handles to cut the start and end before encoding (the
