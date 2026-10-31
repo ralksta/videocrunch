@@ -73,7 +73,7 @@ struct OptionsStep: View {
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
-                .frame(maxWidth: .infinity)
+                .fixedSize()
                 Text("Pixel. Kleiner wird nie hochskaliert.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -84,7 +84,7 @@ struct OptionsStep: View {
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
-                .frame(maxWidth: .infinity)
+                .fixedSize()
                 Text("Bilder pro Sekunde. Mehr wirkt flüssiger und wiegt mehr.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
