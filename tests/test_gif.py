@@ -56,6 +56,14 @@ class TestFilters:
         for hdr in (True, False):
             assert gif.video_filter(fps=15, width=480, hdr=hdr).endswith("format=yuv420p")
 
+    def test_speed_comes_before_the_frame_rate(self):
+        # Twice as fast at 15 fps: every other source frame, still 15 per second.
+        vf = gif.video_filter(fps=15, width=480, hdr=False, speed=2)
+        assert vf.startswith("setpts=PTS/2,fps=15")
+
+    def test_normal_speed_adds_nothing(self):
+        assert "setpts" not in gif.video_filter(fps=15, width=480, hdr=False, speed=1)
+
     def test_hdr_is_recognised_by_its_transfer(self):
         assert gif.is_hdr({"color_transfer": "arib-std-b67"})
         assert gif.is_hdr({"color_transfer": "smpte2084"})
@@ -148,6 +156,21 @@ class TestRealExport:
 
     def test_with_ffmpeg_alone(self, clip, tmp_path):
         self._check(clip, tmp_path, "--encoder", "ffmpeg")
+
+    def test_twice_as_fast_has_half_the_frames(self, clip, tmp_path):
+        out = tmp_path / "fast.gif"
+        report = tmp_path / "fast.json"
+        run = self._run(clip, "--width", 160, "--fps", 10, "--speed", 2, "--to", 3,
+                        "--output", out, "--json-out", report)
+        assert run.returncode == 0, run.stdout + run.stderr
+        result = json.loads(report.read_text())
+        assert result["frames"] == 15
+        assert result["duration_sec"] == 1.5
+        frames = subprocess.run(
+            ["ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
+             "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", str(out)],
+            capture_output=True, text=True).stdout.strip()
+        assert 13 <= int(frames) <= 17  # 3 s at 2x = 1.5 s at 10 fps
 
     def test_events_are_json_lines(self, clip, tmp_path):
         run = self._run(clip, "--width", 160, "--fps", 8, "--to", 1,

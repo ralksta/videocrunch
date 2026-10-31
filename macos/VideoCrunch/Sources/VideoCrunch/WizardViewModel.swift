@@ -49,6 +49,8 @@ class WizardViewModel: ObservableObject {
     @Published var gifWidth: Int = 480
     @Published var gifFPS: Int = 15
     @Published var gifQuality: Double = 90
+    /// Playback speed: 0.5 slow motion, 2 twice as fast.
+    @Published var gifSpeed: Double = 1
     @Published var gifEstimate: GifEstimate?
     @Published var isEstimatingGif = false
     /// The finished GIF (or why there is none), for the last step.
@@ -638,13 +640,15 @@ class WizardViewModel: ObservableObject {
     /// Changes whenever the expected GIF size would.
     var gifEstimateKey: String {
         guard isGif, let range = gifRange else { return "" }
-        return String(format: "%d-%d-%.0f-%.2f-%.2f", gifWidth, gifFPS, gifQuality, range.start, range.end)
+        return String(format: "%d-%d-%.0f-%.2f-%.2f-%.2f", gifWidth, gifFPS, gifQuality, gifSpeed,
+                      range.start, range.end)
     }
 
     private func gifArguments(for c: Candidate, range: (start: Double, end: Double)) -> [String] {
         [scriptDir.appendingPathComponent("gif.py").path, c.file_path,
          "--ss", String(format: "%.3f", range.start), "--to", String(format: "%.3f", range.end),
-         "--width", String(gifWidth), "--fps", String(gifFPS), "--quality", String(Int(gifQuality))]
+         "--width", String(gifWidth), "--fps", String(gifFPS), "--quality", String(Int(gifQuality)),
+         "--speed", String(gifSpeed)]
     }
 
     /// Re-estimates the GIF size half a second after the last change — the

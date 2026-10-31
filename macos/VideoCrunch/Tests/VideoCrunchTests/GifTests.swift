@@ -31,6 +31,9 @@ final class GifTests: XCTestCase {
         let before = h.vm.gifEstimateKey
         h.vm.gifWidth = 640
         XCTAssertNotEqual(h.vm.gifEstimateKey, before)
+        let atWidth = h.vm.gifEstimateKey
+        h.vm.gifSpeed = 2
+        XCTAssertNotEqual(h.vm.gifEstimateKey, atWidth, "the speed changes the size too")
     }
 
     func testGifProgressIsItsOwnPercent() {

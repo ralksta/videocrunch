@@ -89,6 +89,21 @@ struct OptionsStep: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            OptionSection(title: "Tempo") {
+                Picker("Tempo", selection: $vm.gifSpeed) {
+                    Text("½×").tag(0.5)
+                    Text("1×").tag(1.0)
+                    Text("2×").tag(2.0)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .fixedSize()
+                Text(vm.gifSpeed < 1 ? "Zeitlupe: doppelt so lang, doppelt so viele Bilder."
+                     : vm.gifSpeed > 1 ? "Zeitraffer: halb so lang, halb so groß."
+                     : "So schnell wie das Video.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             OptionSection(title: "Qualität") {
                 HStack {
                     Slider(value: $vm.gifQuality, in: 30...100, step: 5)
@@ -100,8 +115,8 @@ struct OptionsStep: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            if let range = vm.gifRange, range.end - range.start > 15 {
-                Label("\(formatDuration(range.end - range.start)) sind lang für ein GIF – links kürzen.",
+            if let range = vm.gifRange, (range.end - range.start) / vm.gifSpeed > 15 {
+                Label("\(formatDuration((range.end - range.start) / vm.gifSpeed)) sind lang für ein GIF – links kürzen.",
                       systemImage: "scissors")
                     .font(.caption)
                     .foregroundStyle(.orange)
@@ -122,7 +137,7 @@ struct OptionsStep: View {
                     if let e = vm.gifEstimate {
                         Text("\(e.width) × \(e.height) · \(e.frames) Bilder · \(e.encoder)")
                     } else if let range = vm.gifRange {
-                        Text("\(formatDuration(range.end - range.start)) · \(vm.gifFPS) Bilder/s")
+                        Text("\(formatDuration((range.end - range.start) / vm.gifSpeed)) · \(vm.gifFPS) Bilder/s")
                     }
                 }
                 .font(.subheadline)
