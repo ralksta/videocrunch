@@ -9,7 +9,8 @@ enum DockProgress {
 
     /// `fraction` 0…1 draws the bar; nil restores the plain icon.
     static func show(_ fraction: Double?) {
-        let tile = NSApp.dockTile
+        // No application object, no Dock tile (the logic tests run without one).
+        guard let tile = NSApp?.dockTile else { return }
         guard let fraction else {
             view = nil
             shownPercent = nil
