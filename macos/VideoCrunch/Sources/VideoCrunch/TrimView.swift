@@ -12,6 +12,11 @@ struct TrimEditor: View {
 
     @State private var player: AVPlayer?
     @State private var looper: RangeLooper?
+    /// Where the preview is, shown as a line on the filmstrip.
+    @State private var playhead: Double = 0
+    /// The filmstrip shows only this stretch when zoomed (the Lupe), so a
+    /// few seconds of a long video are more than a few pixels wide.
+    @State private var window: ClosedRange<Double>?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -25,9 +30,9 @@ struct TrimEditor: View {
             }
             .frame(minHeight: 140, maxHeight: .infinity)
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-            TrimTimeline(url: url, duration: duration, start: $start, end: $end) { time in
-                player?.seek(to: CMTime(seconds: time, preferredTimescale: 600),
-                             toleranceBefore: .zero, toleranceAfter: .zero)
+            TrimTimeline(url: url, duration: duration, visible: window ?? 0...duration,
+                         start: $start, end: $end, playhead: playhead) { time in
+                seek(time)
             }
             .frame(height: 52)
             HStack(spacing: 14) {
@@ -35,21 +40,56 @@ struct TrimEditor: View {
                 timeLabel("Ende", end)
                 timeLabel("Länge", end - start)
                 Spacer()
+                Button {
+                    start = min(playhead, end - TrimTimeline.minimumLength)
+                } label: {
+                    Image(systemName: "arrow.right.to.line")
+                        .accessibilityLabel("Anfang hierher")
+                }
+                .help("Anfang hierher, an die Stelle im Video (Taste I)")
+                .keyboardShortcut("i", modifiers: [])
+                Button {
+                    end = max(playhead, start + TrimTimeline.minimumLength)
+                } label: {
+                    Image(systemName: "arrow.left.to.line")
+                        .accessibilityLabel("Ende hierher")
+                }
+                .help("Ende hierher, an die Stelle im Video (Taste O)")
+                .keyboardShortcut("o", modifiers: [])
+                if window == nil {
+                    Button {
+                        zoom(true)
+                    } label: {
+                        Image(systemName: "plus.magnifyingglass")
+                        .accessibilityLabel("Lupe")
+                    }
+                    .help("Lupe: nur die Umgebung der Auswahl zeigen, für sekundengenaues Kürzen")
+                } else {
+                    Button {
+                        zoom(false)
+                    } label: {
+                        Image(systemName: "minus.magnifyingglass")
+                        .accessibilityLabel("Ganzes Video")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .help("Wieder das ganze Video zeigen")
+                }
                 if start > 0 || end < duration {
                     Button("Zurücksetzen") {
                         start = 0
                         end = duration
+                        window = nil
                     }
-                    .controlSize(.small)
                 }
             }
+            .controlSize(.small)
         }
         .padding(14)
         .cardBackground()
         .onAppear {
             let player = AVPlayer(url: url)
             self.player = player
-            looper = RangeLooper(player: player, start: start, end: end)
+            looper = RangeLooper(player: player, start: start, end: end) { playhead = $0 }
         }
         .onDisappear {
             player?.pause()
@@ -59,11 +99,23 @@ struct TrimEditor: View {
         .onChange(of: end) { looper?.update(start: start, end: end) }
     }
 
+    private func seek(_ time: Double) {
+        playhead = time
+        player?.seek(to: CMTime(seconds: time, preferredTimescale: 600),
+                     toleranceBefore: .zero, toleranceAfter: .zero)
+    }
+
+    /// Thirty seconds around the selection (more if it is longer), or all.
+    private func zoom(_ on: Bool) {
+        guard on else { window = nil; return }
+        window = TrimTimeline.zoomWindow(start: start, end: end, duration: duration)
+    }
+
     private func timeLabel(_ title: String, _ seconds: Double) -> some View {
         HStack(spacing: 4) {
             Text(title)
                 .foregroundStyle(.secondary)
-            Text(clock(seconds))
+            Text(preciseClock(seconds))
                 .monospacedDigit()
         }
         .font(.caption)
@@ -80,14 +132,18 @@ final class RangeLooper {
     private var observer: Any?
     private var endObserver: NSObjectProtocol?
 
-    init(player: AVPlayer, start: Double, end: Double) {
+    /// `onTime` hears where the player is, every 50 ms.
+    init(player: AVPlayer, start: Double, end: Double, onTime: @escaping (Double) -> Void = { _ in }) {
         self.player = player
         self.start = start
         self.end = end
         observer = player.addPeriodicTimeObserver(
             forInterval: CMTime(seconds: 0.05, preferredTimescale: 600), queue: .main
         ) { [weak self] time in
-            MainActor.assumeIsolated { self?.check(time.seconds) }
+            MainActor.assumeIsolated {
+                onTime(time.seconds)
+                self?.check(time.seconds)
+            }
         }
         // An untrimmed end is the file's end, where the player would stop.
         player.actionAtItemEnd = .none
@@ -147,23 +203,49 @@ func clock(_ seconds: Double) -> String {
     return h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%d:%02d", m, s)
 }
 
+/// "0:02.4": tenths, for trims a few seconds long.
+func preciseClock(_ seconds: Double) -> String {
+    let tenths = max(0, Int((seconds * 10).rounded()))
+    let m = tenths / 600, s = (tenths % 600) / 10, t = tenths % 10
+    return String(format: "%d:%02d.%d", m, s, t)
+}
+
 /// Filmstrip with a yellow selection whose ends are dragged.
-private struct TrimTimeline: View {
+struct TrimTimeline: View {
     let url: URL
     let duration: Double
+    /// The stretch of the video the strip spans: all of it, or the Lupe's.
+    let visible: ClosedRange<Double>
     @Binding var start: Double
     @Binding var end: Double
-    /// Called with the time under the handle being dragged, for the preview.
+    let playhead: Double
+    /// Called with the time under the handle being dragged, or clicked on
+    /// the strip, for the preview.
     let scrub: (Double) -> Void
 
     @State private var frames: [CGImage] = []
-    private let minimumLength = 1.0
+    static let minimumLength = 0.5
+    static let handleWidth: CGFloat = 14
     private let frameCount = 12
+
+    /// What the Lupe shows: the selection with room on both sides, at least
+    /// 30 s, inside the video.
+    static func zoomWindow(start: Double, end: Double, duration: Double) -> ClosedRange<Double> {
+        let length = min(duration, max(30, (end - start) * 3))
+        let lo = min(max(0, (start + end) / 2 - length / 2), duration - length)
+        return max(0, lo)...(max(0, lo) + length)
+    }
 
     var body: some View {
         GeometryReader { geo in
-            let width = geo.size.width
-            let x = { (t: Double) in width * CGFloat(t / max(duration, 0.001)) }
+            // The handles sit outside the selection, so even half a second
+            // between them leaves both to grab; the strip leaves them room.
+            let h = Self.handleWidth
+            let width = geo.size.width - 2 * h
+            let span = max(visible.upperBound - visible.lowerBound, 0.001)
+            let x = { (t: Double) in
+                h + min(width, max(0, width * CGFloat((t - visible.lowerBound) / span)))
+            }
             ZStack(alignment: .leading) {
                 HStack(spacing: 0) {
                     ForEach(frames.indices, id: \.self) { i in
@@ -177,45 +259,63 @@ private struct TrimTimeline: View {
                 .frame(width: width, height: geo.size.height, alignment: .leading)
                 .background(Color.secondary.opacity(0.2))
                 .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                .contentShape(Rectangle())
+                .onTapGesture(coordinateSpace: .named("trim")) { location in
+                    scrub(time(location.x, width))
+                }
+                .offset(x: h)
 
                 // What is cut away is dimmed.
                 Rectangle().fill(.black.opacity(0.6))
-                    .frame(width: x(start))
+                    .frame(width: x(start) - h)
+                    .offset(x: h)
+                    .allowsHitTesting(false)
                 Rectangle().fill(.black.opacity(0.6))
-                    .frame(width: max(0, width - x(end)))
+                    .frame(width: max(0, width + h - x(end)))
                     .offset(x: x(end))
+                    .allowsHitTesting(false)
 
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
                     .strokeBorder(Color.yellow, lineWidth: 3)
-                    .frame(width: max(6, x(end) - x(start)))
-                    .offset(x: x(start))
+                    .frame(width: x(end) - x(start) + 2 * h)
+                    .offset(x: x(start) - h)
                     .allowsHitTesting(false)
 
-                handle(at: x(start), label: "Anfang") { location in
-                    start = min(max(0, time(location, width)), end - minimumLength)
+                if visible.contains(playhead) {
+                    Rectangle().fill(.white)
+                        .frame(width: 2)
+                        .shadow(radius: 1)
+                        .offset(x: x(playhead) - 1)
+                        .allowsHitTesting(false)
+                }
+
+                handle(at: x(start) - h, label: "Anfang") { location in
+                    start = min(max(0, time(location + h / 2, width)), end - Self.minimumLength)
                     scrub(start)
                 }
-                handle(at: x(end) - 14, label: "Ende") { location in
-                    end = max(min(duration, time(location + 14, width)), start + minimumLength)
+                handle(at: x(end), label: "Ende") { location in
+                    end = max(min(duration, time(location - h / 2, width)), start + Self.minimumLength)
                     scrub(end)
                 }
             }
             .coordinateSpace(name: "trim")
         }
-        .task(id: url) {
-            frames = await Self.filmstrip(url: url, duration: duration, count: frameCount)
+        .task(id: visible) {
+            frames = await Self.filmstrip(url: url, range: visible, count: frameCount)
         }
     }
 
+    /// The time at `location` in the strip's coordinates (handle room included).
     private func time(_ location: CGFloat, _ width: CGFloat) -> Double {
-        Double(location / max(width, 1)) * duration
+        let fraction = Double(min(max(location - Self.handleWidth, 0), width) / max(width, 1))
+        return visible.lowerBound + fraction * (visible.upperBound - visible.lowerBound)
     }
 
     private func handle(at x: CGFloat, label: String,
                         drag: @escaping (CGFloat) -> Void) -> some View {
         RoundedRectangle(cornerRadius: 4, style: .continuous)
             .fill(Color.yellow)
-            .frame(width: 14)
+            .frame(width: Self.handleWidth)
             .overlay(Capsule().fill(.black.opacity(0.45)).frame(width: 3, height: 16))
             .offset(x: x)
             .gesture(DragGesture(coordinateSpace: .named("trim")).onChanged { value in
@@ -228,13 +328,18 @@ private struct TrimTimeline: View {
             }
     }
 
-    static func filmstrip(url: URL, duration: Double, count: Int) async -> [CGImage] {
+    static func filmstrip(url: URL, range: ClosedRange<Double>, count: Int) async -> [CGImage] {
         let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
         generator.appliesPreferredTrackTransform = true
         generator.maximumSize = CGSize(width: 240, height: 136)
+        let tolerance = CMTime(seconds: (range.upperBound - range.lowerBound) / Double(count * 4),
+                               preferredTimescale: 600)
+        generator.requestedTimeToleranceBefore = tolerance
+        generator.requestedTimeToleranceAfter = tolerance
         var images: [CGImage] = []
         for i in 0..<count {
-            let seconds = duration * (Double(i) + 0.5) / Double(count)
+            let seconds = range.lowerBound
+                + (range.upperBound - range.lowerBound) * (Double(i) + 0.5) / Double(count)
             if let frame = try? await generator.image(at: CMTime(seconds: seconds, preferredTimescale: 600)) {
                 images.append(frame.image)
             }

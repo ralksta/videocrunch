@@ -320,7 +320,10 @@ The finished GIF plays on the last page, next to *Öffnen* and *Teilen*.
 With a single video selected, the options page offers *Kürzen*: a preview,
 a filmstrip and two handles to cut the start and end before encoding (the
 original always stays; the savings estimate follows the cut). `batch.py`
-forwards `--ss`/`--to` per file for this.
+forwards `--ss`/`--to` per file for this. Playing loops the trimmed part. For
+a few seconds out of a long video: click the filmstrip to jump there, set
+the start and end at the playhead with I and O, and switch on the *Lupe*,
+which spreads 30 seconds around the selection over the whole strip.
 
 The selection list shows each video's thumbnail; the eye button or the space
 bar opens it in Quick Look. After a run, *Vergleichen* opens a window with the
