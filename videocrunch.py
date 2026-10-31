@@ -3042,6 +3042,33 @@ def build_parser():
     return parser
 
 
+def select_profile(encoder: str = 'auto', codec: str = 'hevc', preset: str = 'balanced') -> dict:
+    """The encoder profile for this machine, codec and preset (main, fit.py)."""
+    encoder_key = detect_encoder() if encoder == 'auto' else encoder
+
+    # AV1 codec override: map hardware encoder → AV1 variant
+    if codec == 'av1':
+        av1_map = {
+            'videotoolbox': 'av1_software',
+            'nvenc': 'av1_nvenc',
+        }
+        # An explicitly chosen AV1 profile needs no mapping — without this,
+        # `--encoder av1_nvenc --codec av1` would fall into the else branch and
+        # print "AV1 not supported for encoder 'av1_nvenc'".
+        av1_key = encoder_key if encoder_key.startswith('av1_') else av1_map.get(encoder_key)
+        if av1_key and av1_key in ENCODER_PROFILES:
+            print(f"{Y}🧪 AV1 Experimental: switching from {encoder_key} → {av1_key}{NC}")
+            encoder_key = av1_key
+        else:
+            print(f"{Y}⚠️  AV1 not supported for encoder '{encoder_key}', falling back to HEVC.{NC}")
+
+    # Apply user-selected encoding preset (fast / balanced / best)
+    profile = apply_encoding_preset(ENCODER_PROFILES[encoder_key], preset)
+    profile['_encoder_key'] = encoder_key  # for encode-history bucketing
+    profile['_target_codec'] = 'av1' if 'av1' in encoder_key else 'hevc'  # for the pre-flight gate
+    return profile
+
+
 def abort_on_sigterm(signum, frame):
     """batch.py cancels its workers with SIGTERM; take Ctrl+C's abort path.
 
@@ -3061,35 +3088,8 @@ def main():
     else:
         print("⚠️ No notification port provided. Status updates will be disabled.")
 
-    # Select encoder
-    if args.encoder == 'auto':
-        encoder_key = detect_encoder()
-    else:
-        encoder_key = args.encoder
-
-    # AV1 codec override: map hardware encoder → AV1 variant
-    if getattr(args, 'codec', 'hevc') == 'av1':
-        av1_map = {
-            'videotoolbox': 'av1_software',
-            'nvenc': 'av1_nvenc',
-        }
-        # An explicitly chosen AV1 profile needs no mapping — without this,
-        # `--encoder av1_nvenc --codec av1` would fall into the else branch and
-        # print "AV1 not supported for encoder 'av1_nvenc'".
-        av1_key = encoder_key if encoder_key.startswith('av1_') else av1_map.get(encoder_key)
-        if av1_key and av1_key in ENCODER_PROFILES:
-            print(f"{Y}🧪 AV1 Experimental: switching from {encoder_key} → {av1_key}{NC}")
-            encoder_key = av1_key
-        else:
-            print(f"{Y}⚠️  AV1 not supported for encoder '{encoder_key}', falling back to HEVC.{NC}")
-
-    profile = ENCODER_PROFILES[encoder_key]
-
-    # Apply user-selected encoding preset (fast / balanced / best)
     preset = getattr(args, 'preset', 'balanced')
-    profile = apply_encoding_preset(profile, preset)
-    profile['_encoder_key'] = encoder_key  # for encode-history bucketing
-    profile['_target_codec'] = 'av1' if 'av1' in encoder_key else 'hevc'  # for the pre-flight gate
+    profile = select_profile(args.encoder, getattr(args, 'codec', 'hevc'), preset)
     preset_labels = {'fast': '⚡ Fast', 'balanced': '⚖️  Balanced', 'best': '🏆 Best'}
     print(f"{BG}VIDEO OPTIMIZER V2.1{NC} - {G}{profile['name']}{NC} | Preset: {preset_labels.get(preset, preset)}")
     audio_mode_labels = {
@@ -3181,7 +3181,7 @@ def main():
                 append_encode_history({
                     'ts': datetime.now().isoformat(timespec='seconds'),
                     'file': last_encode_result['filename'],
-                    'encoder': encoder_key,
+                    'encoder': profile['_encoder_key'],
                     'codec': profile.get('codec'),
                     'height': last_encode_result.get('height'),
                     'source_kbps': last_encode_result.get('source_kbps'),
