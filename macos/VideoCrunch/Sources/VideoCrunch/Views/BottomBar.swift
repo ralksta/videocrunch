@@ -12,6 +12,9 @@ struct BottomBar: View {
         switch vm.currentStep {
         case .candidateSelection:
             return "\(vm.selectedCandidates.count) ausgewählt · ca. −\(formatMB(vm.selectedEstimatedSavedMB))"
+        case .options where vm.isGif:
+            return vm.gifEstimate.map { "GIF ca. \(formatBytes($0.estimated_bytes)) · \($0.width) × \($0.height)" }
+                ?? (vm.isEstimatingGif ? "Schätze GIF-Größe …" : nil)
         case .options:
             let time = vm.selectedRuntimeSec.map { " · dauert \(formatDuration($0))" } ?? ""
             return "Ergebnis ca. \(formatMB(vm.selectedTotalAfterMB)) · −\(formatMB(vm.selectedEstimatedSavedMB))" + time
@@ -32,7 +35,8 @@ struct BottomBar: View {
                 .disabled(!vm.isEncoding)
             } else if vm.currentStep == .completed, !vm.targetURLs.isEmpty {
                 Button {
-                    NSWorkspace.shared.activateFileViewerSelecting(vm.targetURLs)
+                    let gif = vm.gifResult?.output_path.map { URL(fileURLWithPath: $0) }
+                    NSWorkspace.shared.activateFileViewerSelecting(gif.map { [$0] } ?? vm.targetURLs)
                 } label: {
                     Label("Im Finder zeigen", systemImage: "folder")
                 }
@@ -64,7 +68,11 @@ struct BottomBar: View {
                 Button {
                     vm.startEncoding()
                 } label: {
-                    Label("Encode starten", systemImage: "play.fill")
+                    if vm.isGif {
+                        Label("GIF erstellen", systemImage: "photo.stack")
+                    } else {
+                        Label("Encode starten", systemImage: "play.fill")
+                    }
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)

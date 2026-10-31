@@ -121,6 +121,7 @@ struct WorkerRow: View {
     private var step: String? {
         guard worker.status == "running" else { return nil }
         switch worker.phase {
+        case "gif": return "Erstellt GIF · \(worker.progress) %"
         case "encode": return "Durchgang \(worker.pass) · encodiert \(worker.progress) %"
         case "check": return "Durchgang \(worker.pass) · prüft Qualität"
         default: return "Analysiert …"
