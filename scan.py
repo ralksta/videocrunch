@@ -39,8 +39,10 @@ from savings import (
     resolution_class,
 )
 from videocrunch import (
+    HALF_FPS_SIZE,
     MIN_QUALITY,
     MIN_SAVINGS,
+    can_halve_fps,
     downscale_bitrate_scale,
     ladder_top_factor,
     suggested_floor,
@@ -505,6 +507,10 @@ def rank(media: list[dict], target_codec: str, exclude_paths: set,
                                         if downscaled is not None else None),
             "estimated_saved_pct_1080": (round(downscaled, 1)
                                          if downscaled is not None else None),
+            # 48-60 fps footage: what the result weighs with the frame rate
+            # halved, as a factor on it; null when there is nothing to halve.
+            "half_fps_size_factor": (HALF_FPS_SIZE if can_halve_fps(m.get("frame_rate"))
+                                     else None),
             # Ticked in the app before the user does anything; `advice` says
             # why a listed file is not.
             "recommended": recommended,

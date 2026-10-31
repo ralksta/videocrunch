@@ -901,6 +901,11 @@ class Edits:
         return float(n) / float(d or 1)
 
 
+def can_halve_fps(fps) -> bool:
+    """48/50/60 fps: frames to spare. Slow motion (100 fps and up) has none."""
+    return bool(fps) and 45 <= float(fps) < 100
+
+
 def half_frame_rate(info: dict) -> Optional[str]:
     """Half of a 48/50/60 fps source's rate, or None.
 
@@ -915,7 +920,7 @@ def half_frame_rate(info: dict) -> Optional[str]:
         num, den = int(n), int(d or 1)
     except ValueError:
         return None
-    if den <= 0 or not 45 <= num / den < 100:
+    if den <= 0 or not can_halve_fps(num / den):
         return None
     return f"{num}/{den * 2}"
 

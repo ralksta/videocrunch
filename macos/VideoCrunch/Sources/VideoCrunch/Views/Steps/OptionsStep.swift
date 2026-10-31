@@ -194,12 +194,15 @@ struct OptionsStep: View {
             OptionSection(title: "Audio") {
                 Picker("Audio", selection: $vm.audioMode) {
                     Text("Original").tag("standard")
-                    Text("Lautheit angleichen").tag("enhanced")
+                    Text("Angleichen").tag("enhanced")
+                    Text("Ohne Ton").tag("none")
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
                 Text(vm.audioMode == "enhanced"
-                     ? "Auf −16 LUFS: leise Handyvideos werden hörbar, laute gezähmt."
+                     ? "Lautheit auf −16 LUFS: leise Handyvideos werden hörbar, laute gezähmt."
+                     : vm.audioMode == "none"
+                     ? "Die neue Datei ist stumm."
                      : "Der Ton bleibt, wie er ist. Nur neu kodiert.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -242,6 +245,31 @@ struct OptionsStep: View {
                         .help("\(videoCount(vm.tallCandidatesCount)) über 1080p. Das Seitenverhältnis bleibt.")
                         Divider().padding(.leading, 50)
                     }
+                    if vm.canHalveFrameRate {
+                        SettingRow(
+                            icon: "speedometer",
+                            tint: .orange,
+                            title: "Auf 30 Bilder/s",
+                            subtitle: "Spart zusätzlich ca. \(formatMB(vm.halfFrameRateExtraSavedMB)). Zeitlupen bleiben."
+                        ) {
+                            Toggle("", isOn: $vm.halveFrameRate)
+                                .toggleStyle(.switch)
+                                .labelsHidden()
+                        }
+                        .help("60-fps-Videos werden zu 30, 50 zu 25. Schnelle Bewegung wirkt etwas weniger flüssig.")
+                        Divider().padding(.leading, 50)
+                    }
+                    SettingRow(
+                        icon: "rectangle.compress.vertical",
+                        tint: .teal,
+                        title: "Schwarze Balken abschneiden",
+                        subtitle: "Nur wo welche sind. Das Bild selbst bleibt ganz."
+                    ) {
+                        Toggle("", isOn: $vm.cropBars)
+                            .toggleStyle(.switch)
+                            .labelsHidden()
+                    }
+                    Divider().padding(.leading, 50)
                     SettingRow(
                         icon: "trash.fill",
                         tint: vm.moveToTrash && !vm.isTrimmed ? .red : .gray,

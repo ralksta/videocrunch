@@ -158,3 +158,13 @@ class TestQualityCheckSeesTheEdit:
         cmd = build_ffmpeg_command(src, out, VT, 18, audio_mode="standard", edits=edits)
         subprocess.run(cmd, check=True, capture_output=True)
         assert get_multi_ssim(src, out, [0.5], [0.5], 1.5, edits=edits) > 0.97
+
+
+class TestScanOffersIt:
+    def test_only_footage_with_frames_to_spare(self):
+        from videocrunch import can_halve_fps
+        assert can_halve_fps(59.94)
+        assert can_halve_fps(50)
+        assert not can_halve_fps(29.97)
+        assert not can_halve_fps(120)
+        assert not can_halve_fps(None)

@@ -294,6 +294,16 @@ class TestRank:
         assert result["estimated_saved_pct_1080"] is None
         assert result["estimated_saved_mb_1080"] is None
 
+    def test_sixty_fps_offers_the_halved_rate(self):
+        from scan import EncodeHistory, rank
+        from videocrunch import HALF_FPS_SIZE
+        sixty = rank([self._media(frame_rate=59.94)], "hevc", set(),
+                     EncodeHistory(Path("/nonexistent")), 10)["results"][0]
+        assert sixty["half_fps_size_factor"] == HALF_FPS_SIZE
+        thirty = rank([self._media(frame_rate=30.0)], "hevc", set(),
+                      EncodeHistory(Path("/nonexistent")), 10)["results"][0]
+        assert thirty["half_fps_size_factor"] is None
+
     def test_history_below_the_quality_target_does_not_count(self, tmp_path):
         # Records from before the quality floor went up promised savings the
         # search no longer delivers: 83 % at SSIM 0.954 is now a rejected pass.
