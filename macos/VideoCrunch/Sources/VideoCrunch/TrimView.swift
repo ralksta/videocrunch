@@ -11,6 +11,7 @@ struct TrimEditor: View {
     @Binding var end: Double
 
     @State private var player: AVPlayer?
+    @State private var looper: RangeLooper?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -46,11 +47,16 @@ struct TrimEditor: View {
         .padding(14)
         .cardBackground()
         .onAppear {
-            player = AVPlayer(url: url)
+            let player = AVPlayer(url: url)
+            self.player = player
+            looper = RangeLooper(player: player, start: start, end: end)
         }
         .onDisappear {
             player?.pause()
+            looper = nil
         }
+        .onChange(of: start) { looper?.update(start: start, end: end) }
+        .onChange(of: end) { looper?.update(start: start, end: end) }
     }
 
     private func timeLabel(_ title: String, _ seconds: Double) -> some View {
@@ -61,6 +67,58 @@ struct TrimEditor: View {
                 .monospacedDigit()
         }
         .font(.caption)
+    }
+}
+
+/// Plays only the trimmed part, over and over — what the result will be,
+/// as QuickTime and Gifski play a trim.
+@MainActor
+final class RangeLooper {
+    private let player: AVPlayer
+    private var start: Double
+    private var end: Double
+    private var observer: Any?
+    private var endObserver: NSObjectProtocol?
+
+    init(player: AVPlayer, start: Double, end: Double) {
+        self.player = player
+        self.start = start
+        self.end = end
+        observer = player.addPeriodicTimeObserver(
+            forInterval: CMTime(seconds: 0.05, preferredTimescale: 600), queue: .main
+        ) { [weak self] time in
+            MainActor.assumeIsolated { self?.check(time.seconds) }
+        }
+        // An untrimmed end is the file's end, where the player would stop.
+        player.actionAtItemEnd = .none
+        endObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime, object: player.currentItem, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.restart() }
+        }
+    }
+
+    deinit {
+        if let observer { player.removeTimeObserver(observer) }
+        if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
+    }
+
+    func update(start: Double, end: Double) {
+        self.start = start
+        self.end = end
+    }
+
+    /// While playing: past the end, or before the start, back to the start.
+    /// Paused, the handles may scrub anywhere.
+    private func check(_ now: Double) {
+        guard player.rate != 0, now >= end || now < start - 0.1 else { return }
+        restart()
+    }
+
+    private func restart() {
+        player.seek(to: CMTime(seconds: start, preferredTimescale: 600),
+                    toleranceBefore: .zero, toleranceAfter: .zero)
+        player.play()
     }
 }
 
