@@ -37,4 +37,13 @@ final class EditsTests: XCTestCase {
         h.vm.audioMode = "enhanced"
         XCTAssertEqual(h.vm.editArguments, ["--audio-mode", "enhanced", "--half-fps", "--crop-bars"])
     }
+
+    func testUnderASizeEachFileCountsAtMostTheLimit() {
+        let h = Harness()
+        h.scan(["/v/a.mov", "/v/b.mov"],
+               results: [candidate("/v/a.mov", sizeMB: 100), candidate("/v/b.mov", sizeMB: 8)])
+        h.vm.sizeLimitMB = 25
+        // 100 MB -> 25 MB; 8 MB already fits and stays.
+        XCTAssertEqual(h.vm.selectedTotalAfterMB, 33, accuracy: 0.01)
+    }
 }

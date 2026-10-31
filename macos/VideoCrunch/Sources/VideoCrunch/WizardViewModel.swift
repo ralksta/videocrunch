@@ -42,6 +42,11 @@ class WizardViewModel: ObservableObject {
     @Published var halveFrameRate: Bool = false
     /// Letterbox/pillarbox bars cut away, where the encode finds any.
     @Published var cropBars: Bool = false
+    /// 0: the quality search decides the size. Otherwise every video comes
+    /// in under this many MB (fit.py), for a mail or a chat.
+    @Published var sizeLimitMB: Int = 0
+    /// The limit the last run had, for the last page's wording.
+    @Published var lastRunSizeLimitMB: Int = 0
     @Published var moveToTrash: Bool = false
     @Published var minSSIMOverride: Double? = nil
     /// Trim for a single selected video, in seconds of the source.
@@ -328,6 +333,10 @@ class WizardViewModel: ObservableObject {
 
     /// Expected size of one file's result, with downscale, frame rate and trim.
     private func estimatedAfterMB(_ c: Candidate, halving: Bool? = nil) -> Double {
+        if sizeLimitMB > 0 {
+            // What fits, or the file as it is when it already does.
+            return min(c.size_mb * keptFraction(c), Double(sizeLimitMB))
+        }
         let pct = scaleTo1080p ? (c.estimated_saved_pct_1080 ?? c.estimated_saved_pct)
                                : c.estimated_saved_pct
         let rate = (halving ?? halveFrameRate) ? (c.half_fps_size_factor ?? 1) : 1
@@ -456,6 +465,28 @@ class WizardViewModel: ObservableObject {
         // Trimming never replaces the original (videocrunch keeps it anyway).
         let trim = isTrimmed ? (start: trimStart, end: trimEnd) : nil
         lastRunTrim = trim.flatMap { t in trimTarget.map { (path: $0.file_path, start: t.start) } }
+
+        lastRunSizeLimitMB = sizeLimitMB
+        if sizeLimitMB > 0 {
+            // Under a size: fit.py picks bitrate and resolution itself.
+            var args = [
+                scriptDir.appendingPathComponent("fit.py").path,
+                "--files-from", fileListURL.path,
+                "--max-mb", String(sizeLimitMB),
+                "--codec", targetCodec,
+                "--json-out", resultJsonPath,
+                "--events"
+            ] + editArguments
+            if let trim {
+                args.append(contentsOf: ["--ss", String(format: "%.3f", trim.start),
+                                         "--to", String(format: "%.3f", trim.end)])
+            }
+            launchWithEvents(args, script: "fit.py", resultPath: resultJsonPath) { data in
+                try? FileManager.default.removeItem(at: fileListURL)
+                self.finishBatch(report: data.flatMap { try? JSONDecoder().decode(BatchReport.self, from: $0) })
+            }
+            return
+        }
 
         var args = [
             scriptDir.appendingPathComponent("batch.py").path,

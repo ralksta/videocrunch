@@ -168,46 +168,74 @@ struct OptionsStep: View {
         .cardBackground()
     }
 
+    private func rowLabel(_ text: String) -> some View {
+        Text(text)
+            .font(.subheadline.weight(.medium))
+            .foregroundStyle(.secondary)
+            .gridColumnAlignment(.trailing)
+    }
+
+    /// The one line under the switches: what the choice above means.
+    private var settingsNote: String {
+        if vm.sizeLimitMB > 0 {
+            return "Jedes Video unter \(vm.sizeLimitMB) MB – für Mail oder Chat. Die Auflösung passt sich an."
+        }
+        if vm.targetCodec != vm.scannedCodec {
+            return "Die Ersparnis oben wurde für \(codecName(vm.scannedCodec)) geschätzt."
+        }
+        return vm.targetCodec == "av1"
+            ? "AV1: kleinere Dateien, deutlich langsamer, braucht neuere Geräte."
+            : "So klein, wie es ohne sichtbaren Verlust geht."
+    }
+
     private var videoSettings: some View {
         VStack(alignment: .leading, spacing: 10) {
-            OptionSection(title: "Codec") {
-                Picker("Codec", selection: $vm.targetCodec) {
-                    Text("HEVC / H.265").tag("hevc")
-                    Text("AV1 (experimentell)").tag("av1")
+            // One line each, label on the left: the explanations are in the
+            // tooltips, so the page still fits a laptop screen.
+            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 8) {
+                GridRow {
+                    rowLabel("Ziel")
+                    Picker("Ziel", selection: $vm.sizeLimitMB) {
+                        Text("Qualität").tag(0)
+                        ForEach([10, 25, 50, 100], id: \.self) { Text("\($0) MB").tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .help("Qualität: so klein, wie es ohne sichtbaren Verlust geht. "
+                          + "MB: jedes Video darunter, für Mail oder Chat.")
                 }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                Text(vm.targetCodec == "av1"
-                     ? "Kleinere Dateien, deutlich langsamer. Braucht neuere Geräte."
-                     : "Hardware-Encoder, schnell. Läuft auf praktisch jedem Gerät.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                if vm.targetCodec != vm.scannedCodec {
-                    Label("Die Ersparnis oben wurde für \(codecName(vm.scannedCodec)) geschätzt.",
-                          systemImage: "info.circle")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                GridRow {
+                    rowLabel("Codec")
+                    Picker("Codec", selection: $vm.targetCodec) {
+                        Text("HEVC / H.265").tag("hevc")
+                        Text("AV1 (experimentell)").tag("av1")
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .help(vm.targetCodec == "av1"
+                          ? "Kleinere Dateien, deutlich langsamer. Braucht neuere Geräte."
+                          : "Hardware-Encoder, schnell. Läuft auf praktisch jedem Gerät.")
+                }
+                GridRow {
+                    rowLabel("Audio")
+                    Picker("Audio", selection: $vm.audioMode) {
+                        Text("Original").tag("standard")
+                        Text("Angleichen").tag("enhanced")
+                        Text("Ohne Ton").tag("none")
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .help(vm.audioMode == "enhanced"
+                          ? "Lautheit auf −16 LUFS: leise Handyvideos werden hörbar, laute gezähmt."
+                          : vm.audioMode == "none"
+                          ? "Die neue Datei ist stumm."
+                          : "Der Ton bleibt, wie er ist. Nur neu kodiert.")
                 }
             }
-
-            OptionSection(title: "Audio") {
-                Picker("Audio", selection: $vm.audioMode) {
-                    Text("Original").tag("standard")
-                    Text("Angleichen").tag("enhanced")
-                    Text("Ohne Ton").tag("none")
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                Text(vm.audioMode == "enhanced"
-                     ? "Lautheit auf −16 LUFS: leise Handyvideos werden hörbar, laute gezähmt."
-                     : vm.audioMode == "none"
-                     ? "Die neue Datei ist stumm."
-                     : "Der Ton bleibt, wie er ist. Nur neu kodiert.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
+            Text(settingsNote)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
 
             OptionSection(title: "Dateien") {
                 VStack(spacing: 0) {
@@ -229,7 +257,7 @@ struct OptionsStep: View {
                         }
                         Divider().padding(.leading, 50)
                     }
-                    if vm.hasTallCandidates {
+                    if vm.hasTallCandidates && vm.sizeLimitMB == 0 {
                         SettingRow(
                             icon: "arrow.down.right.and.arrow.up.left",
                             tint: .blue,
@@ -250,7 +278,9 @@ struct OptionsStep: View {
                             icon: "speedometer",
                             tint: .orange,
                             title: "Auf 30 Bilder/s",
-                            subtitle: "Spart zusätzlich ca. \(formatMB(vm.halfFrameRateExtraSavedMB)). Zeitlupen bleiben."
+                            subtitle: vm.sizeLimitMB > 0
+                                ? "Mehr Schärfe in derselben Größe. Zeitlupen bleiben."
+                                : "Spart zusätzlich ca. \(formatMB(vm.halfFrameRateExtraSavedMB)). Zeitlupen bleiben."
                         ) {
                             Toggle("", isOn: $vm.halveFrameRate)
                                 .toggleStyle(.switch)
@@ -269,27 +299,32 @@ struct OptionsStep: View {
                             .toggleStyle(.switch)
                             .labelsHidden()
                     }
-                    Divider().padding(.leading, 50)
-                    SettingRow(
-                        icon: "trash.fill",
-                        tint: vm.moveToTrash && !vm.isTrimmed ? .red : .gray,
-                        title: "Originale in den Papierkorb",
-                        subtitle: vm.isTrimmed
-                            ? "Beim Kürzen bleibt das Original erhalten."
-                            : vm.moveToTrash
-                            ? "Erst nach bestandenem Qualitätscheck."
-                            : "Aus: Original bleibt neben der _opt.mp4."
-                    ) {
-                        Toggle("", isOn: $vm.moveToTrash)
-                            .toggleStyle(.switch)
-                            .labelsHidden()
-                            .disabled(vm.isTrimmed)
+                    // Under a size the original always stays: the small copy is for sending.
+                    if vm.sizeLimitMB == 0 {
+                        Divider().padding(.leading, 50)
+                        SettingRow(
+                            icon: "trash.fill",
+                            tint: vm.moveToTrash && !vm.isTrimmed ? .red : .gray,
+                            title: "Originale in den Papierkorb",
+                            subtitle: vm.isTrimmed
+                                ? "Beim Kürzen bleibt das Original erhalten."
+                                : vm.moveToTrash
+                                ? "Erst nach bestandenem Qualitätscheck."
+                                : "Aus: Original bleibt neben der _opt.mp4."
+                        ) {
+                            Toggle("", isOn: $vm.moveToTrash)
+                                .toggleStyle(.switch)
+                                .labelsHidden()
+                                .disabled(vm.isTrimmed)
+                        }
                     }
                 }
                 .cardBackground()
             }
 
-            previewCard
+            if vm.sizeLimitMB == 0 {
+                previewCard
+            }
         }
     }
 
