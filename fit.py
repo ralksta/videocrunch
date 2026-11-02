@@ -17,7 +17,9 @@ like any other.
 import argparse
 import json
 import math
+import os
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -109,6 +111,24 @@ def output_path_for(src: Path, max_mb: float) -> Path:
     return candidate
 
 
+def publish(part: Path, out: Path) -> None:
+    """Give the finished `.part` file its real name, visible in Finder.
+
+    On iCloud Drive (Desktop & Documents) a dot-file gets the UF_HIDDEN
+    flag, and a rename keeps it: `ls` lists the result, Finder does not.
+    Clear the flag once the file has its real name.
+    """
+    part.replace(out)
+    hidden = getattr(stat, "UF_HIDDEN", 0)
+    if hidden and hasattr(os, "chflags"):
+        try:
+            flags = out.stat().st_flags
+            if flags & hidden:
+                os.chflags(out, flags & ~hidden)
+        except OSError:
+            pass  # cosmetic: the file is there, just hidden in Finder
+
+
 def _encode(cmd, seconds: float, on_percent) -> bool:
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
@@ -176,7 +196,7 @@ def fit_file(src: Path, max_mb: float, profile: dict, request: EditRequest,
             print(f"Versuch {attempt}: {size / 1e6:.1f} MB bei {kbps} kbit/s "
                   f"({p['short_side']}p)", flush=True)
             if size <= max_bytes:
-                part.replace(out)
+                publish(part, out)
                 result.update(status="success", output_path=str(out.resolve()),
                               saved_bytes=size_before - size,
                               saved_pct=round(100 - size * 100 / size_before, 1))
