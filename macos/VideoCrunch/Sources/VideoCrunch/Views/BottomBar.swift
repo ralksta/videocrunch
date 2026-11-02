@@ -35,8 +35,15 @@ struct BottomBar: View {
                 .disabled(!vm.isEncoding)
             } else if vm.currentStep == .completed, !vm.targetURLs.isEmpty {
                 Button {
+                    // Select what the run produced, not the sources it started from.
                     let gif = vm.gifResult?.output_path.map { URL(fileURLWithPath: $0) }
-                    NSWorkspace.shared.activateFileViewerSelecting(gif.map { [$0] } ?? vm.targetURLs)
+                    let encoded = vm.batchResults
+                        .filter { $0.status == "success" }
+                        .compactMap(\.output_path)
+                        .filter { FileManager.default.fileExists(atPath: $0) }
+                        .map { URL(fileURLWithPath: $0) }
+                    let selection = gif.map { [$0] } ?? (encoded.isEmpty ? vm.targetURLs : encoded)
+                    NSWorkspace.shared.activateFileViewerSelecting(selection)
                 } label: {
                     Label("Im Finder zeigen", systemImage: "folder")
                 }
