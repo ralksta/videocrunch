@@ -30,8 +30,9 @@ def tiny_clip(tmp_path_factory):
     subprocess.run(
         ["ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=duration=2:size=320x240:rate=24",
          "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
-         "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac",
-         "-shortest", str(path)],
+         "-vf", "gblur=sigma=1.5",
+         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "12", "-pix_fmt", "yuv420p",
+         "-c:a", "aac", "-shortest", str(path)],
         check=True, capture_output=True,
     )
     return path
@@ -507,3 +508,165 @@ class TestPreview:
         assert json.loads((out / "preview.json").read_text())["preview"] == result["preview"]
         # A preview never touches the source's folder.
         assert sorted(p.name for p in tmp_path.iterdir()) == ["in.mp4", "preview"]
+
+
+def _mp4_top_level_boxes(path: Path) -> list[tuple[str, int]]:
+    """Parse top-level ISO BMFF box types and sizes from an MP4 file."""
+    import struct
+
+    data = path.read_bytes()
+    pos = 0
+    boxes: list[tuple[str, int]] = []
+    while pos + 8 <= len(data):
+        size, kind = struct.unpack(">I4s", data[pos:pos + 8])
+        if size == 1:
+            size = struct.unpack(">Q", data[pos + 8:pos + 16])[0]
+        elif size == 0:
+            size = len(data) - pos
+        assert size >= 8, f"invalid MP4 box size {size} at offset {pos}"
+        boxes.append((kind.decode("latin1"), size))
+        pos += size
+    return boxes
+
+
+class TestMP4StreamingLayout:
+    """Exported MP4s must be non-fragmented +faststart files for HTTP streaming.
+
+    Players like Immich, Safari, and AVPlayer stall or fail on fragmented MP4s
+    (moof/mdat without sidx). Standard MP4 with ftyp -> moov -> mdat, hvc1 tag
+    for HEVC, and preserved QuickTime metadata ensures instant playback and
+    intact library metadata.
+    """
+
+    @pytest.fixture(scope="class")
+    def rich_metadata_clip(self, tmp_path_factory):
+        path = tmp_path_factory.mktemp("meta") / "iphone_like.mov"
+        subprocess.run(
+            ["ffmpeg", "-y", "-v", "error",
+             "-f", "lavfi", "-i", "testsrc2=duration=2:size=320x240:rate=24",
+             "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+             "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac",
+             "-movflags", "+use_metadata_tags",
+             "-metadata", "creation_time=2024-10-10T13:44:56.000000Z",
+             "-metadata", "com.apple.quicktime.location.ISO6709=+53.5511+009.9937/",
+             "-metadata", "com.apple.quicktime.model=iPhone 15 Pro",
+             "-shortest", str(path)],
+            check=True, capture_output=True,
+        )
+        return path
+
+    def test_non_fragmented_faststart_hvc1_and_metadata(self, rich_metadata_clip, tmp_path):
+        from videocrunch import (
+            ENCODER_PROFILES,
+            build_ffmpeg_command,
+            probe_stream_inventory,
+        )
+
+        out = tmp_path / "streamable.mp4"
+        cmd = build_ffmpeg_command(
+            rich_metadata_clip, out, ENCODER_PROFILES["libx265"], 28,
+            audio_mode="standard", streams=probe_stream_inventory(rich_metadata_clip),
+        )
+        subprocess.run(cmd, check=True, capture_output=True)
+
+        # 1. Top-level MP4 boxes: ftyp -> moov -> mdat, no moof/mfra
+        boxes = _mp4_top_level_boxes(out)
+        kinds = [k for k, _ in boxes]
+        assert kinds[0] == "ftyp"
+        assert "moof" not in kinds
+        assert "mfra" not in kinds
+        assert "moov" in kinds and "mdat" in kinds
+        assert kinds.index("moov") < kinds.index("mdat")
+
+        # 2. HEVC video stream carries Apple-compatible hvc1 codec tag and TV color range
+        streams = _probe(out, "stream=codec_type,codec_name,codec_tag_string,color_range")["streams"]
+        video = next(s for s in streams if s["codec_type"] == "video")
+        assert video["codec_name"] == "hevc"
+        assert video["codec_tag_string"] == "hvc1"
+        assert video["color_range"] == "tv"
+
+        # 3. Container metadata (creation_time, GPS, camera model) survives
+        tags = _probe(out, "format_tags")["format"].get("tags", {})
+        assert tags.get("creation_time", "").startswith("2024-10-10T13:44:56")
+        assert tags.get("com.apple.quicktime.location.ISO6709") == "+53.5511+009.9937/"
+        assert tags.get("com.apple.quicktime.model") == "iPhone 15 Pro"
+
+
+class TestAppleHardwareAudioAndVideoToolbox:
+    def test_preferred_aac_encoder_uses_aac_at_on_darwin_and_falls_back(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        import videocrunch
+
+        monkeypatch.setattr(videocrunch, "_AAC_ENCODER", None)
+        monkeypatch.setattr(videocrunch.sys, "platform", "darwin")
+        monkeypatch.setattr(
+            videocrunch.subprocess, "run",
+            lambda *a, **kw: MagicMock(stdout=" A..... aac_at  aac (AudioToolbox)\n A....D aac     AAC\n"),
+        )
+        assert videocrunch.preferred_aac_encoder() == "aac_at"
+
+        monkeypatch.setattr(videocrunch, "_AAC_ENCODER", None)
+        monkeypatch.setattr(videocrunch.sys, "platform", "linux")
+        assert videocrunch.preferred_aac_encoder() == "aac"
+
+        monkeypatch.setattr(videocrunch, "_AAC_ENCODER", None)
+        monkeypatch.setattr(videocrunch.sys, "platform", "darwin")
+        monkeypatch.setattr(
+            videocrunch.subprocess, "run",
+            MagicMock(side_effect=OSError("no ffmpeg")),
+        )
+        assert videocrunch.preferred_aac_encoder() == "aac"
+
+    @pytest.mark.skipif(sys.platform != "darwin", reason="macOS VideoToolbox only")
+    def test_videotoolbox_command_encodes_with_spatial_aq_and_aac_at(self, tiny_clip, tmp_path):
+        from videocrunch import (
+            ENCODER_PROFILES,
+            build_ffmpeg_command,
+            preferred_aac_encoder,
+            probe_stream_inventory,
+        )
+
+        out = tmp_path / "vt_out.mp4"
+        cmd = build_ffmpeg_command(
+            tiny_clip, out, ENCODER_PROFILES["videotoolbox"], 65,
+            audio_mode="standard", streams=probe_stream_inventory(tiny_clip),
+        )
+        assert preferred_aac_encoder() == "aac_at"
+        assert cmd[cmd.index("-c:a") + 1] == "aac_at"
+        assert "-spatial_aq" in cmd
+        assert "-prio_speed" in cmd
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        assert res.returncode == 0, res.stderr
+        assert out.exists() and out.stat().st_size > 0
+
+    def test_get_multi_ssim_does_not_deadlock_on_large_stderr(self, monkeypatch, tmp_path):
+        import time
+
+        import videocrunch
+
+        real_popen = subprocess.Popen
+        child = (
+            "import sys\n"
+            "sys.stderr.write('Could not find ref with POC\\n' * 6500)\n"
+            "sys.stderr.write('[Parsed_ssim_0] All:0.991234 (20.5)\\n')\n"
+            "sys.stderr.flush()\n"
+            "for us in (1000000, 2000000, 3000000):\n"
+            "    sys.stdout.write(f'out_time_us={us}\\n')\n"
+            "sys.stdout.flush()\n"
+        )
+
+        monkeypatch.setattr(videocrunch, "_detect_quality_filter", lambda: "ssim")
+        monkeypatch.setattr(videocrunch, "get_video_info", lambda _p: {"fps": 30})
+        monkeypatch.setattr(
+            videocrunch.subprocess,
+            "Popen",
+            lambda _cmd, **kw: real_popen([sys.executable, "-c", child], **kw),
+        )
+
+        t0 = time.monotonic()
+        score = videocrunch.get_multi_ssim(
+            tmp_path / "orig.mov", tmp_path / "opt.mp4", [0.0], [0.0], 3.0
+        )
+        assert time.monotonic() - t0 < 5.0
+        assert score == pytest.approx(0.991234, abs=1e-6)

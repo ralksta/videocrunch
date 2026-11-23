@@ -18,13 +18,17 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
-# Logs directory
-LOG_DIR = Path.home() / ".videocrunch" / "logs"
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-
+from crunch_utils import default_log_dir, valid_live_bitrate, valid_live_speed  # noqa: E402
 from encoders import get_best_h264_encoder as get_best_encoder  # noqa: E402
 from encoders import get_optimal_workers  # noqa: E402
 from videocrunch import quality_floor  # noqa: E402
+
+# Logs directory
+LOG_DIR = default_log_dir()
+try:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+except OSError:
+    pass
 
 # --- COLORS ---
 G = '\033[0;32m'
@@ -58,6 +62,17 @@ event_lock = threading.Lock()
 PERCENT_RE = re.compile(r'\]\s*(\d+)%')
 PASS_RE = re.compile(r'Pass:\s+Q=(\d+)')
 ANSI_RE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
+BITRATE_ANALYSIS_RE = re.compile(
+    r'Bitrate Analysis:\s*Source avg=([\d.]+)kbps(?:,\s*max=([\d.]+)kbps)?(?:,\s*VBR=(True|False))?'
+)
+AUDIO_ANALYSIS_RE = re.compile(r'Audio Analysis:\s*measured\s*(-?[\d.]+)\s*LUFS')
+SAMPLE_WINDOWS_RE = re.compile(r'Sample Windows:\s*(.+?)\s*\(bitrate hotspots\)')
+PRESEARCH_START_RE = re.compile(r'Pre-Search:\s*probing quality on a\s*([\d.]+)s sample clip')
+PRESEARCH_PROBE_RE = re.compile(r'probe Q=(\d+):\s*SSIM\s*([\d.]+)')
+RESULT_LINE_RE = re.compile(
+    r'->\s*Result:\s*Q=(\d+)\s*\|\s*Saved:\s*(-?[\d.]+)%\s*\|\s*(SSIM|VMAF|PSNR):\s*([\d.]+)'
+)
+POOR_SAVINGS_RE = re.compile(r'->\s*Saved only\s*(-?[\d.]+)%')
 
 
 def emit(event: str, **fields) -> None:
@@ -70,6 +85,92 @@ def emit(event: str, **fields) -> None:
         stream.flush()
 
 
+def _detail_info_from_line(clean_line: str) -> tuple[str, str, dict[str, str]] | None:
+    """Turn milestone log lines into (German text, localization code, args)."""
+    m = BITRATE_ANALYSIS_RE.search(clean_line)
+    if m:
+        avg = float(m.group(1))
+        avg_str = f"{avg / 1000:.1f} Mbit/s" if avg >= 1000 else f"{int(round(avg))} kbit/s"
+        is_vbr = m.group(3) == "True"
+        vbr = " (VBR)" if is_vbr else ""
+        return (f"Bitrate-Analyse · Ø {avg_str}{vbr}", "bitrate_analysis",
+                {"avg": avg_str, "vbr": "1" if is_vbr else "0"})
+
+    m = AUDIO_ANALYSIS_RE.search(clean_line)
+    if m:
+        lufs = m.group(1)
+        return (f"Audio-Lautheit gemessen ({lufs} LUFS)", "audio_loudness", {"lufs": lufs})
+
+    m = SAMPLE_WINDOWS_RE.search(clean_line)
+    if m:
+        count = len([p for p in m.group(1).split(",") if p.strip()])
+        return (f"Qualitäts-Hotspots bestimmt ({count} Stellen)", "hotspots", {"count": str(count)})
+
+    if "Constrained-VBR:" in clean_line:
+        return ("Bitraten-Leiter berechnet", "bitrate_ladder", {})
+
+    m = PRESEARCH_START_RE.search(clean_line)
+    if m:
+        sec = str(int(round(float(m.group(1)))))
+        return (f"Qualitäts-Vortest auf {sec}s-Stichprobe", "presearch_start", {"sec": sec})
+
+    m = PRESEARCH_PROBE_RE.search(clean_line)
+    if m:
+        q = m.group(1)
+        ssim = f"{float(m.group(2)):.3f}"
+        return (f"Vortest Q={q} · SSIM {ssim}", "presearch_probe", {"q": q, "ssim": ssim})
+
+    if ">>> COPY MODE:" in clean_line:
+        return ("Verlustfreier Stream Copy …", "copy_mode", {})
+    if "[Moving Atoms / Finalizing...]" in clean_line:
+        return ("Finalisiere MP4 (Faststart) …", "finalizing", {})
+    if "-> Integrity verified." in clean_line:
+        return ("Integrität geprüft", "integrity_verified", {})
+    return None
+
+
+def _detail_from_line(clean_line: str) -> str | None:
+    """Turn milestone log lines into short German live status subtitles."""
+    info = _detail_info_from_line(clean_line)
+    return info[0] if info is not None else None
+
+
+def parse_pass_event(clean_line: str, current_pass: int, current_q: int | None,
+                     last_pass_event: dict | None) -> dict | None:
+    """Extract a structured pass_result payload from a worker output line, if any."""
+    m = RESULT_LINE_RE.search(clean_line)
+    if m:
+        return {
+            "pass": max(current_pass, 1),
+            "q": int(m.group(1)),
+            "saved_pct": round(float(m.group(2)), 1),
+            "metric": m.group(3),
+            "ssim": round(float(m.group(4)), 4),
+            "verdict": "evaluated",
+        }
+
+    m = POOR_SAVINGS_RE.search(clean_line)
+    if m:
+        return {
+            "pass": max(current_pass, 1),
+            "q": current_q,
+            "saved_pct": round(float(m.group(1)), 1),
+            "metric": None,
+            "ssim": None,
+            "verdict": "poor_savings",
+        }
+
+    if last_pass_event is not None:
+        if "-> Quality too low" in clean_line:
+            return {**last_pass_event, "verdict": "too_low"}
+        if "-> Early exit:" in clean_line:
+            return {**last_pass_event, "verdict": "early_exit"}
+        if "quality short" in clean_line:
+            return {**last_pass_event, "verdict": "quality_short"}
+
+    return None
+
+
 class ProgressTracker:
     """Where one videocrunch.py run is: phase, pass, quality and percent.
 
@@ -80,10 +181,31 @@ class ProgressTracker:
 
     def __init__(self):
         self.phase, self.passes, self.q, self.percent = "prepare", 0, None, 0
+        self.speed: str | None = None
+        self.bitrate: str | None = None
+        self.detail: str | None = None
+        self.detail_code: str | None = None
+        self.detail_args: dict[str, str] | None = None
 
     def state(self) -> dict:
-        return {"phase": self.phase, "pass": self.passes, "q": self.q,
-                "percent": self.percent}
+        s = {"phase": self.phase, "pass": self.passes, "q": self.q,
+             "percent": self.percent}
+        if self.speed is not None:
+            s["speed"] = self.speed
+        if self.bitrate is not None:
+            s["bitrate"] = self.bitrate
+        if self.detail is not None:
+            s["detail"] = self.detail
+        if self.detail_code is not None:
+            s["detail_code"] = self.detail_code
+        if self.detail_args is not None:
+            s["detail_args"] = self.detail_args
+        return s
+
+    def _clear_detail(self) -> None:
+        self.detail = None
+        self.detail_code = None
+        self.detail_args = None
 
     def feed(self, line: str) -> bool:
         """Take one output line; True when the state changed."""
@@ -93,12 +215,31 @@ class ProgressTracker:
         if match:
             self.phase, self.passes = "encode", self.passes + 1
             self.q, self.percent = int(match.group(1)), 0
+            self.speed, self.bitrate = None, None
+            self._clear_detail()
         else:
             match = PERCENT_RE.search(line)
             if match:
                 if "Checking quality" in line:
+                    # Pre-search SSIM checks run while passes == 0; stay in prepare
+                    # rather than spoofing "Pass 1 · Quality Check".
+                    if self.passes == 0:
+                        self.phase = "prepare"
+                        return False
                     self.phase = "check"
-                self.percent = min(100, int(match.group(1)))
+                    self.speed, self.bitrate = None, None
+                    self.percent = min(100, int(match.group(1)))
+                    self._clear_detail()
+                else:
+                    parts = [p.strip() for p in line[match.end():].split("|") if p.strip()]
+                    self.speed = valid_live_speed(parts[0]) if len(parts) >= 1 else None
+                    self.bitrate = valid_live_bitrate(parts[1]) if len(parts) >= 2 else None
+                    self.percent = min(100, int(match.group(1)))
+                    self._clear_detail()
+            else:
+                info = _detail_info_from_line(line)
+                if info is not None:
+                    self.detail, self.detail_code, self.detail_args = info
         return self.state() != before
 
 
@@ -253,7 +394,7 @@ def merge_worker_result(result: dict, data: dict | None) -> bool:
 
 def build_optimizer_command(file_path, port, audio_mode, min_ssim=None, json_out=None,
                             scale_height=None, replace=False, codec=None, ss=None, to=None,
-                            edit_flags=()):
+                            edit_flags=(), video_mode=None, output_dir=None):
     """The per-file `videocrunch.py` invocation — see tests/test_cli_contract.py.
 
     Every batch-level option a caller sets has to appear here; anything the
@@ -282,6 +423,12 @@ def build_optimizer_command(file_path, port, audio_mode, min_ssim=None, json_out
         cmd.extend(["--ss", str(ss)])
     if to:
         cmd.extend(["--to", str(to)])
+    if output_dir:
+        cmd.extend(["--output-dir", str(output_dir)])
+    if video_mode and video_mode != 'compress':
+        cmd.extend(["--video-mode", str(video_mode)])
+        if video_mode == 'copy':
+            cmd.append("--copy-audio")
     cmd.extend(edit_flags)
     return cmd
 
@@ -300,12 +447,14 @@ def start_worker(cmd):
     with workers_lock:
         if abort_requested.is_set():
             return None
+        env = {**os.environ, "PYTHONUNBUFFERED": "1"}
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            bufsize=1
+            bufsize=1,
+            env=env,
         )
         active_workers.add(process)
         return process
@@ -330,21 +479,32 @@ def abort_workers(signum=None, frame=None):
                 process.terminate()
 
 
+def _unpack_work_item(args_tuple):
+    """Normalize 11-, 12-, or 13-element batch work tuples into a uniform 13-tuple."""
+    if len(args_tuple) >= 13:
+        return args_tuple[:13]
+    if len(args_tuple) == 12:
+        return (*args_tuple, None)
+    return (*args_tuple[:10], 'compress', args_tuple[10], None)
+
+
 def run_optimizer(args_tuple):
     """Worker function - captures output and updates shared state. Returns detailed results for logging."""
-    file_path, worker_id = args_tuple[0], args_tuple[-1]
+    unpacked = _unpack_work_item(args_tuple)
+    file_path, worker_id = unpacked[0], unpacked[11]
     emit("file_start", worker=worker_id, file=file_path, name=Path(file_path).name)
     outcome = _run_optimizer(args_tuple)
     result = outcome[2]
     emit("file_done", worker=worker_id, file=file_path, status=result["status"],
          quality=result.get("quality"), ssim=result.get("ssim"),
-         saved_pct=result.get("saved_pct"), reason=result.get("reason"))
+         saved_pct=result.get("saved_pct"), saved_bytes=result.get("saved_bytes"),
+         reason=result.get("reason"))
     return outcome
 
 
 def _run_optimizer(args_tuple):
     (file_path, port, audio_mode, min_ssim, scale_height, replace, codec, ss, to, flags,
-     worker_id) = args_tuple
+     video_mode, worker_id, output_dir) = _unpack_work_item(args_tuple)
 
     filename = Path(file_path).name
     file_start = time.time()
@@ -370,7 +530,8 @@ def _run_optimizer(args_tuple):
     cmd = build_optimizer_command(file_path, port, audio_mode, min_ssim,
                                   json_out=result_file, scale_height=scale_height,
                                   replace=replace, codec=codec, ss=ss, to=to,
-                                  edit_flags=flags)
+                                  edit_flags=flags, video_mode=video_mode,
+                                  output_dir=output_dir)
 
     try:
         process = start_worker(cmd)
@@ -384,6 +545,8 @@ def _run_optimizer(args_tuple):
 
         success = False
         failed = False  # Track explicit failures
+        skipped = False
+        skip_reason = None
         last_quality = None
         last_ssim = None
         last_saved_pct = None
@@ -391,9 +554,13 @@ def _run_optimizer(args_tuple):
         failure_reason = None
 
         tracker = ProgressTracker()
+        last_pass_event = None
         for line in process.stdout:
-            line = line.strip()
-            verdict, verdict_reason = terminal_verdict(line)
+            clean_line = ANSI_RE.sub('', line).strip()
+            verdict, verdict_reason = terminal_verdict(clean_line)
+
+            if PASS_RE.search(clean_line):
+                last_pass_event = None
 
             if tracker.feed(line):
                 state = tracker.state()
@@ -403,21 +570,26 @@ def _run_optimizer(args_tuple):
                         worker_status[worker_id]["q"] = state["q"]
                 emit("progress", worker=worker_id, file=file_path, **state)
 
+            pass_event = parse_pass_event(clean_line, tracker.passes, tracker.q, last_pass_event)
+            if pass_event is not None:
+                last_pass_event = pass_event
+                emit("pass_result", worker=worker_id, file=file_path, **pass_event)
+
             # The quality of the last result: "-> Result: Q=65"
-            if 'Q=' in line:
-                match = re.search(r'Q=(\d+)', line)
+            if 'Q=' in clean_line:
+                match = re.search(r'Q=(\d+)', clean_line)
                 if match:
                     last_quality = int(match.group(1))
 
             # Parse SSIM: "SSIM: 0.9823"
-            if 'SSIM:' in line:
-                match = re.search(r'SSIM:\s*([\d.]+)', line)
+            if 'SSIM:' in clean_line:
+                match = re.search(r'SSIM:\s*([\d.]+)', clean_line)
                 if match:
                     last_ssim = float(match.group(1))
 
             # Parse savings: "Saved: 45.23%"
-            if 'Saved:' in line and '%' in line:
-                match = re.search(r'Saved:\s*([\d.]+)%', line)
+            if 'Saved:' in clean_line and '%' in clean_line:
+                match = re.search(r'Saved:\s*([\d.]+)%', clean_line)
                 if match:
                     last_saved_pct = float(match.group(1))
 
@@ -425,7 +597,7 @@ def _run_optimizer(args_tuple):
             if verdict == 'success':
                 success = True
                 # Try to parse saved bytes: "1.23 GB saved" or "456.7 MB saved"
-                match = re.search(r'([\d.]+)\s*(GB|MB|KB)\s*saved', line)
+                match = re.search(r'([\d.]+)\s*(GB|MB|KB)\s*saved', clean_line)
                 if match:
                     val = float(match.group(1))
                     unit = match.group(2)
@@ -441,27 +613,21 @@ def _run_optimizer(args_tuple):
                 failed = True
                 failure_reason = verdict_reason
 
-            # Handle skipped files
-            if 'Skipping' in line:
-                result["status"] = "skipped"
-                result["reason"] = line
-                result["duration"] = time.time() - file_start
-                with display_lock:
-                    worker_status[worker_id]["status"] = "skipped"
-                    worker_status[worker_id]["progress"] = 100
-                    file_results.append(result)
-                finish_worker(process)
-                return (file_path, True, result)
+            # Real skip messages start with "Skipping:" — copy-mode banners like
+            # ">>> COPY MODE: Skipping re-encode logic." must NOT short-circuit.
+            if clean_line.startswith('Skipping:'):
+                skipped = True
+                skip_reason = clean_line.removeprefix('Skipping:').strip()
 
         process.wait()
         finish_worker(process)
         result["duration"] = time.time() - file_start
 
         # The worker's own verdict outranks anything scraped from its output.
-        scraped = {"status": "success" if (success and not failed) else "failed",
+        scraped = {"status": "skipped" if skipped else ("success" if (success and not failed) else "failed"),
                    "quality": last_quality, "ssim": last_ssim,
                    "saved_pct": last_saved_pct, "saved_bytes": last_saved_bytes,
-                   "reason": failure_reason}
+                   "reason": skip_reason if skipped else failure_reason}
         from_worker = read_worker_result(result_file)
         try:
             result_file.unlink()
@@ -469,22 +635,29 @@ def _run_optimizer(args_tuple):
             pass
         merge_worker_result(scraped, from_worker)
         # A file stopped by a cancel did not fail; it was never allowed to finish.
-        if scraped["status"] != "success" and abort_requested.is_set():
+        if scraped["status"] not in ("success", "skipped") and abort_requested.is_set():
             scraped["status"] = "cancelled"
             scraped["reason"] = "Cancelled"
         result.update({k: v for k, v in scraped.items() if k != "status"})
-        succeeded = scraped["status"] == "success"
+        final_status = scraped["status"]
 
         with display_lock:
-            if succeeded:
+            if final_status == "success":
                 worker_status[worker_id]["status"] = "done"
                 worker_status[worker_id]["progress"] = 100
                 result["status"] = "success"
                 file_results.append(result)
                 return (file_path, True, result)
+            elif final_status == "skipped":
+                worker_status[worker_id]["status"] = "skipped"
+                worker_status[worker_id]["progress"] = 100
+                result["status"] = "skipped"
+                result["reason"] = scraped.get("reason") or "Skipped"
+                file_results.append(result)
+                return (file_path, True, result)
             else:
-                worker_status[worker_id]["status"] = scraped["status"]
-                result["status"] = scraped["status"]
+                worker_status[worker_id]["status"] = final_status
+                result["status"] = final_status
                 result["reason"] = scraped.get("reason") or "Encoding failed"
                 file_results.append(result)
                 return (file_path, False, result)
@@ -605,9 +778,13 @@ def build_parser():
     parser.add_argument('--events', action='store_true',
                         help='Print one JSON object per line (start, progress, file '
                              'results, summary) instead of the live table')
+    parser.add_argument('--video-mode', choices=['compress', 'copy'], default='compress',
+                        help='Video processing mode: compress (default) or copy (passthrough)')
     parser.add_argument('--min-ssim', type=quality_floor, metavar='S',
                         help='Override the hard quality floor for every file in this batch '
                              '(0 < S <= 1). Forwarded to videocrunch.py per file.')
+    parser.add_argument('--output-dir', metavar='DIR',
+                        help='Write output files into DIR instead of next to each source')
     return parser
 
 
@@ -653,7 +830,7 @@ def main():
     # Prepare work items
     work_items = [(f, args.port, args.audio_mode, args.min_ssim, args.scale_height,
                    args.replace, args.codec, args.ss, args.to, edit_flags(args),
-                   (i % max_workers) + 1)
+                   args.video_mode, (i % max_workers) + 1, args.output_dir)
                   for i, f in enumerate(files)]
 
     # Process files

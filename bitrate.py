@@ -515,7 +515,13 @@ def main():
         else:
             ffmpeg_cmd += ["-an"]
 
-        ffmpeg_cmd += ["-y", args.output]
+        if "hevc" in encoder_name or "265" in encoder_name:
+            ffmpeg_cmd += ["-tag:v", "hvc1"]
+        ffmpeg_cmd += [
+            "-movflags", "+faststart+use_metadata_tags",
+            "-map_metadata", "0",
+            "-y", args.output,
+        ]
 
         print(f"\n🎬 Executing: {' '.join(ffmpeg_cmd)}\n")
         result = subprocess.run(ffmpeg_cmd)

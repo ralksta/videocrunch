@@ -24,7 +24,9 @@ import sys
 import tempfile
 import threading
 from pathlib import Path
+from typing import Optional
 
+from crunch_utils import drain_pipe_async, finish_pipe_drain
 from videocrunch import abort_on_sigterm, get_video_info, parse_time_to_seconds, stop_encoder
 
 DEFAULT_WIDTH = 480
@@ -52,12 +54,13 @@ def emit(event: str, **fields) -> None:
     event_stream.flush()
 
 
-def output_path_for(src: Path) -> Path:
-    """`clip.gif` next to the video, or `clip 2.gif` when that exists."""
-    candidate = src.with_suffix(".gif")
+def output_path_for(src: Path, output_dir: Optional[Path] = None) -> Path:
+    """`clip.gif` next to the video (or in output_dir), or `clip 2.gif` when taken."""
+    dest_dir = Path(output_dir).expanduser() if output_dir else src.parent
+    candidate = dest_dir / f"{src.stem}.gif"
     n = 2
     while candidate.exists():
-        candidate = src.with_name(f"{src.stem} {n}.gif")
+        candidate = dest_dir / f"{src.stem} {n}.gif"
         n += 1
     return candidate
 
@@ -125,6 +128,7 @@ def _run_gifski(src, out, start, end, fps, width, quality, hdr, speed, on_frames
         _input_args(src, start, end, hdr)
         + ["-vf", video_filter(fps, width, hdr, speed), "-f", "yuv4mpegpipe", "-"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    err_thread, err_chunks = drain_pipe_async(reader.stderr)
     writer = subprocess.Popen(
         ["gifski", "--fps", str(fps), "--quality", str(quality), "--width", str(width),
          "-o", str(out), "-"],
@@ -141,7 +145,8 @@ def _run_gifski(src, out, start, end, fps, width, quality, hdr, speed, on_frames
         if frames is not None:
             on_frames(frames)
     writer.wait()
-    reader_err = reader.communicate()[1].decode("utf-8", "replace")
+    reader.wait()
+    reader_err = finish_pipe_drain(err_thread, err_chunks, is_bytes=True).decode("utf-8", "replace")
     if writer.returncode != 0 or reader.returncode != 0:
         raise RuntimeError((reader_err.strip() or "".join(printed).strip())[-300:]
                            or "gifski failed")
@@ -155,6 +160,7 @@ def _run_ffmpeg(src, out, start, end, fps, width, hdr, speed, on_frames, procs):
         + ["-filter_complex", graph, "-loop", "0", "-f", "gif",
            "-progress", "pipe:1", "-nostats", "-y", str(out)],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    err_thread, err_chunks = drain_pipe_async(proc.stderr)
     procs.append(proc)
     for line in proc.stdout:
         if line.startswith("out_time_us="):
@@ -162,7 +168,7 @@ def _run_ffmpeg(src, out, start, end, fps, width, hdr, speed, on_frames, procs):
                 on_frames(int(int(line.split("=", 1)[1]) / 1_000_000 * fps))
             except ValueError:
                 pass
-    err = proc.stderr.read()
+    err = finish_pipe_drain(err_thread, err_chunks)
     if proc.wait() != 0:
         raise RuntimeError(err.strip()[-300:] or "ffmpeg failed")
 
@@ -213,6 +219,7 @@ def build_parser():
     p.add_argument("--encoder", choices=["gifski", "ffmpeg"],
                    help="Default: gifski when installed, else ffmpeg")
     p.add_argument("--output", help="Where to write the GIF (default: next to the video)")
+    p.add_argument("--output-dir", metavar="DIR", help="Write the GIF into DIR instead of next to the source")
     p.add_argument("--json-out", metavar="PATH", help="Write the result as JSON")
     p.add_argument("--estimate", action="store_true",
                    help="Print the expected size as JSON instead of writing a GIF")
@@ -256,7 +263,12 @@ def main() -> int:
             }))
         return 0
 
-    out = Path(args.output) if args.output else output_path_for(src)
+    out = (
+        Path(args.output).expanduser()
+        if args.output
+        else output_path_for(src, output_dir=Path(args.output_dir).expanduser() if args.output_dir else None)
+    )
+    out.parent.mkdir(parents=True, exist_ok=True)
     part = out.with_name(f".{out.name}.part")
     total = expected_frames((end - start) / args.speed, args.fps)
     emit("start", total=1, workers=1, files=[str(src)])

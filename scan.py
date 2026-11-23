@@ -28,8 +28,10 @@ from crunch_utils import (
     DEFAULT_HISTORY_PATH,
     disk_headroom_needed,
     estimate_runtime_sec,
+    first_video_stream,
     history_throughput,
     read_encode_history,
+    resolve_history_path,
 )
 from savings import (
     _is_same_codec,
@@ -123,7 +125,7 @@ def probe_to_media(file_path: str, probe: dict) -> Optional[dict]:
     0 Mbit/s and never appear.
     """
     streams = probe.get("streams") or []
-    video_stream = next((s for s in streams if s.get("codec_type") == "video"), None)
+    video_stream = first_video_stream(streams)
     if video_stream is None:
         return None
 
@@ -357,7 +359,7 @@ class EncodeHistory:
 
     def __init__(self, path: Path = DEFAULT_HISTORY_PATH,
                  min_ssim: Optional[float] = MIN_QUALITY) -> None:
-        self.path = path
+        self.path = resolve_history_path(path)
         self.min_ssim = min_ssim
         self._mtime: float = -1.0
         # bucket (resolution_class, bitrate_class) -> [(lowered codec str, saved_pct), ...]

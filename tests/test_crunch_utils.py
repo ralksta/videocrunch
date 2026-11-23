@@ -5,7 +5,9 @@ Unit tests for crunch_utils.py — the pure (subprocess-free) helper
 logic behind the video optimizer: encode history Q seeding, HDR detection,
 loudnorm filter building, scene-window selection, and worker scheduling.
 """
+import subprocess
 import sys
+import time
 from datetime import time as dtime
 from pathlib import Path
 
@@ -16,6 +18,7 @@ if str(REPO_ROOT) not in sys.path:
 from crunch_utils import (  # noqa: E402
     append_encode_history,
     apply_hdr_adjustments,
+    audio_bitrate_kbps,
     battery_from_pmset,
     bitrate_class,
     build_audio_filter_chain,
@@ -23,10 +26,16 @@ from crunch_utils import (  # noqa: E402
     clamp_maxrate_to_pass,
     disk_headroom_needed,
     dolby_vision_info,
+    drain_pipe_async,
     estimate_runtime_sec,
+    finish_pipe_drain,
+    first_video_stream,
     history_throughput,
+    is_hdr,
     is_hdr_or_10bit,
+    is_room_tone,
     is_within_schedule,
+    loudnorm_will_be_linear,
     narrow_quality_window,
     nearest_quality_index,
     parse_loudnorm_json,
@@ -160,6 +169,37 @@ class TestHdr:
         profile = {"codec": "hevc_qsv", "encoder_args": [], "video_filter": "format=yuv420p"}
         assert apply_hdr_adjustments(profile, HDR10) is None
 
+    def test_10bit_sdr_gets_main10_without_bt2020_tags(self):
+        ten_bit_sdr = {**SDR, "pix_fmt": "yuv420p10le"}
+        assert is_hdr(ten_bit_sdr) is False
+        assert is_hdr(HDR10) is True
+        profile = {"codec": "hevc_videotoolbox",
+                   "encoder_args": ["-profile:v", "main", "-allow_sw", "0"],
+                   "video_filter": "format=yuv420p,scale=trunc(iw/2)*2:trunc(ih/2)*2"}
+        adj = apply_hdr_adjustments(profile, ten_bit_sdr)
+        assert adj is not None
+        assert "main10" in adj["encoder_args"]
+        assert "p010le" in adj["video_filter"]
+        assert "color_args" not in adj
+
+    def test_videotoolbox_422_10bit_gets_main42210_p210(self):
+        profile = {"codec": "hevc_videotoolbox",
+                   "encoder_args": ["-profile:v", "main", "-allow_sw", "0"],
+                   "video_filter": "format=yuv420p,scale=trunc(iw/2)*2:trunc(ih/2)*2"}
+        src_422 = {"pix_fmt": "yuv422p10le", "color_transfer": "bt709", "color_primaries": "bt709"}
+        adj = apply_hdr_adjustments(profile, src_422)
+        assert adj is not None
+        assert "main42210" in adj["encoder_args"]
+        assert "p210le" in adj["video_filter"]
+        assert "color_args" not in adj
+
+        hdr_422 = {**HDR10, "pix_fmt": "p210le"}
+        adj_hdr = apply_hdr_adjustments(profile, hdr_422)
+        assert adj_hdr is not None
+        assert "main42210" in adj_hdr["encoder_args"]
+        assert "p210le" in adj_hdr["video_filter"]
+        assert "smpte2084" in adj_hdr["color_args"]
+
 
 LOUDNORM_STDERR = """
 [Parsed_loudnorm_3 @ 0x600002]
@@ -212,6 +252,34 @@ class TestLoudnorm:
 
     def test_standard_mode_returns_none(self):
         assert build_audio_filter_chain("standard") is None
+
+    def test_room_tone_skips_normalization(self):
+        room_tone = {
+            "input_i": "-45.0",
+            "input_tp": "-30.0",
+            "input_lra": "2.0",
+            "input_thresh": "-55.0",
+            "target_offset": "0.0",
+        }
+        assert is_room_tone({"input_i": "-45.0"}) is True
+        assert is_room_tone({"input_i": "-40.0"}) is True
+        assert is_room_tone({"input_i": "-23.6"}) is False
+        assert is_room_tone({"input_i": "-inf"}) is False
+        assert build_audio_filter_chain("moderate", measured=room_tone) is None
+
+    def test_loudnorm_will_be_linear_checks_peak_and_lra(self):
+        fits = {
+            "input_i": "-23.61",
+            "input_tp": "-6.53",
+            "input_lra": "5.90",
+            "input_thresh": "-33.79",
+            "target_offset": "0.02",
+        }
+        assert loudnorm_will_be_linear(fits, target_i=-19) is True
+        # Raising -23.61 LUFS to -16 LUFS adds +7.61 dB -> -6.53 + 7.61 = +1.08 dBTP > -1.5
+        assert loudnorm_will_be_linear(fits, target_i=-16) is False
+        high_lra = {**fits, "input_lra": "14.0"}
+        assert loudnorm_will_be_linear(high_lra, target_i=-19) is False
 
 
 class TestSceneWindows:
@@ -335,7 +403,16 @@ class TestStreamMapping:
         args, _ = build_stream_args(
             [self.VIDEO, self._audio(), self._audio()],
             copy_audio=False, audio_filters=None)
+        assert args[:2] == ["-map", "0:V:0"]
         assert "0:a:0" in args and "0:a:1" in args
+
+    def test_first_video_stream_skips_attached_pic(self):
+        cover = {"codec_type": "video", "codec_name": "mjpeg",
+                 "disposition": {"attached_pic": 1}}
+        real_video = {"codec_type": "video", "codec_name": "hevc",
+                      "disposition": {"attached_pic": 0}}
+        assert first_video_stream([cover, real_video]) == real_video
+        assert first_video_stream([cover]) is None
 
     def test_only_the_first_audio_track_gets_the_filter_chain(self):
         # The two-pass loudnorm measurement is taken from the first track
@@ -394,6 +471,23 @@ class TestStreamMapping:
         _, skipped = build_stream_args([self.VIDEO, self._audio(), mebx, mebx, mebx],
                                        copy_audio=False, audio_filters=None)
         assert skipped == ["3 data tracks (mebx): metadata mp4 cannot hold"]
+
+    def test_audio_bitrate_is_capped_to_source_when_lean(self):
+        assert audio_bitrate_kbps([self.VIDEO, {"codec_type": "audio", "bit_rate": "68000"}]) == 68
+        assert audio_bitrate_kbps([self.VIDEO, {"codec_type": "audio", "bit_rate": "1500000"}]) == 192
+        assert audio_bitrate_kbps([self.VIDEO, {"codec_type": "audio", "bit_rate": "24000"}]) == 48
+        assert audio_bitrate_kbps([self.VIDEO, self._audio()]) == 192
+
+        args, _ = build_stream_args(
+            [self.VIDEO, {"codec_type": "audio", "codec_name": "aac", "bit_rate": "68000"}],
+            copy_audio=False, audio_filters=None)
+        assert args[args.index("-b:a") + 1] == "68k"
+
+    def test_audio_codec_parameter_selects_encoder(self):
+        args, _ = build_stream_args(
+            [self.VIDEO, self._audio()],
+            copy_audio=False, audio_filters=None, audio_codec="aac_at")
+        assert args[args.index("-c:a") + 1] == "aac_at"
 
 
 class TestDolbyVision:
@@ -521,3 +615,45 @@ class TestDiskHeadroom:
     def test_a_batch_needs_room_for_every_file_at_once(self):
         # Workers run in parallel, so their staging files coexist.
         assert disk_headroom_needed(1000, files=4) == 4 * disk_headroom_needed(1000)
+
+
+class TestPipeDrain:
+    """Async pipe draining prevents 64 KB POSIX pipe deadlocks on two-pipe children."""
+
+    def test_large_stderr_with_stdout_loop_does_not_deadlock(self):
+        child = (
+            "import sys\n"
+            "sys.stderr.write('X' * 220000)\n"
+            "sys.stderr.flush()\n"
+            "for i in range(10):\n"
+            "    print(f'line_{i}', flush=True)\n"
+        )
+        t0 = time.monotonic()
+        proc = subprocess.Popen(
+            [sys.executable, "-c", child],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        thread, chunks = drain_pipe_async(proc.stderr)
+        lines = [line.strip() for line in proc.stdout]
+        stderr_out = finish_pipe_drain(thread, chunks)
+        rc = proc.wait(timeout=5)
+        elapsed = time.monotonic() - t0
+        assert rc == 0
+        assert elapsed < 5.0
+        assert len(lines) == 10
+        assert len(stderr_out) == 220000
+
+    def test_handles_none_and_streams_without_read(self):
+        t_none, chunks_none = drain_pipe_async(None)
+        assert t_none is None
+        assert finish_pipe_drain(t_none, chunks_none) == ""
+        assert finish_pipe_drain(t_none, chunks_none, is_bytes=True) == b""
+
+        class DummyStream:
+            pass
+
+        t_dummy, chunks_dummy = drain_pipe_async(DummyStream())
+        assert t_dummy is None
+        assert finish_pipe_drain(t_dummy, chunks_dummy) == ""

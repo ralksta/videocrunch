@@ -6,13 +6,31 @@ by the encode engine and the test suite alike.
 from __future__ import annotations
 
 import json
+import math
+import os
 import re
 import statistics
+import threading
 from datetime import datetime
 from datetime import time as dtime
 from pathlib import Path
 
 DEFAULT_HISTORY_PATH = Path.home() / ".videocrunch" / "logs" / "encode_history.jsonl"
+
+
+def default_log_dir() -> Path:
+    """Return the active log directory, honoring VIDEOCRUNCH_LOG_DIR when set."""
+    override = os.environ.get("VIDEOCRUNCH_LOG_DIR", "").strip()
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".videocrunch" / "logs"
+
+
+def resolve_history_path(history_path: Path = DEFAULT_HISTORY_PATH) -> Path:
+    """Redirect the default history path into VIDEOCRUNCH_LOG_DIR when overridden."""
+    if history_path == DEFAULT_HISTORY_PATH and os.environ.get("VIDEOCRUNCH_LOG_DIR", "").strip():
+        return default_log_dir() / "encode_history.jsonl"
+    return history_path
 
 
 # ---------------------------------------------------------------------------
@@ -42,6 +60,7 @@ def resolution_class(height: int) -> str:
 
 
 def append_encode_history(record: dict, history_path: Path = DEFAULT_HISTORY_PATH) -> None:
+    history_path = resolve_history_path(history_path)
     try:
         history_path.parent.mkdir(parents=True, exist_ok=True)
         with open(history_path, "a", encoding="utf-8") as f:
@@ -59,6 +78,7 @@ def suggest_q_from_history(encoder_key: str, height: int, source_kbps: float,
     under a laxer quality floor would otherwise keep seeding the search at
     the rung that no longer passes.
     """
+    history_path = resolve_history_path(history_path)
     try:
         if not history_path.exists():
             return None
@@ -99,6 +119,7 @@ def read_encode_history(history_path: Path = DEFAULT_HISTORY_PATH) -> list:
     rather than taken as the end of the file: the records before and after it
     are still good.
     """
+    history_path = resolve_history_path(history_path)
     records = []
     try:
         with open(history_path, encoding="utf-8") as f:
@@ -216,13 +237,22 @@ _HDR_CAPABLE = {
 }
 
 
+def is_hdr(info: dict) -> bool:
+    """True when the source carries HDR transfer or BT.2020 wide-gamut primaries.
+
+    10-bit pixel depth alone (e.g. GoPro HERO 10-bit SDR yuv420p10le in BT.709)
+    is a container/pixel property, not HDR.
+    """
+    if str(info.get("color_transfer") or "") in _HDR_TRANSFERS:
+        return True
+    return str(info.get("color_primaries") or "") == "bt2020"
+
+
 def is_hdr_or_10bit(info: dict) -> bool:
     pix = str(info.get("pix_fmt") or "")
     if "10" in pix or "12" in pix:
         return True
-    if str(info.get("color_transfer") or "") in _HDR_TRANSFERS:
-        return True
-    return str(info.get("color_primaries") or "") == "bt2020"
+    return is_hdr(info)
 
 
 def apply_hdr_adjustments(profile: dict, info: dict) -> dict | None:
@@ -232,25 +262,35 @@ def apply_hdr_adjustments(profile: dict, info: dict) -> dict | None:
     caps = _HDR_CAPABLE.get(profile.get("codec", ""))
     if not caps:
         return None
+    target_profile = caps["profile"]
+    target_pix_fmt = caps["pix_fmt"]
+    src_pix_fmt = str(info.get("pix_fmt") or "")
+    if profile.get("codec") == "hevc_videotoolbox" and ("422p10" in src_pix_fmt or "p210" in src_pix_fmt):
+        target_profile = "main42210"
+        target_pix_fmt = "p210le"
+
     adj = dict(profile)
     args = list(profile.get("encoder_args", []))
     if "-profile:v" in args:
-        args[args.index("-profile:v") + 1] = caps["profile"]
+        args[args.index("-profile:v") + 1] = target_profile
     else:
-        args.extend(["-profile:v", caps["profile"]])
+        args.extend(["-profile:v", target_profile])
     adj["encoder_args"] = args
     # 8-bit surface format in the filter chain -> 10-bit
     vf = profile.get("video_filter", "")
     for fmt8 in ("yuv420p", "nv12"):
-        vf = vf.replace(f"format={fmt8}", f"format={caps['pix_fmt']}")
+        vf = vf.replace(f"format={fmt8}", f"format={target_pix_fmt}")
     adj["video_filter"] = vf
-    # Pass source color metadata through instead of stamping bt709
-    trc = str(info.get("color_transfer") or "smpte2084")
-    adj["color_args"] = [
-        "-colorspace", "bt2020nc",
-        "-color_primaries", "bt2020",
-        "-color_trc", trc,
-    ]
+    # Only pass BT.2020/HDR tags through when the source actually carries HDR/BT.2020;
+    # 10-bit SDR (e.g. GoPro 10-bit BT.709) keeps the default BT.709 color tags.
+    if is_hdr(info):
+        trc = str(info.get("color_transfer") or "smpte2084")
+        adj["color_args"] = [
+            "-colorspace", "bt2020nc",
+            "-color_primaries", "bt2020",
+            "-color_trc", trc,
+            "-color_range", "tv",
+        ]
     return adj
 
 
@@ -259,6 +299,9 @@ def apply_hdr_adjustments(profile: dict, info: dict) -> dict | None:
 # ---------------------------------------------------------------------------
 
 LOUDNORM_TARGETS = {"moderate": -19, "enhanced": -16}
+LOUDNORM_TP = -1.5
+LOUDNORM_LRA = 11.0
+ROOM_TONE_FLOOR_LUFS = -40.0
 
 # Pre-chain must be identical between measurement and encode pass so the
 # loudnorm measurement reflects the gated/filtered signal it will normalize.
@@ -277,16 +320,59 @@ def parse_loudnorm_json(stderr_text: str) -> dict | None:
         return None
 
 
+def is_room_tone(measured: dict | None, floor_lufs: float = ROOM_TONE_FLOOR_LUFS) -> bool:
+    """True when measured integrated loudness is at or below room-tone floor.
+
+    Normalizing ambient noise (<= -40 LUFS) to -19/-16 LUFS boosts the noise
+    floor by 20+ dB. Unmeasurable ('-inf') is handled separately as fallback.
+    """
+    if not measured:
+        return False
+    try:
+        val = float(measured.get("input_i", ""))
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(val) and val <= floor_lufs
+
+
+def loudnorm_will_be_linear(measured: dict | None, target_i: float,
+                            target_tp: float = LOUDNORM_TP,
+                            target_lra: float = LOUDNORM_LRA) -> bool:
+    """Whether FFmpeg's af_loudnorm will actually stay in linear mode.
+
+    Even with linear=true, af_loudnorm.c falls back to dynamic mode when the
+    linear gain would push true peak above target_tp or measured LRA exceeds
+    target_lra.
+    """
+    if not measured:
+        return False
+    try:
+        mi, mtp, mlra, mth, _ = (
+            float(measured[k])
+            for k in ("input_i", "input_tp", "input_lra", "input_thresh", "target_offset")
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+    if not all(math.isfinite(x) for x in (mi, mtp, mlra, mth)):
+        return False
+    if mtp == 99 or mth == -70 or mlra <= 0 or mi == 0:
+        return False
+    return (mtp + (target_i - mi) <= target_tp) and (mlra <= target_lra)
+
+
 def build_audio_filter_chain(audio_mode: str, measured: dict | None = None) -> str | None:
     """Audio filter chain for the given mode; None = no filtering (plain AAC).
 
     With a valid measurement, loudnorm runs in linear (transparent) mode
-    instead of the pumping-prone dynamic mode.
+    instead of the pumping-prone dynamic mode. Room tone (<= -40 LUFS) skips
+    normalization so ambient noise is not boosted by 20+ dB.
     """
     target_i = LOUDNORM_TARGETS.get(audio_mode)
     if target_i is None:
         return None
-    ln = f"loudnorm=I={target_i}:TP=-1.5:LRA=11"
+    if is_room_tone(measured):
+        return None
+    ln = f"loudnorm=I={target_i}:TP={LOUDNORM_TP:g}:LRA={LOUDNORM_LRA:g}"
     if measured:
         keys = ("input_i", "input_tp", "input_lra", "input_thresh", "target_offset")
         vals = {k: str(measured.get(k, "")) for k in keys}
@@ -313,10 +399,51 @@ MP4_MUXABLE_AUDIO = {
 # (PGS, VobSub) cannot be converted and would abort the encode.
 MOV_TEXT_SUBTITLES = {"subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text"}
 
+DEFAULT_AUDIO_KBPS = 192
+MIN_AUDIO_KBPS = 48
+
+
+def audio_bitrate_kbps(streams: list[dict] | None,
+                       default_kbps: int = DEFAULT_AUDIO_KBPS) -> int:
+    """Target AAC bitrate (kbps), never inflating a compact source track.
+
+    Lossless or high-bitrate sources (PCM, FLAC, AC3 384k) cap at
+    `default_kbps` (192k); already-lean tracks (e.g. 64-128k AAC) keep their
+    source bitrate down to `MIN_AUDIO_KBPS`.
+    """
+    rates = []
+    for s in streams or []:
+        if s.get("codec_type") != "audio":
+            continue
+        try:
+            bps = float(s.get("bit_rate") or 0)
+        except (TypeError, ValueError):
+            continue
+        if bps > 0:
+            rates.append(round(bps / 1000))
+    if not rates:
+        return default_kbps
+    return max(MIN_AUDIO_KBPS, min(default_kbps, max(rates)))
+
+
+def is_attached_pic(stream: dict) -> bool:
+    """True when a video stream is an embedded cover/thumbnail picture."""
+    disp = stream.get("disposition")
+    return isinstance(disp, dict) and bool(disp.get("attached_pic"))
+
+
+def first_video_stream(streams: list[dict]) -> dict | None:
+    """First real video stream, ignoring embedded cover art (attached_pic)."""
+    for s in streams or []:
+        if s.get("codec_type") == "video" and not is_attached_pic(s):
+            return s
+    return None
+
 
 def build_stream_args(streams: list[dict], copy_audio: bool,
                       audio_filters: str | None,
-                      decodable: set[str] | None = None) -> tuple[list[str], list[str]]:
+                      decodable: set[str] | None = None,
+                      audio_codec: str = "aac") -> tuple[list[str], list[str]]:
     """Map every usable input stream into the output, explicitly.
 
     Without `-map`, ffmpeg keeps one video and one audio stream and silently
@@ -330,7 +457,7 @@ def build_stream_args(streams: list[dict], copy_audio: bool,
     "assume it can". Data streams (iPhone timecode/metadata tracks) are never
     mapped: the mp4 muxer rejects most of them.
     """
-    args: list[str] = ["-map", "0:v:0"]
+    args: list[str] = ["-map", "0:V:0"]
     skipped: list[str] = []
 
     audio = [s for s in streams if s.get("codec_type") == "audio"]
@@ -364,7 +491,8 @@ def build_stream_args(streams: list[dict], copy_audio: bool,
         if copy_audio:
             args.extend(["-c:a", "copy"])
         else:
-            args.extend(["-c:a", "aac", "-b:a", "192k", "-ar", "48000"])
+            audio_kbps = audio_bitrate_kbps(streams)
+            args.extend(["-c:a", audio_codec, "-b:a", f"{audio_kbps}k", "-ar", "48000"])
             if audio_filters:
                 # Output stream 0, not input: the filter chain belongs to the
                 # primary track, and that is whichever track was mapped first.
@@ -472,3 +600,57 @@ def clamp_maxrate_to_pass(maxrate_kbps: float | None, bufsize_kbps: float | None
     if maxrate_kbps and cap >= maxrate_kbps:
         return maxrate_kbps, bufsize_kbps  # file-wide cap already tighter
     return cap, cap * 2.0
+
+
+_LIVE_SPEED_RE = re.compile(r"^(\d+(?:\.\d+)?)x$", re.IGNORECASE)
+_LIVE_BITRATE_RE = re.compile(
+    r"^(\d+(?:\.\d+)?)\s*(kbits/s|kb/s|mbits/s|mb/s|m|k)$", re.IGNORECASE
+)
+
+
+def valid_live_speed(raw: str | None) -> str | None:
+    """Return a positive encoder speed token (e.g. '3.1x'), or None if zero/invalid."""
+    if not raw:
+        return None
+    token = raw.strip()
+    m = _LIVE_SPEED_RE.match(token)
+    if not m or float(m.group(1)) <= 0:
+        return None
+    return token
+
+
+def valid_live_bitrate(raw: str | None) -> str | None:
+    """Return a positive encoder bitrate token (e.g. '6420kbits/s'), or None."""
+    if not raw:
+        return None
+    token = raw.strip()
+    m = _LIVE_BITRATE_RE.match(token)
+    if not m or float(m.group(1)) <= 0:
+        return None
+    return token
+
+
+def drain_pipe_async(stream):
+    """Drain a subprocess pipe on a daemon thread to prevent 64 KB two-pipe deadlocks."""
+    chunks = []
+    if stream is None or not hasattr(stream, "read"):
+        return None, chunks
+
+    def _reader():
+        try:
+            data = stream.read()
+            if data:
+                chunks.append(data)
+        except (OSError, ValueError):
+            pass
+
+    thread = threading.Thread(target=_reader, daemon=True)
+    thread.start()
+    return thread, chunks
+
+
+def finish_pipe_drain(thread, chunks, *, is_bytes: bool = False):
+    """Wait briefly for a drain thread and return the collected output."""
+    if thread is not None:
+        thread.join(timeout=5.0)
+    return b"".join(chunks) if is_bytes else "".join(chunks)

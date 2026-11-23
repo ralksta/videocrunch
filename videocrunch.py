@@ -15,6 +15,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -28,14 +29,23 @@ from typing import Any, Dict, Optional, Tuple
 # where these modules could be absent.
 from bitrate import analyze_bitrate
 from crunch_utils import (
+    LOUDNORM_TARGETS,
+    ROOM_TONE_FLOOR_LUFS,
     append_encode_history,
     apply_hdr_adjustments,
     build_audio_filter_chain,
     build_stream_args,
     clamp_maxrate_to_pass,
+    default_log_dir,
     disk_headroom_needed,
     dolby_vision_info,
+    drain_pipe_async,
+    finish_pipe_drain,
+    first_video_stream,
+    is_hdr,
     is_hdr_or_10bit,
+    is_room_tone,
+    loudnorm_will_be_linear,
     narrow_quality_window,
     nearest_quality_index,
     parse_loudnorm_json,
@@ -51,8 +61,11 @@ OPTIMIZER_UTILS_AVAILABLE = True
 ADVISOR_AVAILABLE = True
 
 # Logs directory
-LOG_DIR = Path.home() / ".videocrunch" / "logs"
-LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_DIR = default_log_dir()
+try:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+except OSError:
+    pass
 
 # --- CONFIGURATION ---
 MIN_SAVINGS = 20.0
@@ -117,12 +130,14 @@ ENCODER_PROFILES = {
         'codec': 'hevc_videotoolbox',
         'quality_range': (75, 45, -10),  # (start, min, step) - higher is better
         'quality_direction': -1,  # -1 means decrease q = worse quality
-        'hwaccel_input': [],  # VideoToolbox handles this implicitly
+        'hwaccel_input': ['-hwaccel', 'videotoolbox'],  # Decode on Media Engine; system RAM handles filters/fallbacks
         'encoder_args': [
             '-profile:v', 'main',
             '-alpha_quality', '0.75',
             '-allow_sw', '0',  # Disable software fallback
             '-realtime', '0',          # Allow encoder more time -> better compression on M4 Max
+            '-spatial_aq', '1',        # Spatial adaptive quantization for dark/detailed regions
+            '-prio_speed', '0',        # Favor compression efficiency over raw speed
         ],
         'quality_flag': '-q:v',
         'video_filter': 'format=yuv420p,scale=trunc(iw/2)*2:trunc(ih/2)*2',
@@ -172,7 +187,7 @@ ENCODER_PROFILES = {
         'codec': 'libsvtav1',
         'quality_range': (26, 40, 2),  # CRF: lower is better
         'quality_direction': 1,
-        'hwaccel_input': [],
+        'hwaccel_input': ['-hwaccel', 'videotoolbox'] if sys.platform == 'darwin' else [],
         'encoder_args': [
             '-preset', '6',
         ],
@@ -218,12 +233,22 @@ ENCODING_PRESET_MAP = {
 }
 
 
+def _set_flag(args: list, flag: str, value: str) -> None:
+    """Replace an existing CLI flag's value or append `[flag, value]`."""
+    if flag in args:
+        idx = args.index(flag)
+        if idx + 1 < len(args):
+            args[idx + 1] = value
+            return
+    args.extend([flag, value])
+
+
 def apply_encoding_preset(profile: dict, preset: str) -> dict:
     """
     Return a modified copy of *profile* with the encoding preset applied.
     For encoders that support a -preset arg (nvenc, qsv, libx265) the mapped
     value replaces the existing entry.  For VideoToolbox / VAAPI we only
-    touch the -realtime flag (0 = quality, 1 = speed).
+    touch the -realtime / -prio_speed / -spatial_aq flags.
     """
     import copy
     profile = copy.deepcopy(profile)
@@ -262,9 +287,14 @@ def apply_encoding_preset(profile: dict, preset: str) -> dict:
     elif codec in ('hevc_videotoolbox', 'av1_videotoolbox', 'hevc_vaapi'):
         # VideoToolbox / VAAPI: use -realtime as speed proxy
         realtime_val = '1' if preset == 'fast' else '0'
-        if '-realtime' in args:
-            idx = args.index('-realtime')
-            args[idx + 1] = realtime_val
+        _set_flag(args, '-realtime', realtime_val)
+        if codec == 'hevc_videotoolbox':
+            if preset == 'fast':
+                _set_flag(args, '-prio_speed', '1')
+                _set_flag(args, '-spatial_aq', '0')
+            else:
+                _set_flag(args, '-prio_speed', '0')
+                _set_flag(args, '-spatial_aq', '1')
         # VAAPI only: use -compression_level for fine-tuning
         if codec == 'hevc_vaapi' and '-compression_level' in args:
             level_val = '32' if preset == 'fast' else ('20' if preset == 'best' else '24')
@@ -358,7 +388,7 @@ def get_video_info(file_path: Path) -> Optional[Dict[str, Any]]:
     """Get video duration and stream info using ffprobe."""
     cmd = [
         'ffprobe', '-v', 'error',
-        '-show_entries', 'format=duration:stream=codec_type,width,height,codec_name,r_frame_rate,pix_fmt,color_transfer,color_primaries:stream_tags=rotate:stream_side_data=rotation',
+        '-show_entries', 'format=duration:stream=codec_type,width,height,codec_name,r_frame_rate,pix_fmt,color_transfer,color_primaries:stream_disposition=attached_pic:stream_tags=rotate:stream_side_data=rotation',
         '-of', 'json', str(file_path)
     ]
     try:
@@ -366,7 +396,7 @@ def get_video_info(file_path: Path) -> Optional[Dict[str, Any]]:
         data = json.loads(result.stdout)
 
         duration = float(data.get('format', {}).get('duration', 0))
-        video_stream = next((s for s in data.get('streams', []) if s.get('codec_type') == 'video'), {})
+        video_stream = first_video_stream(data.get('streams', [])) or {}
 
         width = int(video_stream.get('width', 0))
         height = int(video_stream.get('height', 0))
@@ -485,14 +515,14 @@ def discard_abort_leftovers(input_path: Path, is_interactive: bool, ask=None) ->
             pass
 
 
-def meets_quality_targets(saved_pct: float, ssim: float) -> bool:
+def meets_quality_targets(saved_pct: float, ssim: float, min_quality: float = MIN_QUALITY) -> bool:
     """Whether a pass is good enough to stop searching: worth it, and looks right.
 
     Large savings used to buy a lower bar (SSIM_ACCEPTABLE at 50 %+). That is
     how a 4K60 clip downscaled to 1080p shipped at 0.954 with smeared foliage:
     the savings were spectacular precisely because detail was thrown away.
     """
-    return saved_pct >= MIN_SAVINGS and ssim >= MIN_QUALITY
+    return saved_pct >= MIN_SAVINGS and ssim >= min_quality
 
 
 def ladder_top_factor() -> float:
@@ -542,9 +572,9 @@ def reusable_staging(path: Path, expected_duration: float,
 
     An interrupted run leaves the passes it already completed on disk; at
     minutes per 4K pass, re-encoding them is the most expensive thing the tool
-    can do for nothing. A half-written file must never qualify: with
-    `+delay_moov` it has no moov atom, and judging it would compare a fraction
-    of the video against the whole source.
+    can do for nothing. A half-written file must never qualify: standard MP4
+    writes its moov atom only on finalization (moved to the front by
+    `+faststart`), so an aborted pass has no moov atom at all.
     """
     path = Path(path)
     try:
@@ -617,6 +647,7 @@ def get_multi_ssim(
     duration: float,
     ref_size: Optional[Tuple[int, int]] = None,
     edits: Optional["Edits"] = None,
+    hwaccel: Optional[list] = None,
 ) -> float:
     """
     Calculate quality score across N sample segments in ONE ffmpeg pass.
@@ -656,31 +687,37 @@ def get_multi_ssim(
     if edits and edits.fps:
         fps = edits.fps_value()  # both sides are at the halved rate when cut
 
-    def _seg(stream: int, start: float, tail: str, label: str, head: str = "") -> str:
+    def _cut(start: float, tail: str = "") -> str:
         if fps > 0:
             sf = int(round(start * fps))
             ef = sf + int(round(duration * fps))
-            cut = f"trim=start_frame={sf}:end_frame={ef},settb=AVTB,setpts=N/{fps}/TB"
-        else:
-            cut = f"trim=start={start:.3f}:end={start + duration:.3f},setpts=PTS-STARTPTS"
-        return f"[{stream}:v]{head}{cut}{tail}[{label}]"
+            return f"trim=start_frame={sf}:end_frame={ef},settb=AVTB,setpts=N/{fps}/TB{tail}"
+        return f"trim=start={start:.3f}:end={start + duration:.3f},setpts=PTS-STARTPTS{tail}"
 
-    # Build filter_complex: trim segments, concat pairs, compare once
+    # Build filter_complex: split once so fps/crop run once per input, then compare
     fc: list = []
-    for i, s in enumerate(orig_starts):
-        fc.append(_seg(0, s, ref_scale, f"oa{i}", ref_prefix))
-    for i, s in enumerate(opt_starts):
-        fc.append(_seg(1, s, "", f"na{i}"))
-    fc.append(''.join(f'[oa{i}]' for i in range(n)) + f"concat=n={n}:v=1:a=0[ocat]")
-    fc.append(''.join(f'[na{i}]' for i in range(n)) + f"concat=n={n}:v=1:a=0[ncat]")
-    fc.append(f"[ocat][ncat]{quality_filter}")
+    if n == 1:
+        fc.append(f"[0:v]{ref_prefix}{_cut(orig_starts[0], ref_scale)}[oa0]")
+        fc.append(f"[1:v]{_cut(opt_starts[0])}[na0]")
+        fc.append(f"[oa0][na0]{quality_filter}=shortest=1")
+    else:
+        fc.append(f"[0:v]{ref_prefix}split={n}" + "".join(f"[s0_{i}]" for i in range(n)))
+        fc.append(f"[1:v]split={n}" + "".join(f"[s1_{i}]" for i in range(n)))
+        for i, s in enumerate(orig_starts):
+            fc.append(f"[s0_{i}]{_cut(s, ref_scale)}[oa{i}]")
+        for i, s in enumerate(opt_starts):
+            fc.append(f"[s1_{i}]{_cut(s)}[na{i}]")
+        fc.append(''.join(f'[oa{i}]' for i in range(n)) + f"concat=n={n}:v=1:a=0[ocat]")
+        fc.append(''.join(f'[na{i}]' for i in range(n)) + f"concat=n={n}:v=1:a=0[ncat]")
+        fc.append(f"[ocat][ncat]{quality_filter}=shortest=1")
 
+    hw_in = ['-hwaccel', 'videotoolbox'] if (hwaccel and 'videotoolbox' in hwaccel) else []
     cmd = [
-        'ffmpeg', '-progress', 'pipe:1',
-        '-i', str(original),
-        '-i', str(optimized),
+        'ffmpeg', '-hide_banner', '-nostats', '-progress', 'pipe:1',
+        *hw_in, '-i', str(original),
+        *hw_in, '-i', str(optimized),
         '-filter_complex', ';'.join(fc),
-        '-f', 'null', '-'
+        '-an', '-f', 'null', '-'
     ]
     try:
         process = subprocess.Popen(
@@ -689,6 +726,7 @@ def get_multi_ssim(
             stderr=subprocess.PIPE,
             text=True
         )
+        stderr_thread, stderr_chunks = drain_pipe_async(process.stderr)
 
         out_time_us = 0
         total_us = total_sample_duration * 1_000_000
@@ -715,8 +753,8 @@ def get_multi_ssim(
                 sys.stdout.write(f"\r\033[2K {Y}-> Checking quality... [{arrow}{spaces}] {int(pct)}%{NC}")
                 sys.stdout.flush()
 
-        # Drain stderr for SSIM result
-        stderr_out = process.stderr.read()
+        # Collect drained stderr and wait for exit
+        stderr_out = finish_pipe_drain(stderr_thread, stderr_chunks)
         process.wait()
 
         # Clear the progress line
@@ -849,7 +887,15 @@ def measure_loudness(input_path, audio_mode):
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
         measured = parse_loudnorm_json(result.stderr)
         if measured and measured.get('input_i') not in (None, '-inf'):
-            print(f"{Y}Audio Analysis:{NC} measured {measured['input_i']} LUFS → linear loudnorm")
+            if is_room_tone(measured):
+                print(f"{Y}Audio Analysis:{NC} measured {measured['input_i']} LUFS (room tone ≤ {ROOM_TONE_FLOOR_LUFS:g} LUFS) → skipping normalization")
+            else:
+                mode_label = (
+                    "linear loudnorm"
+                    if loudnorm_will_be_linear(measured, LOUDNORM_TARGETS.get(audio_mode, -19))
+                    else "dynamic loudnorm (peak/LRA ceiling)"
+                )
+                print(f"{Y}Audio Analysis:{NC} measured {measured['input_i']} LUFS → {mode_label}")
             return measured
     except (subprocess.SubprocessError, OSError):
         pass
@@ -950,12 +996,110 @@ def bars_crop(found: list, width: int, height: int) -> Optional[str]:
     return f"{w}:{h}:{x0}:{y0}"
 
 
+_CROPDETECT_AVAILABLE: Optional[bool] = None
+
+
+def _has_cropdetect() -> bool:
+    """Whether the active FFmpeg build includes the GPL cropdetect filter."""
+    global _CROPDETECT_AVAILABLE
+    if _CROPDETECT_AVAILABLE is not None:
+        return _CROPDETECT_AVAILABLE
+    try:
+        result = subprocess.run(
+            ['ffmpeg', '-hide_banner', '-filters'],
+            capture_output=True, text=True, timeout=5
+        )
+        _CROPDETECT_AVAILABLE = bool(re.search(r'\bcropdetect\b', result.stdout))
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        _CROPDETECT_AVAILABLE = False
+    return _CROPDETECT_AVAILABLE
+
+
+def luma_frame_bbox(frame: bytes, width: int, height: int,
+                    limit: int = 24) -> Optional[Tuple[int, int, int, int]]:
+    """Find the active picture rectangle `(w, h, x, y)` in a raw 8-bit luma frame."""
+    if width < 2 or height < 2 or len(frame) < width * height:
+        return None
+    row_thresh = limit * width
+    y0 = 0
+    while y0 < height and sum(frame[y0 * width:(y0 + 1) * width]) <= row_thresh:
+        y0 += 1
+    if y0 >= height:
+        return None
+    y1 = height
+    while y1 > y0 + 1 and sum(frame[(y1 - 1) * width:y1 * width]) <= row_thresh:
+        y1 -= 1
+
+    col_thresh = limit * (y1 - y0)
+    mv = memoryview(frame)
+    start_off = y0 * width
+    end_off = y1 * width
+    x0 = 0
+    while x0 < width and sum(mv[start_off + x0:end_off:width]) <= col_thresh:
+        x0 += 1
+    x1 = width
+    while x1 > x0 + 1 and sum(mv[start_off + (x1 - 1):end_off:width]) <= col_thresh:
+        x1 -= 1
+
+    even_x0 = (x0 + 1) & ~1 if x0 > 0 else 0
+    even_y0 = (y0 + 1) & ~1 if y0 > 0 else 0
+    even_x1 = x1 & ~1
+    even_y1 = y1 & ~1
+    w = even_x1 - even_x0
+    h = even_y1 - even_y0
+    if w <= 0 or h <= 0:
+        return None
+    return (w, h, even_x0, even_y0)
+
+
+def detect_black_bars_luma(path, width: int, height: int, start: float = 0.0,
+                           length: float = 0.0, points: int = 5) -> Optional[str]:
+    """LGPL-compatible black-bar detector using `scale` + `format=gray` rawvideo frames."""
+    if width < 2 or height < 2 or length <= 2:
+        return None
+    pw = min(640, width) & ~1
+    ph = max(2, int(round(height * pw / width)) & ~1)
+    expected = pw * ph
+    found = []
+    for i in range(points):
+        t = start + length * (i + 0.5) / points
+        try:
+            r = subprocess.run(
+                ['ffmpeg', '-hide_banner', '-nostdin', '-v', 'error', '-ss', f'{t:.3f}',
+                 '-i', str(path), '-frames:v', '1', '-an',
+                 '-vf', f'scale={pw}:{ph}:flags=fast_bilinear,format=gray',
+                 '-f', 'rawvideo', '-'],
+                capture_output=True, timeout=120)
+        except (subprocess.SubprocessError, OSError):
+            continue
+        if r.returncode != 0 or len(r.stdout) < expected:
+            continue
+        box = luma_frame_bbox(r.stdout[:expected], pw, ph)
+        if not box:
+            continue
+        bw, bh, bx, by = box
+        sx, sy = width / pw, height / ph
+        rx = min(width - 2, ((int(round(bx * sx)) + 1) & ~1) if bx > 0 else 0)
+        ry = min(height - 2, ((int(round(by * sy)) + 1) & ~1) if by > 0 else 0)
+        rx1 = max(rx + 2, min(width, int(round((bx + bw) * sx)) & ~1))
+        ry1 = max(ry + 2, min(height, int(round((by + bh) * sy)) & ~1))
+        rw = (rx1 - rx) & ~1
+        rh = (ry1 - ry) & ~1
+        if rw > 0 and rh > 0:
+            found.append((rw, rh, rx, ry))
+    return bars_crop(found, width, height)
+
+
 def detect_black_bars(path, info: dict, start: float = 0.0, length: Optional[float] = None,
                       points: int = 5) -> Optional[str]:
     """Black bars around the picture (letterbox, pillarbox) as a crop, or None."""
     length = length if length is not None else info.get('duration') or 0
     if length <= 2:
         return None
+    width = info.get('width') or 0
+    height = info.get('height') or 0
+    if not _has_cropdetect():
+        return detect_black_bars_luma(path, width, height, start, length, points)
     found = []
     for i in range(points):
         t = start + length * (i + 0.5) / points
@@ -967,7 +1111,7 @@ def detect_black_bars(path, info: dict, start: float = 0.0, length: Optional[flo
         hits = CROPDETECT_RE.findall(r.stderr)
         if hits:
             found.append(tuple(int(v) for v in hits[-1]))
-    return bars_crop(found, info.get('width') or 0, info.get('height') or 0)
+    return bars_crop(found, width, height)
 
 
 def settle_edits(request: Optional[EditRequest], info: dict, path, profile,
@@ -1056,7 +1200,7 @@ def probe_stream_inventory(path) -> list:
     try:
         result = subprocess.run(
             ['ffprobe', '-v', 'error', '-show_entries',
-             'stream=codec_type,codec_name,codec_tag_string:stream_side_data',
+             'stream=codec_type,codec_name,codec_tag_string,bit_rate:stream_disposition=attached_pic:stream_side_data',
              '-of', 'json', str(path)],
             capture_output=True, text=True, check=True, timeout=60,
         )
@@ -1086,6 +1230,32 @@ def available_decoders() -> set:
         pass
     _DECODERS = names
     return names
+
+
+_AAC_ENCODER: Optional[str] = None
+
+
+def preferred_aac_encoder() -> str:
+    """Use Apple's AudioToolbox AAC encoder (`aac_at`) on macOS when available."""
+    global _AAC_ENCODER
+    if _AAC_ENCODER is not None:
+        return _AAC_ENCODER
+    if sys.platform != 'darwin':
+        _AAC_ENCODER = 'aac'
+        return _AAC_ENCODER
+    selected = 'aac'
+    try:
+        result = subprocess.run(['ffmpeg', '-hide_banner', '-encoders'],
+                                capture_output=True, text=True, timeout=10)
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and len(parts[0]) == 6 and parts[0][0] == 'A' and parts[1] == 'aac_at':
+                selected = 'aac_at'
+                break
+    except (subprocess.SubprocessError, OSError):
+        pass
+    _AAC_ENCODER = selected
+    return selected
 
 
 def probe_ref_size(path) -> Optional[Tuple[int, int]]:
@@ -1138,6 +1308,10 @@ def build_ffmpeg_command(input_path, output_path, profile, quality_value, copy_a
         # Map video codec
         cmd.extend(['-c:v', profile['codec']])
         cmd.extend(profile['encoder_args'])
+        # Cap keyframe interval (2s @ 30fps) so HTTP seeking in Immich/Safari/AVPlayer
+        # stays snappy instead of waiting for 5-10s default GOPs.
+        if '-g' not in profile['encoder_args']:
+            cmd.extend(['-g', '60'])
 
         # VideoToolbox mode selection:
         # -q:v (quality VBR) and -b:v (bitrate-controlled VBR) are MUTUALLY EXCLUSIVE.
@@ -1176,6 +1350,7 @@ def build_ffmpeg_command(input_path, output_path, profile, quality_value, copy_a
     audio_filters = None
     if not copy_audio and not mute:
         audio_filters = build_audio_filter_chain(audio_mode, measured=loudnorm_measured)
+    aac_enc = preferred_aac_encoder() if (not copy_audio and not mute) else 'aac'
 
     if mute and not streams:
         cmd.append('-an')
@@ -1183,12 +1358,13 @@ def build_ffmpeg_command(input_path, output_path, profile, quality_value, copy_a
         # Explicit mapping: keep every usable track, not just the one ffmpeg
         # would pick by default.
         stream_args, _ = build_stream_args(streams, copy_audio, audio_filters,
-                                           decodable=available_decoders())
+                                           decodable=available_decoders(),
+                                           audio_codec=aac_enc)
         cmd.extend(stream_args)
     elif copy_audio:
         cmd.extend(['-c:a', 'copy'])
     else:
-        cmd.extend(['-c:a', 'aac', '-b:a', '192k', '-ar', '48000'])
+        cmd.extend(['-c:a', aac_enc, '-b:a', '192k', '-ar', '48000'])
         if audio_filters:
             cmd.extend(['-af', audio_filters])
 
@@ -1202,12 +1378,15 @@ def build_ffmpeg_command(input_path, output_path, profile, quality_value, copy_a
         # profile's tag on it is wrong — ffmpeg rejects `hvc1` on an H.264
         # stream outright. Without a tag it picks the matching one itself.
         *([] if video_mode == 'copy' else ['-tag:v', tag]),
-        # delay_moov: prevents partial/corrupt moov on aborted encodes.
+        # faststart: moves moov to the front for instant HTTP streaming (Immich,
+        # Safari, AVPlayer). Never combine with delay_moov/frag_* — ffmpeg's
+        # movenc turns delay_moov into fragmented MP4 (moof/mdat without sidx),
+        # which defeats faststart and stalls HTTP players.
         # use_metadata_tags: carries QuickTime keys (GPS, capture date with
         # timezone, camera model) through — without it the mp4 muxer writes
         # only the handful of tags it knows and an iPhone clip loses where and
         # when it was shot.
-        '-movflags', '+faststart+delay_moov+use_metadata_tags',
+        '-movflags', '+faststart+use_metadata_tags',
         '-fps_mode', 'vfr',                    # Preserve source timestamps; no dup/drop (any VFR source)
         '-map_metadata', '0',                  # Container metadata is NOT copied by default
         # The source's own container brands would otherwise be written next to
@@ -1223,6 +1402,7 @@ def build_ffmpeg_command(input_path, output_path, profile, quality_value, copy_a
             '-colorspace', 'bt709',
             '-color_primaries', 'bt709',
             '-color_trc', 'bt709',
+            '-color_range', 'tv',
         ])
     cmd.extend([
         '-progress', 'pipe:1',
@@ -1344,7 +1524,7 @@ def estimate_optimal_q(input_path, profile, quality_values, bitrate_values,
                 return None  # encoder trouble -> let the real search handle it
             ref_size = probe_ref_size(out) if scale_height else None
             ssim = get_multi_ssim(probe, out, probe_ssim_starts, probe_ssim_starts, SAMPLE_DURATION,
-                                  ref_size=ref_size, edits=edits)
+                                  ref_size=ref_size, edits=edits, hwaccel=profile.get('hwaccel_input'))
             out_kbps = (out.stat().st_size * 8) / (probe_dur * 1000) if probe_dur > 0 else 0.0
             ratio = out.stat().st_size / probe_size if probe_size else 1.0
             if target and target > 0:
@@ -1443,7 +1623,7 @@ def make_preview(input_path, profile, out_dir, audio_mode='enhanced', ss=None, t
     seg_duration = max(0.5, (seg_info.get('duration') or PREVIEW_SEGMENT_SEC) - 0.2)
     ssim = get_multi_ssim(source, preview, [0.0], [0.0], seg_duration,
                           ref_size=probe_ref_size(preview) if plan.scale_height else None,
-                          edits=plan.edits)
+                          edits=plan.edits, hwaccel=plan.profile.get('hwaccel_input'))
     result = {
         'quality': int(quality),
         'ssim': round(ssim, 4),
@@ -1663,12 +1843,17 @@ def run_copy_mode(input_path, output_path, profile, copy_audio, audio_mode,
          # Calculate size diff just for logs, though savings aren't guaranteed
          size_after = output_path.stat().st_size
          saved_bytes = size_before - size_after
+         saved_pct = (saved_bytes / size_before * 100) if size_before > 0 else 0.0
 
          last_encode_result['filename'] = input_path.name
+         last_encode_result['input_path'] = str(input_path.resolve())
+         last_encode_result['output_path'] = str(output_path.resolve())
          last_encode_result['status'] = 'success'
          last_encode_result['reason'] = 'Video Copy (Passthrough)'
          last_encode_result['duration'] = file_time
          last_encode_result['saved_bytes'] = saved_bytes # Might be negative if container overhead
+         last_encode_result['saved_pct'] = round(saved_pct, 1)
+         last_encode_result['ssim'] = 1.0
 
          if port:
              notify_server(port, input_path)
@@ -1722,7 +1907,7 @@ class EncodePlan:
 def prepare_encode(input_path, profile, min_size_mb=0, copy_audio=False,
                    audio_mode='enhanced', ss=None, to=None, video_mode='compress',
                    q_override=None, scale_height=None, force=False, min_ssim=None,
-                   edit_request=None):
+                   edit_request=None, output_dir=None):
     """Everything that has to be settled before the first encode pass.
 
     Probing, HDR handling, stream inventory, the pre-flight savings gate,
@@ -1755,15 +1940,22 @@ def prepare_encode(input_path, profile, min_size_mb=0, copy_audio=False,
         return None
 
     # Determine Output Path
+    out_dir = Path(output_dir).expanduser() if output_dir else input_path.parent
+    if output_dir:
+        out_dir.mkdir(parents=True, exist_ok=True)
     if video_mode == 'copy':
         # "Copy" mode (Passthrough/Trim) -> Use _trim suffix
         suffix = "_trim.mp4"
-        output_path = input_path.parent / f"{input_path.stem}{suffix}"
+        output_path = out_dir / f"{input_path.stem}{suffix}"
     elif is_trim:
         # Re-encode + Trim -> Use _opt suffix (standard)
         output_path = input_path.parent / f"{input_path.stem}_opt.mp4"
+        if output_dir:
+            output_path = out_dir / output_path.name
     else:
         output_path = input_path.parent / f"{input_path.stem}_opt.mp4"
+        if output_dir:
+            output_path = out_dir / output_path.name
 
         # Skip if output already exists (Skip check if trimming)
         if output_path.exists():
@@ -1787,7 +1979,7 @@ def prepare_encode(input_path, profile, min_size_mb=0, copy_audio=False,
     # no hint why. Saying so up front costs one syscall.
     needed = disk_headroom_needed(size_before)
     try:
-        free = shutil.disk_usage(input_path.parent).free
+        free = shutil.disk_usage(out_dir).free
     except OSError:
         free = None
     if free is not None and free < needed:
@@ -1880,7 +2072,10 @@ def prepare_encode(input_path, profile, min_size_mb=0, copy_audio=False,
             last_encode_result['duration'] = 0
             return None
         profile = hdr_profile
-        print(f"{Y}HDR/10-bit source:{NC} main10 encode with color passthrough ({info.get('color_transfer') or '10-bit SDR'})")
+        if is_hdr(info):
+            print(f"{Y}HDR source:{NC} main10 encode with color passthrough ({info.get('color_transfer') or 'BT.2020'})")
+        else:
+            print(f"{Y}10-bit SDR source:{NC} main10 encode with BT.709 color tags")
 
     # --- STREAM INVENTORY ---
     # Probed once per file: every usable track is mapped explicitly, and
@@ -1896,7 +2091,7 @@ def prepare_encode(input_path, profile, min_size_mb=0, copy_audio=False,
     for note in skipped_streams:
         print(f"{Y}Stream dropped:{NC} {note}")
     last_encode_result['dropped'] = skipped_streams or None
-    _video = next((s for s in source_streams if s.get('codec_type') == 'video'), {})
+    _video = first_video_stream(source_streams) or {}
     dolby_vision = dolby_vision_info(_video.get('side_data_list', []))
     last_encode_result['dolby_vision'] = dolby_vision
     if dolby_vision and dolby_vision['kept_as'] is None and video_mode == 'compress':
@@ -2117,7 +2312,7 @@ def prepare_encode(input_path, profile, min_size_mb=0, copy_audio=False,
     )
 
 
-def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None, audio_mode='enhanced', ss=None, to=None, video_mode='compress', q_override=None, presearch=True, scale_height=None, force=False, min_ssim=None, replace=False, edit_request=None, progress_callback=None):
+def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None, audio_mode='enhanced', ss=None, to=None, video_mode='compress', q_override=None, presearch=True, scale_height=None, force=False, min_ssim=None, replace=False, edit_request=None, output_dir=None, progress_callback=None):
     """Process a single video file. Returns (success, bytes_saved).
 
     `progress_callback(done_seconds, total_seconds, label)` is called while
@@ -2130,7 +2325,7 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
     input_path = Path(input_path)
     plan = prepare_encode(input_path, profile, min_size_mb, copy_audio, audio_mode,
                           ss, to, video_mode, q_override, scale_height, force, min_ssim,
-                          edit_request)
+                          edit_request, output_dir=output_dir)
     if plan is None:
         return (False, 0)
 
@@ -2162,12 +2357,15 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
     fallback_floor = plan.fallback_floor
     q_override = plan.q_override
     _source_avg_kbps = plan.source_avg_kbps
+    quality_target = min_ssim or MIN_QUALITY
 
     def should_continue(q):
         return quality_search_continues(q, end_q, profile['quality_direction'])
 
     # Video Copy Mode Bypass
     if video_mode == 'copy':
+        if not copy_audio and not (edits and edits.mute):
+            copy_audio = True
         return run_copy_mode(input_path, output_path, profile, copy_audio,
                              audio_mode, ss, to, source_streams, port, size_before,
                              info, is_trim, trim_duration, progress_callback)
@@ -2188,6 +2386,8 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
         tool cannot undo by itself.
         """
         if not should_replace(replace, video_mode, is_trim):
+            return
+        if output_path.parent.resolve() != input_path.parent.resolve():
             return
         target, reason = plan_replacement(input_path)
         if target is None:
@@ -2251,6 +2451,7 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
             input_path, effective_out, orig_starts, opt_starts, SAMPLE_DURATION,
             ref_size=probe_ref_size(effective_out) if scale_height else None,
             edits=edits,
+            hwaccel=profile.get('hwaccel_input'),
         )
         quality_label = _detect_quality_filter().upper()
 
@@ -2290,6 +2491,7 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
 
         # Track mid-encode progress for educated quality jump on early abort
         _last_out_time_ms = 0
+        _pending_out_time_ms = None
         _abort_size = 0
 
         # Start Non-Blocking Reader
@@ -2326,16 +2528,13 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
                         try:
                             ms = int(val)
                             _last_out_time_ms = ms
-                            elapsed = time.time() - encode_start
-                            duration_to_show = trim_duration if is_trim else info['duration']
-                            show_progress(ms / 1000000, duration_to_show, profile['codec'], cur_stats["bitrate"], cur_stats["speed"], elapsed)
-                            _report_progress(progress_callback, ms / 1000000, duration_to_show,
-                                             f"encode Q={quality_val}")
+                            _pending_out_time_ms = ms
 
                             # Rolling projection: predict final size from current progress.
                             # Use out_time_ms + _abort_size (updated from total_size= just before).
                             # Trust estimate only after 25% encoded – HEVC VBR is too volatile
                             # in the first 15-20% (scene complexity, encoder warmup, I-frames).
+                            duration_to_show = trim_duration if is_trim else info['duration']
                             duration_us = duration_to_show * 1_000_000
                             if _abort_size > 0 and duration_us > 0 and ms > 0:
                                 encoded_fraction = ms / duration_us
@@ -2352,6 +2551,25 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
                                         break
                         except ValueError:
                             pass
+                elif line.strip().startswith('progress='):
+                    if _pending_out_time_ms is not None:
+                        elapsed = time.time() - encode_start
+                        duration_to_show = trim_duration if is_trim else info['duration']
+                        show_progress(
+                            _pending_out_time_ms / 1000000,
+                            duration_to_show,
+                            profile['codec'],
+                            cur_stats["bitrate"],
+                            cur_stats["speed"],
+                            elapsed,
+                        )
+                        _report_progress(
+                            progress_callback,
+                            _pending_out_time_ms / 1000000,
+                            duration_to_show,
+                            f"encode Q={quality_val}",
+                        )
+                        _pending_out_time_ms = None
                 elif 'total_size=' in line:
                     val = line.split('=')[1].strip()
                     if val != 'N/A':
@@ -2463,12 +2681,13 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
         # --- full-encode search to predicted ±1 (usually 1-2 real passes) ---
         if (presearch and OPTIMIZER_UTILS_AVAILABLE and not is_trim
                 and info['duration'] >= PRESEARCH_MIN_DURATION):
-            predicted_q = estimate_optimal_q(
-                input_path, profile, quality_values, bitrate_values,
-                sample_starts, audio_mode, input_path.parent, scale_height=scale_height,
-                source_avg_kbps=_source_avg_kbps,
-                maxrate_kbps=maxrate_kbps, bufsize_kbps=bufsize_kbps,
-                min_ssim=ssim_min, edits=edits)
+            with tempfile.TemporaryDirectory(prefix="videocrunch_probe_") as probe_dir:
+                predicted_q = estimate_optimal_q(
+                    input_path, profile, quality_values, bitrate_values,
+                    sample_starts, audio_mode, Path(probe_dir), scale_height=scale_height,
+                    source_avg_kbps=_source_avg_kbps,
+                    maxrate_kbps=maxrate_kbps, bufsize_kbps=bufsize_kbps,
+                    min_ssim=ssim_min, edits=edits)
             if predicted_q is not None:
                 idx = nearest_quality_index(quality_values, predicted_q)
                 low, high = narrow_quality_window(len(quality_values), idx, radius=1)
@@ -2491,7 +2710,7 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
         if OPTIMIZER_UTILS_AVAILABLE and profile.get('_encoder_key'):
             _suggested_q = suggest_q_from_history(
                 profile['_encoder_key'], effective_height,
-                last_encode_result['source_kbps'] or 0.0, min_ssim=MIN_QUALITY)
+                last_encode_result['source_kbps'] or 0.0, min_ssim=quality_target)
             if _suggested_q is not None:
                 first_mid = nearest_quality_index(quality_values, _suggested_q)
                 print(f"{Y}History Seed:{NC} starting at Q={quality_values[first_mid]} (median of past encodes)")
@@ -2572,7 +2791,7 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
             saved_pct = saved_bytes * 100 / size_to_compare
 
             # Check if meets targets
-            meets_targets = meets_quality_targets(saved_pct, ssim)
+            meets_targets = meets_quality_targets(saved_pct, ssim, min_quality=quality_target)
 
             # Track best acceptable result as backup (retain its staging file).
             # Retention uses SSIM_MIN, the documented hard floor — NOT the
@@ -2607,18 +2826,18 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
                 best_candidate_path = staging
 
                 # EARLY EXIT: No point searching further when we've already saved excellently
-                if saved_pct >= EXCELLENT_SAVINGS_PCT and ssim >= MIN_QUALITY:
+                if saved_pct >= EXCELLENT_SAVINGS_PCT and ssim >= quality_target:
                     print(f" {BG}   -> Early exit: {saved_pct:.1f}% savings is excellent! (cached)  {NC}")
                     break
 
                 # Otherwise try for more compression
                 low = mid + 1
-            elif saved_pct >= MIN_SAVINGS and ssim < MIN_QUALITY:
+            elif saved_pct >= MIN_SAVINGS and ssim < quality_target:
                 # Savings goal already met — QUALITY is what is missing. More
                 # compression can only lower SSIM further, so move toward
                 # BETTER quality (lower index) instead of grinding downward.
                 print(f" {Y}   -> Savings fine ({saved_pct:.1f}%), quality short "
-                      f"({ssim:.4f} < {MIN_QUALITY}) – trying better quality.{NC}")
+                      f"({ssim:.4f} < {quality_target}) – trying better quality.{NC}")
                 high = mid - 1
                 # staging already handled under best_acceptable tracking above
             else:
@@ -2823,7 +3042,7 @@ def process_file(input_path, profile, min_size_mb=0, copy_audio=False, port=None
         saved_bytes = size_to_compare - size_after
         saved_pct = saved_bytes * 100 / size_to_compare
 
-        if meets_quality_targets(saved_pct, ssim):
+        if meets_quality_targets(saved_pct, ssim, min_quality=quality_target):
             # Great result – promote staging file to final output
             # Discard any previously saved fallback
             if linear_best_acceptable_path and linear_best_acceptable_path.exists():
@@ -3039,6 +3258,8 @@ def build_parser():
                              '(JSON). Written whatever the outcome, including failures.')
     parser.add_argument('--no-presearch', action='store_true',
                         help='Skip the sample-clip quality pre-search (always run the full binary search)')
+    parser.add_argument('--output-dir', metavar='DIR',
+                        help='Write output files into DIR instead of next to the source')
     return parser
 
 
@@ -3154,6 +3375,7 @@ def main():
                 min_ssim=args.min_ssim,
                 replace=args.replace,
                 edit_request=edit_request,
+                output_dir=args.output_dir,
             )
         except KeyboardInterrupt:
             print(f"\n{R}>>> Abort.{NC}")

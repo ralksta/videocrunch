@@ -121,6 +121,28 @@ class TestCommand:
     def test_no_edits_changes_nothing(self):
         assert self._cmd(None) == self._cmd(Edits())
 
+    def test_movflags_faststart_without_fragmentation(self):
+        cmd = self._cmd(None)
+        movflags = cmd[cmd.index("-movflags") + 1]
+        assert movflags == "+faststart+use_metadata_tags"
+        for forbidden in ("delay_moov", "frag_", "empty_moov", "default_base_moof"):
+            assert forbidden not in movflags
+
+    def test_hevc_uses_hvc1_and_preserves_metadata(self):
+        cmd = self._cmd(None)
+        assert cmd[cmd.index("-tag:v") + 1] == "hvc1"
+        assert cmd[cmd.index("-map_metadata") + 1] == "0"
+
+    def test_streaming_gop_and_color_range(self):
+        cmd = self._cmd(None)
+        assert cmd[cmd.index("-g") + 1] == "60"
+        assert cmd[cmd.index("-color_range") + 1] == "tv"
+
+        copy_cmd = build_ffmpeg_command("in.mov", "out.mp4", VT, 28,
+                                        audio_mode="standard", video_mode="copy")
+        assert "-g" not in copy_cmd
+        assert "-color_range" not in copy_cmd
+
 
 class TestBatchForwards:
     def test_switches_reach_every_file(self):

@@ -644,10 +644,22 @@ class TestBatchQualityFloorForwarding:
                                             replace=True)
         assert "--replace" in cmd
 
+    def test_video_mode_reaches_the_per_file_command(self):
+        cmd = batch.build_optimizer_command("/a.mp4", port=None, audio_mode="standard",
+                                            video_mode="copy")
+        assert cmd[cmd.index("--video-mode") + 1] == "copy"
+        assert "--copy-audio" in cmd
+
+    def test_video_mode_parses_and_defaults_to_compress(self):
+        assert batch.build_parser().parse_args(["--files=/a.mp4"]).video_mode == "compress"
+        assert batch.build_parser().parse_args(
+            ["--files=/a.mp4", "--video-mode=copy"]).video_mode == "copy"
+
     def test_neither_appears_unless_asked_for(self):
         cmd = batch.build_optimizer_command("/a.mp4", port=None, audio_mode="standard")
         assert "--scale-height" not in cmd
         assert "--replace" not in cmd
+        assert "--video-mode" not in cmd
 
     def test_command_still_carries_the_documented_basics(self):
         cmd = batch.build_optimizer_command("/a.mp4", port=8000,
@@ -716,6 +728,10 @@ class TestQualityTargets:
     def test_target_quality_without_savings_is_not(self):
         assert not videocrunch.meets_quality_targets(saved_pct=12.0, ssim=0.99)
 
+    def test_explicit_min_quality_override_is_respected(self):
+        assert not videocrunch.meets_quality_targets(saved_pct=30.0, ssim=0.965)
+        assert videocrunch.meets_quality_targets(saved_pct=30.0, ssim=0.965, min_quality=0.960)
+
     def test_floors_are_ordered(self):
         assert (videocrunch.SSIM_MIN <= videocrunch.SSIM_ACCEPTABLE
                 <= videocrunch.MIN_QUALITY)
@@ -768,3 +784,24 @@ class TestDownscaleIsTheShortSide:
                                "-of", "csv=p=0", str(frame)],
                               capture_output=True, text=True, check=True).stdout.strip()
         assert size == expected
+
+
+class TestVideoToolboxTuning:
+    def test_videotoolbox_profile_enables_spatial_aq_and_quality_priority(self):
+        args = videocrunch.ENCODER_PROFILES["videotoolbox"]["encoder_args"]
+        assert args[args.index("-spatial_aq") + 1] == "1"
+        assert args[args.index("-prio_speed") + 1] == "0"
+        assert args[args.index("-realtime") + 1] == "0"
+
+    def test_apply_encoding_preset_updates_videotoolbox_flags(self):
+        vt = videocrunch.ENCODER_PROFILES["videotoolbox"]
+        fast = videocrunch.apply_encoding_preset(vt, "fast")["encoder_args"]
+        assert fast[fast.index("-realtime") + 1] == "1"
+        assert fast[fast.index("-prio_speed") + 1] == "1"
+        assert fast[fast.index("-spatial_aq") + 1] == "0"
+
+        for preset in ("balanced", "best"):
+            tuned = videocrunch.apply_encoding_preset(vt, preset)["encoder_args"]
+            assert tuned[tuned.index("-realtime") + 1] == "0"
+            assert tuned[tuned.index("-prio_speed") + 1] == "0"
+            assert tuned[tuned.index("-spatial_aq") + 1] == "1"

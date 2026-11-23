@@ -26,7 +26,12 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from crunch_utils import apply_hdr_adjustments, is_hdr_or_10bit
+from crunch_utils import (
+    apply_hdr_adjustments,
+    is_hdr_or_10bit,
+    valid_live_bitrate,
+    valid_live_speed,
+)
 from videocrunch import (
     EditRequest,
     Edits,
@@ -100,13 +105,14 @@ def plan(max_bytes: float, seconds: float, info: dict, audio_tracks: int) -> dic
             "scale_height": side if side < min(width, height) else None, "fps": half}
 
 
-def output_path_for(src: Path, max_mb: float) -> Path:
-    """`clip_25MB.mp4` next to the video, `clip_25MB 2.mp4` when that exists."""
+def output_path_for(src: Path, max_mb: float, output_dir: Optional[Path] = None) -> Path:
+    """`clip_25MB.mp4` next to the video (or in output_dir), `clip_25MB 2.mp4` when taken."""
+    dest_dir = Path(output_dir).expanduser() if output_dir else src.parent
     base = f"{src.stem}_{max_mb:g}MB"
-    candidate = src.with_name(base + ".mp4")
+    candidate = dest_dir / f"{base}.mp4"
     n = 2
     while candidate.exists():
-        candidate = src.with_name(f"{base} {n}.mp4")
+        candidate = dest_dir / f"{base} {n}.mp4"
         n += 1
     return candidate
 
@@ -129,16 +135,22 @@ def publish(part: Path, out: Path) -> None:
             pass  # cosmetic: the file is there, just hidden in Finder
 
 
-def _encode(cmd, seconds: float, on_percent) -> bool:
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+def _encode(cmd, seconds: float, on_progress) -> bool:
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    cur_speed = None
+    cur_bitrate = None
     try:
         for line in proc.stdout:
-            if line.startswith("out_time_us=") and seconds > 0:
+            if line.startswith("speed="):
+                cur_speed = valid_live_speed(line.split("=", 1)[1])
+            elif line.startswith("bitrate="):
+                cur_bitrate = valid_live_bitrate(line.split("=", 1)[1])
+            elif line.startswith("out_time_us=") and seconds > 0:
                 try:
                     done = int(line.split("=", 1)[1]) / 1e6
                 except ValueError:
                     continue
-                on_percent(min(99, int(done * 100 / seconds)))
+                on_progress(min(99, int(done * 100 / seconds)), cur_speed, cur_bitrate)
         return proc.wait() == 0
     except KeyboardInterrupt:
         stop_encoder(proc)
@@ -146,7 +158,7 @@ def _encode(cmd, seconds: float, on_percent) -> bool:
 
 
 def fit_file(src: Path, max_mb: float, profile: dict, request: EditRequest,
-             audio_mode: str, ss=None, to=None) -> dict:
+             audio_mode: str, ss=None, to=None, output_dir: Optional[Path] = None) -> dict:
     """Encode one video under max_mb. Returns a batch.py-style result."""
     result = {"filename": src.name, "path": str(src.resolve()), "status": "failed", "quality": None,
               "ssim": None, "saved_pct": None, "saved_bytes": None, "duration": 0,
@@ -177,29 +189,48 @@ def fit_file(src: Path, max_mb: float, profile: dict, request: EditRequest,
     # The size plan may halve the rate too, when even 360p is too much.
     edits = Edits(fps=edits.fps or p["fps"], crop=edits.crop, mute=edits.mute)
 
-    out = output_path_for(src, max_mb)
+    out = output_path_for(src, max_mb, output_dir=output_dir)
+    out.parent.mkdir(parents=True, exist_ok=True)
     part = out.with_name(f".{out.stem}.part.mp4")  # ffmpeg picks the muxer by extension
     kbps = p["video_kbps"]
     try:
         for attempt in range(1, MAX_TRIES + 1):
+            detail_text = f"Versuch {attempt}/{MAX_TRIES} · {kbps} kbit/s · {p['short_side']}p"
             cmd = build_ffmpeg_command(
                 src, part, profile, 0, audio_mode=audio_mode, ss=ss, to=to,
                 target_bitrate_kbps=kbps, maxrate_kbps=kbps * 1.5, bufsize_kbps=kbps * 2,
                 color_args=profile.get("color_args"), scale_height=p["scale_height"],
                 streams=streams, edits=edits)
-            ok = _encode(cmd, seconds, lambda pct, a=attempt: emit(
-                "progress", worker=1, file=str(src), phase="encode", **{"pass": a}, percent=pct))
+            emit("progress", worker=1, file=str(src), phase="encode",
+                 **{"pass": attempt}, percent=0, detail=detail_text)
+            def emit_fit_progress(pct: int, speed: Optional[str], bitrate: Optional[str],
+                                  a=attempt, dt=detail_text):
+                extra = {}
+                if speed is not None:
+                    extra["speed"] = speed
+                if bitrate is not None:
+                    extra["bitrate"] = bitrate
+                emit("progress", worker=1, file=str(src), phase="encode",
+                     **{"pass": a}, percent=pct, detail=dt, **extra)
+
+            ok = _encode(cmd, seconds, emit_fit_progress)
             if not ok or not part.exists():
                 result["reason"] = "Encoder-Fehler"
                 return result
             size = part.stat().st_size
+            saved_pct = round(100 - size * 100 / size_before, 1) if size_before > 0 else 0.0
+            fits = size <= max_bytes
+            emit("pass_result", worker=1, file=str(src), **{"pass": attempt}, q=None,
+                 saved_pct=saved_pct, ssim=None, metric=None,
+                 verdict="accepted" if fits else "too_large",
+                 note=f"{size / 1e6:.1f} MB bei {kbps} kbit/s ({p['short_side']}p)")
             print(f"Versuch {attempt}: {size / 1e6:.1f} MB bei {kbps} kbit/s "
                   f"({p['short_side']}p)", flush=True)
-            if size <= max_bytes:
+            if fits:
                 publish(part, out)
                 result.update(status="success", output_path=str(out.resolve()),
                               saved_bytes=size_before - size,
-                              saved_pct=round(100 - size * 100 / size_before, 1))
+                              saved_pct=saved_pct)
                 return result
             kbps = int(kbps * max_bytes / size * 0.96)
             if kbps < MIN_VIDEO_KBPS:
@@ -228,6 +259,7 @@ def build_parser():
     p.add_argument("--to", metavar="TIME")
     p.add_argument("--json-out", metavar="PATH", help="All results, as batch.py writes them")
     p.add_argument("--events", action="store_true", help="JSON lines on stdout, like batch.py")
+    p.add_argument("--output-dir", metavar="DIR", help="Write resized MP4 files into DIR")
     return p
 
 
@@ -241,6 +273,7 @@ def main() -> int:
                   if ln.strip()]
     if not files or args.max_mb <= 0:
         build_parser().error("needs files and a positive --max-mb")
+    output_dir = Path(args.output_dir).expanduser() if args.output_dir else None
     if args.events:
         event_stream = sys.stdout
 
@@ -252,10 +285,11 @@ def main() -> int:
     for f in files:
         src = Path(f).expanduser()
         emit("file_start", worker=1, file=str(src), name=src.name)
-        r = fit_file(src, args.max_mb, profile, request, args.audio_mode, args.ss, args.to)
+        r = fit_file(src, args.max_mb, profile, request, args.audio_mode, args.ss, args.to,
+                     output_dir=output_dir)
         results.append(r)
         emit("file_done", worker=1, file=str(src), status=r["status"], quality=None, ssim=None,
-             saved_pct=r["saved_pct"], reason=r["reason"])
+             saved_pct=r["saved_pct"], saved_bytes=r.get("saved_bytes"), reason=r["reason"])
         if r["status"] == "cancelled":
             break
     ok = sum(1 for r in results if r["status"] in ("success", "skipped"))
