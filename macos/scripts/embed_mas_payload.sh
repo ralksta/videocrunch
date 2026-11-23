@@ -216,26 +216,30 @@ chmod 0644 "$LICENSES_DIR"/*.txt
 # Inside-out code signing when requested or running inside Xcode archive build phase
 SIGN_ID="${MAS_SIGN_IDENTITY:-${EXPANDED_CODE_SIGN_IDENTITY:-}}"
 if [[ -n "$SIGN_ID" && "$SIGN_ID" != "-" ]]; then
-  echo "Signing embedded MAS payload with identity: $SIGN_ID"
+  TIMESTAMP_FLAG="--timestamp=none"
+  if [[ "$SIGN_ID" == "Apple Distribution:"* || "$SIGN_ID" == "Developer ID "* || "${MAS_CODESIGN_TIMESTAMP:-0}" == "1" ]]; then
+    TIMESTAMP_FLAG="--timestamp"
+  fi
+  echo "Signing embedded MAS payload with identity: $SIGN_ID ($TIMESTAMP_FLAG)"
   HELPER_ENT="${MACOS_DIR}/VideoCrunchHelper.entitlements"
   APP_ENT="${MACOS_DIR}/VideoCrunch.entitlements"
 
   if [[ -d "$FRAMEWORKS_DIR" ]]; then
     while IFS= read -r -d '' dylib; do
       chmod u+w "$dylib" || true
-      codesign --force --options runtime --timestamp=none --sign "$SIGN_ID" "$dylib"
+      codesign --force --options runtime "$TIMESTAMP_FLAG" --sign "$SIGN_ID" "$dylib"
     done < <(find "$FRAMEWORKS_DIR" -maxdepth 1 -type f -name "*.dylib" -print0)
   fi
 
   for tool in ffmpeg ffprobe python3; do
     if [[ -f "$HELPERS_DIR/$tool" ]]; then
       chmod u+w "$HELPERS_DIR/$tool" || true
-      codesign --force --options runtime --timestamp=none --entitlements "$HELPER_ENT" --sign "$SIGN_ID" "$HELPERS_DIR/$tool"
+      codesign --force --options runtime "$TIMESTAMP_FLAG" --entitlements "$HELPER_ENT" --sign "$SIGN_ID" "$HELPERS_DIR/$tool"
     fi
   done
 
   if [[ "${SKIP_OUTER_RESIGN:-0}" != "1" ]]; then
-    codesign --force --options runtime --timestamp=none --entitlements "$APP_ENT" --sign "$SIGN_ID" "$APP_PATH"
+    codesign --force --options runtime "$TIMESTAMP_FLAG" --entitlements "$APP_ENT" --sign "$SIGN_ID" "$APP_PATH"
   fi
 fi
 
