@@ -3,13 +3,18 @@
 Diese Checkliste fasst die kurzen manuellen Schritte vor dem Upload in App Store Connect zusammen — ergänzt zur technischen LGPL-/Open-Source-Bündelung im App-Bundle (`Contents/Resources/LICENSES/NOTICES.txt`).
 
 ## 1. Custom EULA in App Store Connect hinterlegen (LGPL §6)
-1. Öffne [AppStore-Custom-EULA.txt](AppStore-Custom-EULA.txt).
-2. Ersetze alle drei Platzhalter durch deine realen Kontaktdaten:
+1. Kopiere [AppStore-Custom-EULA.txt](AppStore-Custom-EULA.txt) nach `macos/legal/AppStore-Custom-EULA.local.txt` (ist per `.gitignore` ausgeschlossen, damit deine Privatadresse/E-Mail nicht im öffentlichen Git landet).
+2. Ersetze in der `.local.txt` alle drei Platzhalter durch deine realen Kontaktdaten:
    - `[YOUR FULL NAME OR LEGAL ENTITY]` (zweimal im Text: Abschnitt 1 & Abschnitt 9)
    - `[YOUR MAILING ADDRESS]` (Abschnitt 9)
    - `[YOUR CONTACT EMAIL]` (Abschnitt 9)
 3. Kopiere den kompletten Plain-Text in App Store Connect unter **App-Informationen → Lizenzvereinbarung → Eigene Lizenzvereinbarung (Custom License Agreement)**.
 4. Warum: Apples Standard-EULA verbietet pauschal Reverse Engineering, während LGPL v2.1 §6 Reverse Engineering explizit *zum Debuggen eigener Änderungen an den LGPL-Bibliotheken (FFmpeg)* erlauben muss.
+
+## 1b. Store-Texte, Datenschutz & Support-URLs
+- **Privacy Policy URL:** `https://github.com/ralksta/videocrunch/blob/main/PRIVACY.md` (Quelle: [PRIVACY.md](../../PRIVACY.md))
+- **Support URL:** `https://github.com/ralksta/videocrunch/blob/main/SUPPORT.md` (Quelle: [SUPPORT.md](../../SUPPORT.md))
+- **Copy-Paste-Metadaten (DE/EN), Review Notes & Screenshots:** [APP-STORE-METADATA.md](../appstore/APP-STORE-METADATA.md)
 
 ## 2. Unveränderte Upstream-Source-Tarballs beim GitHub-Release spiegeln
 Lade beim Erstellen des passenden GitHub-Releases unter `https://github.com/ralksta/videocrunch/releases` die drei exakten, unveränderten Upstream-Quellarchive direkt als Release-Assets hoch (damit das Source-Angebot in `NOTICES.txt` auch langfristig ohne 404 abrufbar bleibt):

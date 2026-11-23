@@ -25,3 +25,6 @@ macos/VideoCrunch/VideoCrunch.xcodeproj/
 
 # Local icon generation drafts
 macos/VideoCrunch/icon_candidates/
+
+# Local personal App Store EULA (never commit personal address/email)
+macos/legal/AppStore-Custom-EULA.local.txt
