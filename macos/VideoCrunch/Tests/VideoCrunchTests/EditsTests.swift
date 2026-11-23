@@ -46,4 +46,21 @@ final class EditsTests: XCTestCase {
         // 100 MB -> 25 MB; 8 MB already fits and stays.
         XCTAssertEqual(h.vm.selectedTotalAfterMB, 33, accuracy: 0.01)
     }
+
+    func testSizeLimitPresetsAdaptToSelectedVideoSize() {
+        let h = Harness()
+        h.scan(["/v/a.mov"], results: [candidate("/v/a.mov", sizeMB: 41.0)])
+        XCTAssertTrue(h.vm.isSizeLimitUseful(10))
+        XCTAssertTrue(h.vm.isSizeLimitUseful(25))
+        XCTAssertFalse(h.vm.isSizeLimitUseful(50))
+        XCTAssertFalse(h.vm.isSizeLimitUseful(100))
+
+        XCTAssertFalse(h.vm.isSizeLimitMode)
+        h.vm.isSizeLimitMode = true
+        XCTAssertTrue(h.vm.isSizeLimitMode)
+        XCTAssertEqual(h.vm.sizeLimitMB, 25)
+
+        h.vm.isSizeLimitMode = false
+        XCTAssertEqual(h.vm.sizeLimitMB, 0)
+    }
 }

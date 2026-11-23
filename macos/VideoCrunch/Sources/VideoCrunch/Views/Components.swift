@@ -2,22 +2,32 @@ import AppKit
 import SwiftUI
 
 func videoCount(_ n: Int) -> String {
-    n == 1 ? "1 Video" : "\(n) Videos"
+    n == 1 ? L("count.video_one") : L("count.video_many_fmt", n)
 }
 
 // MARK: - Option building blocks
 
-/// Grouped card surface, the way System Settings draws its sections.
+/// Grouped card surface with a subtle top machined hairline rim, the way System Settings and Apple Pro apps draw panels.
 struct CardBackground: ViewModifier {
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.colorSchemeContrast) private var contrast
+
     func body(content: Content) -> some View {
+        let topEdge = colorScheme == .dark
+            ? Color.white.opacity(contrast == .increased ? 0.24 : 0.13)
+            : Color.black.opacity(contrast == .increased ? 0.14 : 0.06)
+        let bottomEdge = Color(nsColor: .separatorColor).opacity(contrast == .increased ? 1.0 : 0.75)
         content
             .background(
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(Color(nsColor: .controlBackgroundColor).opacity(0.55))
+                    .fill(Color(nsColor: .controlBackgroundColor).opacity(colorScheme == .dark ? 0.52 : 0.78))
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .strokeBorder(Color(nsColor: .separatorColor))
+                    .strokeBorder(
+                        LinearGradient(colors: [topEdge, bottomEdge], startPoint: .top, endPoint: .bottom),
+                        lineWidth: 1
+                    )
             )
     }
 }
@@ -135,6 +145,9 @@ struct Chip: View {
     let text: String
     var icon: String? = nil
     var tint: Color = .secondary
+    var monospaced: Bool = false
+
+    @Environment(\.colorSchemeContrast) private var contrast
 
     var body: some View {
         HStack(spacing: 3) {
@@ -144,10 +157,23 @@ struct Chip: View {
             Text(text)
         }
         .font(.caption2.weight(.medium))
+        .if(monospaced) { $0.monospacedDigit() }
         .padding(.horizontal, 7)
         .padding(.vertical, 2)
-        .background(Capsule().fill(tint.opacity(0.15)))
+        .background(Capsule().fill(tint.opacity(contrast == .increased ? 0.22 : 0.14)))
+        .overlay {
+            if contrast == .increased {
+                Capsule().strokeBorder(tint.opacity(0.55), lineWidth: 0.75)
+            }
+        }
         .foregroundStyle(tint == .secondary ? Color.primary.opacity(0.75) : tint)
+    }
+}
+
+private extension View {
+    @ViewBuilder
+    func `if`<Content: View>(_ condition: Bool, transform: (Self) -> Content) -> some View {
+        if condition { transform(self) } else { self }
     }
 }
 
@@ -158,9 +184,9 @@ struct SavingsBar: View {
     var body: some View {
         GeometryReader { geo in
             ZStack(alignment: .leading) {
-                Capsule().fill(Color.secondary.opacity(0.2))
+                Capsule().fill(Color.secondary.opacity(0.18))
                 Capsule()
-                    .fill(Color.green.gradient)
+                    .fill(Color.brandBarGradient)
                     .frame(width: max(3, geo.size.width * min(1, max(0, fraction))))
             }
         }

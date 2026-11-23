@@ -1,16 +1,17 @@
 import AppKit
+import AVFoundation
 import QuickLookThumbnailing
 import SwiftUI
 
 // MARK: - Colours
 
 extension Color {
-    /// Green for saved megabytes. The system green is too light to read as
-    /// text on a light background, so light mode gets a deeper one.
+    /// Green for saved megabytes. Harmonized with the brand teal and kept high-contrast
+    /// in both dark and light appearances.
     static let savings = Color(nsColor: NSColor(name: nil) { appearance in
         appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-            ? .systemGreen
-            : NSColor(srgbRed: 0.10, green: 0.55, blue: 0.22, alpha: 1)
+            ? NSColor(srgbRed: 0.28, green: 0.80, blue: 0.54, alpha: 1)
+            : NSColor(srgbRed: 0.09, green: 0.52, blue: 0.28, alpha: 1)
     })
 }
 
@@ -35,19 +36,31 @@ struct NotRestorable: NSViewRepresentable {
 /// The frame Finder shows for a video, from Quick Look.
 struct VideoThumbnail: View {
     let url: URL
+    var duration: Double? = nil
     @State private var image: NSImage?
 
     var body: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(Color.secondary.opacity(0.15))
-            if let image {
-                Image(nsImage: image)
-                    .resizable()
-                    .aspectRatio(contentMode: .fill)
-            } else {
-                Image(systemName: "film")
-                    .foregroundStyle(.secondary)
+        ZStack(alignment: .bottomTrailing) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(Color.secondary.opacity(0.15))
+                if let image {
+                    Image(nsImage: image)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                } else {
+                    Image(systemName: "film")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            if let duration, duration > 0 {
+                Text(clock(duration))
+                    .font(.system(size: 9.5, weight: .semibold).monospacedDigit())
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 1)
+                    .background(Capsule().fill(.black.opacity(0.68)))
+                    .padding(3)
             }
         }
         .frame(width: 72, height: 48)
@@ -66,6 +79,150 @@ struct VideoThumbnail: View {
             fileAt: url, size: CGSize(width: 144, height: 96), scale: 2,
             representationTypes: .thumbnail)
         return try? await QLThumbnailGenerator.shared.generateBestRepresentation(for: request).nsImage
+    }
+}
+
+/// High-resolution 16:9 preview frame for the Encode stage.
+struct VideoStagePreview: View {
+    let url: URL
+    let title: String
+    var duration: Double? = nil
+    var trimRange: (start: Double, end: Double)? = nil
+    var badge: String? = nil
+    var height: CGFloat? = nil
+
+    @State private var image: NSImage?
+
+    private var taskKey: String {
+        "\(url.path)-\(trimRange?.start ?? -1)"
+    }
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: 12, style: .continuous)
+        Color.black.opacity(0.88)
+            .frame(maxWidth: .infinity)
+            .modifier(StageAspectOrHeight(height: height))
+            .overlay {
+                if let image {
+                    Image(nsImage: image)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                } else {
+                    CrunchMark(size: 40, squeeze: 0.25, scanning: false)
+                        .opacity(0.65)
+                }
+            }
+            .overlay(alignment: .topTrailing) {
+                if let badge, !badge.isEmpty {
+                    Text(badge)
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.white.opacity(0.92))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(Capsule().fill(.black.opacity(0.60)))
+                        .padding(10)
+                }
+            }
+            .overlay(alignment: .bottom) {
+                VStack(spacing: 0) {
+                    Spacer()
+                    HStack(alignment: .bottom, spacing: 8) {
+                        Text(title)
+                            .font(.subheadline.weight(.medium))
+                            .foregroundStyle(.white)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Spacer(minLength: 8)
+                        if let trimRange {
+                            Label("\(clock(trimRange.start))–\(clock(trimRange.end))", systemImage: "scissors")
+                                .font(.caption2.weight(.semibold).monospacedDigit())
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 3)
+                                .background(Capsule().fill(.black.opacity(0.65)))
+                        } else if let duration, duration > 0 {
+                            Text(clock(duration))
+                                .font(.caption2.weight(.semibold).monospacedDigit())
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 3)
+                                .background(Capsule().fill(.black.opacity(0.65)))
+                        }
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                    .background(
+                        LinearGradient(
+                            colors: [.clear, .black.opacity(0.78)],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                    )
+                }
+            }
+            .clipShape(shape)
+            .overlay(
+                shape.strokeBorder(Color(nsColor: .separatorColor))
+            )
+            .task(id: taskKey) {
+                image = await Self.loadFrame(for: url, trimStart: trimRange?.start, duration: duration)
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(title)
+            .accessibilityValue(stageAccessibilityValue)
+    }
+
+    private var stageAccessibilityValue: String {
+        var parts: [String] = []
+        if let badge, !badge.isEmpty {
+            parts.append(badge)
+        }
+        if let trimRange {
+            parts.append("\(clock(trimRange.start))–\(clock(trimRange.end))")
+        } else if let duration, duration > 0 {
+            parts.append(clock(duration))
+        }
+        return parts.joined(separator: ", ")
+    }
+
+    private struct StageAspectOrHeight: ViewModifier {
+        let height: CGFloat?
+        func body(content: Content) -> some View {
+            if let height {
+                content.frame(height: height)
+            } else {
+                content.aspectRatio(16 / 9, contentMode: .fit)
+            }
+        }
+    }
+
+    static func loadFrame(for url: URL, trimStart: Double?, duration: Double?) async -> NSImage? {
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        if let trimStart {
+            if let frame = await grabAssetFrame(url: url, atSeconds: max(0, trimStart)) {
+                return frame
+            }
+        }
+        let req = QLThumbnailGenerator.Request(
+            fileAt: url, size: CGSize(width: 720, height: 405), scale: 2,
+            representationTypes: .thumbnail)
+        if let rep = try? await QLThumbnailGenerator.shared.generateBestRepresentation(for: req) {
+            return rep.nsImage
+        }
+        let fallbackSec = min(max((duration ?? 5) * 0.1, 0.2), 2.0)
+        return await grabAssetFrame(url: url, atSeconds: fallbackSec)
+    }
+
+    private static func grabAssetFrame(url: URL, atSeconds seconds: Double) async -> NSImage? {
+        let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: 960, height: 540)
+        generator.requestedTimeToleranceBefore = CMTime(seconds: 0.5, preferredTimescale: 600)
+        generator.requestedTimeToleranceAfter = CMTime(seconds: 0.5, preferredTimescale: 600)
+        let time = CMTime(seconds: seconds, preferredTimescale: 600)
+        guard let result = try? await generator.image(at: time) else { return nil }
+        let cg = result.image
+        return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
     }
 }
 
@@ -88,7 +245,13 @@ struct Comparison: Identifiable, Codable, Hashable {
 enum FramePosition: Int, CaseIterable, Identifiable {
     case start, middle, end
     var id: Int { rawValue }
-    var label: String { ["Anfang", "Mitte", "Ende"][rawValue] }
+    var label: String {
+        switch self {
+        case .start: return L("comparison.start")
+        case .middle: return L("comparison.middle")
+        case .end: return L("comparison.end")
+        }
+    }
     var fraction: Double { [0.1, 0.5, 0.9][rawValue] }
 }
 
@@ -110,12 +273,12 @@ struct ComparisonSheet: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(comparison.title ?? comparison.source.lastPathComponent)
                         .font(.headline)
-                    Text(comparison.note ?? "Links das Original, rechts das Ergebnis – Trennlinie ziehen")
+                    Text(comparison.note ?? L("comparison.default_note"))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                Picker("Stelle", selection: $position) {
+                Picker(L("comparison.position"), selection: $position) {
                     ForEach(FramePosition.allCases) { place in
                         Text(place.label).tag(place)
                     }
@@ -125,7 +288,7 @@ struct ComparisonSheet: View {
                 .frame(width: 210)
                 Toggle("100 %", isOn: $actualSize)
                     .toggleStyle(.button)
-                    .help("In Originalgröße zeigen, um Details zu beurteilen")
+                    .help(L("comparison.actual_size_help"))
             }
             .padding(16)
 
@@ -166,7 +329,7 @@ struct ComparisonSheet: View {
 
             HStack {
                 Spacer()
-                Button("Schließen") { dismiss() }
+                Button(L("action.close")) { dismiss() }
                     .keyboardShortcut(.defaultAction)
                     .controlSize(.large)
             }
@@ -183,7 +346,7 @@ struct ComparisonSheet: View {
                                                        at: position.fraction,
                                                        sourceOffset: comparison.offset)
             } catch {
-                failure = "Bild konnte nicht gelesen werden."
+                failure = L("comparison.load_error")
             }
         }
     }
@@ -225,9 +388,9 @@ private struct SplitImage: View {
                 )
                 .offset(x: size.width * split - 1)
             HStack {
-                tag("Original")
+                tag(L("comparison.original"))
                 Spacer()
-                tag("Neu")
+                tag(L("comparison.new"))
             }
             .frame(maxHeight: .infinity, alignment: .top)
             .padding(10)
@@ -238,8 +401,8 @@ private struct SplitImage: View {
             split = min(1, max(0, value.location.x / max(size.width, 1)))
         })
         .accessibilityElement()
-        .accessibilityLabel("Vergleich Original und Ergebnis")
-        .accessibilityValue("\(Int(split * 100)) % Original")
+        .accessibilityLabel(L("comparison.a11y_label"))
+        .accessibilityValue(L("comparison.a11y_value_fmt", Int(split * 100)))
         .accessibilityAdjustableAction { direction in
             split = min(1, max(0, split + (direction == .increment ? 0.1 : -0.1)))
         }
@@ -303,8 +466,13 @@ enum FrameGrabber {
     @discardableResult
     private static func run(_ args: [String], env: [String: String]) throws -> String {
         let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        proc.arguments = args
+        if let first = args.first, let toolURL = AppRuntime.executableURL(for: first, env: env) {
+            proc.executableURL = toolURL
+            proc.arguments = Array(args.dropFirst())
+        } else {
+            proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            proc.arguments = args
+        }
         proc.environment = env
         let pipe = Pipe()
         proc.standardOutput = pipe

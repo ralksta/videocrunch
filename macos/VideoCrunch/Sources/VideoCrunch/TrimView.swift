@@ -17,6 +17,8 @@ struct TrimEditor: View {
     /// The filmstrip shows only this stretch when zoomed (the Lupe), so a
     /// few seconds of a long video are more than a few pixels wide.
     @State private var window: ClosedRange<Double>?
+    /// One frame duration, updated from the video track's nominal frame rate.
+    @State private var frameStep: Double = 1.0 / 30.0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -35,47 +37,75 @@ struct TrimEditor: View {
                 seek(time)
             }
             .frame(height: 52)
-            HStack(spacing: 14) {
-                timeLabel("Anfang", start)
-                timeLabel("Ende", end)
-                timeLabel("Länge", end - start)
-                Spacer()
+            HStack(spacing: 8) {
+                timeLabel(L("trim.start"), start)
+                timeLabel(L("trim.end"), end)
+                timeLabel(L("trim.length"), end - start)
+                Spacer(minLength: 4)
+                Button {
+                    stepPlayhead(by: -frameStep)
+                } label: {
+                    Image(systemName: "chevron.left")
+                        .accessibilityLabel(L("trim.step_back"))
+                }
+                .help(L("trim.step_back_help"))
+                .keyboardShortcut(.leftArrow, modifiers: [])
+                Button {
+                    stepPlayhead(by: frameStep)
+                } label: {
+                    Image(systemName: "chevron.right")
+                        .accessibilityLabel(L("trim.step_fwd"))
+                }
+                .help(L("trim.step_fwd_help"))
+                .keyboardShortcut(.rightArrow, modifiers: [])
+                Button(L("trim.step_back")) { stepPlayhead(by: -1.0) }
+                    .keyboardShortcut(.leftArrow, modifiers: .shift)
+                    .frame(width: 0, height: 0)
+                    .opacity(0)
+                    .accessibilityHidden(true)
+                Button(L("trim.step_fwd")) { stepPlayhead(by: 1.0) }
+                    .keyboardShortcut(.rightArrow, modifiers: .shift)
+                    .frame(width: 0, height: 0)
+                    .opacity(0)
+                    .accessibilityHidden(true)
                 Button {
                     start = min(playhead, end - TrimTimeline.minimumLength)
+                    Haptics.tap(.alignment)
                 } label: {
                     Image(systemName: "arrow.right.to.line")
-                        .accessibilityLabel("Anfang hierher")
+                        .accessibilityLabel(L("trim.set_start"))
                 }
-                .help("Anfang hierher, an die Stelle im Video (Taste I)")
+                .help(L("trim.set_start_help"))
                 .keyboardShortcut("i", modifiers: [])
                 Button {
                     end = max(playhead, start + TrimTimeline.minimumLength)
+                    Haptics.tap(.alignment)
                 } label: {
                     Image(systemName: "arrow.left.to.line")
-                        .accessibilityLabel("Ende hierher")
+                        .accessibilityLabel(L("trim.set_end"))
                 }
-                .help("Ende hierher, an die Stelle im Video (Taste O)")
+                .help(L("trim.set_end_help"))
                 .keyboardShortcut("o", modifiers: [])
                 if window == nil {
                     Button {
                         zoom(true)
                     } label: {
                         Image(systemName: "plus.magnifyingglass")
-                        .accessibilityLabel("Lupe")
+                        .accessibilityLabel(L("trim.zoom_in"))
                     }
-                    .help("Lupe: nur die Umgebung der Auswahl zeigen, für sekundengenaues Kürzen")
+                    .help(L("trim.zoom_in_help"))
                 } else {
                     Button {
                         zoom(false)
                     } label: {
                         Image(systemName: "minus.magnifyingglass")
-                        .accessibilityLabel("Ganzes Video")
+                        .accessibilityLabel(L("trim.zoom_out"))
                     }
                     .buttonStyle(.borderedProminent)
-                    .help("Wieder das ganze Video zeigen")
+                    .help(L("trim.zoom_out_help"))
                 }
                 if start > 0 || end < duration {
-                    Button("Zurücksetzen") {
+                    Button(L("action.reset")) {
                         start = 0
                         end = duration
                         window = nil
@@ -91,6 +121,13 @@ struct TrimEditor: View {
             self.player = player
             looper = RangeLooper(player: player, start: start, end: end) { playhead = $0 }
         }
+        .task(id: url) {
+            if let track = try? await AVURLAsset(url: url).loadTracks(withMediaType: .video).first,
+               let fps = try? await track.load(.nominalFrameRate),
+               fps > 1 {
+                frameStep = 1.0 / Double(fps)
+            }
+        }
         .onDisappear {
             player?.pause()
             looper = nil
@@ -103,6 +140,12 @@ struct TrimEditor: View {
         playhead = time
         player?.seek(to: CMTime(seconds: time, preferredTimescale: 600),
                      toleranceBefore: .zero, toleranceAfter: .zero)
+    }
+
+    private func stepPlayhead(by delta: Double) {
+        player?.pause()
+        let next = TrimTimeline.nudgedTime(playhead, delta: delta, bounds: 0...duration)
+        seek(next)
     }
 
     /// Thirty seconds around the selection (more if it is longer), or all.
@@ -119,6 +162,8 @@ struct TrimEditor: View {
                 .monospacedDigit()
         }
         .font(.caption)
+        .lineLimit(1)
+        .fixedSize()
     }
 }
 
@@ -224,9 +269,32 @@ struct TrimTimeline: View {
     let scrub: (Double) -> Void
 
     @State private var frames: [CGImage] = []
+    @State private var dragOrigin: (start: Double, end: Double)?
+    @State private var hoveringSelection = false
+    @State private var handPushed = false
+    @State private var hitBoundary = false
     static let minimumLength = 0.5
     static let handleWidth: CGFloat = 14
     private let frameCount = 12
+
+    private var isSelectionMovable: Bool {
+        start > 0.001 || end < duration - 0.001
+    }
+
+    /// Shift the entire `[start, end]` window by `delta`, keeping its length intact inside `0...duration`.
+    static func shiftedRange(start: Double, end: Double, delta: Double,
+                             duration: Double) -> (start: Double, end: Double) {
+        guard duration > 0 else { return (start, end) }
+        let length = min(duration, max(minimumLength, end - start))
+        let maxStart = max(0, duration - length)
+        let newStart = min(max(0, start + delta), maxStart)
+        return (newStart, min(duration, newStart + length))
+    }
+
+    /// Nudge a playhead timestamp by `delta` within `bounds`.
+    static func nudgedTime(_ time: Double, delta: Double, bounds: ClosedRange<Double>) -> Double {
+        min(bounds.upperBound, max(bounds.lowerBound, time + delta))
+    }
 
     /// What the Lupe shows: the selection with room on both sides, at least
     /// 30 s, inside the video.
@@ -281,6 +349,48 @@ struct TrimTimeline: View {
                     .offset(x: x(start) - h)
                     .allowsHitTesting(false)
 
+                // Dragging inside a trimmed selection slides the whole window across the clip;
+                // tapping still seeks the playhead.
+                Color.clear
+                    .frame(width: max(0, x(end) - x(start)), height: geo.size.height)
+                    .contentShape(Rectangle())
+                    .offset(x: x(start))
+                    .onTapGesture(coordinateSpace: .named("trim")) { location in
+                        scrub(time(location.x, width))
+                    }
+                    .gesture(
+                        DragGesture(minimumDistance: 4, coordinateSpace: .named("trim"))
+                            .onChanged { value in
+                                guard isSelectionMovable else { return }
+                                if dragOrigin == nil {
+                                    dragOrigin = (start, end)
+                                }
+                                guard let origin = dragOrigin else { return }
+                                let delta = Double(value.translation.width / max(width, 1)) * span
+                                let shifted = Self.shiftedRange(start: origin.start, end: origin.end,
+                                                                delta: delta, duration: duration)
+                                start = shifted.start
+                                end = shifted.end
+                                checkBoundary(shifted.start <= 0.001 || shifted.end >= duration - 0.001)
+                                scrub(shifted.start)
+                            }
+                            .onEnded { _ in
+                                dragOrigin = nil
+                                hitBoundary = false
+                            }
+                    )
+                    .onHover { inside in
+                        hoveringSelection = inside
+                        syncHandCursor()
+                    }
+                    .onChange(of: isSelectionMovable) {
+                        syncHandCursor()
+                    }
+                    .onDisappear {
+                        hoveringSelection = false
+                        syncHandCursor()
+                    }
+
                 if visible.contains(playhead) {
                     Rectangle().fill(.white)
                         .frame(width: 2)
@@ -289,14 +399,20 @@ struct TrimTimeline: View {
                         .allowsHitTesting(false)
                 }
 
-                handle(at: x(start) - h, label: "Anfang") { location in
-                    start = min(max(0, time(location + h / 2, width)), end - Self.minimumLength)
+                handle(at: x(start) - h, label: "Anfang", drag: { location in
+                    let raw = time(location + h / 2, width)
+                    let clamped = min(max(0, raw), end - Self.minimumLength)
+                    checkBoundary(raw <= 0 || raw >= end - Self.minimumLength)
+                    start = clamped
                     scrub(start)
-                }
-                handle(at: x(end), label: "Ende") { location in
-                    end = max(min(duration, time(location - h / 2, width)), start + Self.minimumLength)
+                }, endDrag: { hitBoundary = false })
+                handle(at: x(end), label: "Ende", drag: { location in
+                    let raw = time(location - h / 2, width)
+                    let clamped = max(min(duration, raw), start + Self.minimumLength)
+                    checkBoundary(raw >= duration || raw <= start + Self.minimumLength)
+                    end = clamped
                     scrub(end)
-                }
+                }, endDrag: { hitBoundary = false })
             }
             .coordinateSpace(name: "trim")
         }
@@ -311,16 +427,39 @@ struct TrimTimeline: View {
         return visible.lowerBound + fraction * (visible.upperBound - visible.lowerBound)
     }
 
+    private func syncHandCursor() {
+        let shouldShow = hoveringSelection && isSelectionMovable
+        if shouldShow && !handPushed {
+            NSCursor.openHand.push()
+            handPushed = true
+        } else if !shouldShow && handPushed {
+            NSCursor.pop()
+            handPushed = false
+        }
+    }
+
+    private func checkBoundary(_ atEdge: Bool) {
+        if atEdge && !hitBoundary {
+            hitBoundary = true
+            Haptics.tap(.alignment)
+        } else if !atEdge {
+            hitBoundary = false
+        }
+    }
+
     private func handle(at x: CGFloat, label: String,
-                        drag: @escaping (CGFloat) -> Void) -> some View {
+                        drag: @escaping (CGFloat) -> Void,
+                        endDrag: @escaping () -> Void = {}) -> some View {
         RoundedRectangle(cornerRadius: 4, style: .continuous)
             .fill(Color.yellow)
             .frame(width: Self.handleWidth)
             .overlay(Capsule().fill(.black.opacity(0.45)).frame(width: 3, height: 16))
             .offset(x: x)
-            .gesture(DragGesture(coordinateSpace: .named("trim")).onChanged { value in
-                drag(value.location.x)
-            })
+            .gesture(
+                DragGesture(coordinateSpace: .named("trim"))
+                    .onChanged { value in drag(value.location.x) }
+                    .onEnded { _ in endDrag() }
+            )
             .accessibilityElement()
             .accessibilityLabel(label)
             .onHover { inside in

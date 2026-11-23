@@ -32,4 +32,30 @@ final class TrimTimelineTests: XCTestCase {
         XCTAssertEqual(preciseClock(2.44), "0:02.4")
         XCTAssertEqual(preciseClock(151.06), "2:31.1")
     }
+
+    func testShiftedRangeMovesSelectionPreservingLength() {
+        let moved = TrimTimeline.shiftedRange(start: 20, end: 35, delta: 12.5, duration: 100)
+        XCTAssertEqual(moved.start, 32.5, accuracy: 0.001)
+        XCTAssertEqual(moved.end, 47.5, accuracy: 0.001)
+    }
+
+    func testShiftedRangeClampsAtClipBoundsWithoutShrinking() {
+        let atStart = TrimTimeline.shiftedRange(start: 5, end: 15, delta: -20, duration: 100)
+        XCTAssertEqual(atStart.start, 0, accuracy: 0.001)
+        XCTAssertEqual(atStart.end, 10, accuracy: 0.001)
+
+        let atEnd = TrimTimeline.shiftedRange(start: 80, end: 90, delta: 30, duration: 100)
+        XCTAssertEqual(atEnd.start, 90, accuracy: 0.001)
+        XCTAssertEqual(atEnd.end, 100, accuracy: 0.001)
+
+        let full = TrimTimeline.shiftedRange(start: 0, end: 100, delta: 15, duration: 100)
+        XCTAssertEqual(full.start, 0, accuracy: 0.001)
+        XCTAssertEqual(full.end, 100, accuracy: 0.001)
+    }
+
+    func testNudgedTimeStepsAndClamps() {
+        XCTAssertEqual(TrimTimeline.nudgedTime(10.0, delta: 1.0 / 30.0, bounds: 0...60), 10.0 + 1.0 / 30.0, accuracy: 0.0001)
+        XCTAssertEqual(TrimTimeline.nudgedTime(0.02, delta: -1.0, bounds: 0...60), 0, accuracy: 0.0001)
+        XCTAssertEqual(TrimTimeline.nudgedTime(59.8, delta: 1.0, bounds: 0...60), 60, accuracy: 0.0001)
+    }
 }

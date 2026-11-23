@@ -37,8 +37,20 @@ SDK_VERSION="$(xcrun --sdk macosx --show-sdk-version)"
 SWIFT_BUILD=(swift build -c release --package-path "$MACOS_DIR"
              -Xlinker -platform_version -Xlinker macos -Xlinker 14.0 -Xlinker "$SDK_VERSION")
 "${SWIFT_BUILD[@]}"
-cp "$("${SWIFT_BUILD[@]}" --show-bin-path)/VideoCrunch" \
+BIN_DIR="$("${SWIFT_BUILD[@]}" --show-bin-path)"
+cp "$BIN_DIR/VideoCrunch" \
     "$MACOS_DIR/VideoCrunch.app/Contents/MacOS/VideoCrunch"
+
+rm -rf "$MACOS_DIR/VideoCrunch.app/Contents/Resources/"*.lproj \
+       "$MACOS_DIR/VideoCrunch.app/Contents/Resources/VideoCrunch_VideoCrunch.bundle"
+if [ -d "$BIN_DIR/VideoCrunch_VideoCrunch.bundle" ]; then
+    ditto "$BIN_DIR/VideoCrunch_VideoCrunch.bundle" \
+          "$MACOS_DIR/VideoCrunch.app/Contents/Resources/VideoCrunch_VideoCrunch.bundle"
+fi
+for lproj in "$MACOS_DIR/Sources/VideoCrunch/Resources/"*.lproj; do
+    [ -d "$lproj" ] || continue
+    ditto "$lproj" "$MACOS_DIR/VideoCrunch.app/Contents/Resources/$(basename "$lproj")"
+done
 
 if [ -f "$MACOS_DIR/AppIcon.icns" ]; then
     cp "$MACOS_DIR/AppIcon.icns" "$MACOS_DIR/VideoCrunch.app/Contents/Resources/AppIcon.icns"
@@ -53,12 +65,21 @@ cat > "$MACOS_DIR/VideoCrunch.app/Contents/Info.plist" <<PLIST
     <string>VideoCrunch</string>
     <key>CFBundleIdentifier</key>
     <string>$BUNDLE_ID</string>
-    <!-- German UI: the standard menus read "Ablage", "Bearbeiten", … -->
     <key>CFBundleDevelopmentRegion</key>
-    <string>de</string>
+    <string>en</string>
     <key>CFBundleLocalizations</key>
     <array>
+        <string>en</string>
+        <string>en-GB</string>
         <string>de</string>
+        <string>fr</string>
+        <string>es</string>
+        <string>it</string>
+        <string>nl</string>
+        <string>pl</string>
+        <string>pt-PT</string>
+        <string>pt-BR</string>
+        <string>ja</string>
     </array>
     <key>CFBundleName</key>
     <string>VideoCrunch</string>
@@ -165,12 +186,28 @@ cat > "$SERVICE_DIR/document.wflow" <<WFLOW
   </array>
   <key>workflowMetaData</key>
   <dict>
+    <key>applicationBundleID</key><string>com.apple.finder</string>
+    <key>applicationBundleIDsByPath</key>
+    <dict>
+      <key>/System/Library/CoreServices/Finder.app</key><string>com.apple.finder</string>
+    </dict>
+    <key>applicationPath</key><string>/System/Library/CoreServices/Finder.app</string>
+    <key>applicationPaths</key>
+    <array>
+      <string>/System/Library/CoreServices/Finder.app</string>
+    </array>
+    <key>inputTypeIdentifier</key><string>com.apple.Automator.fileSystemObject</string>
+    <key>outputTypeIdentifier</key><string>com.apple.Automator.nothing</string>
+    <key>presentationMode</key><integer>15</integer>
+    <key>processesInput</key><false/>
     <key>serviceApplicationBundleID</key><string>com.apple.finder</string>
     <key>serviceApplicationPath</key><string>/System/Library/CoreServices/Finder.app</string>
     <key>serviceInputTypeIdentifier</key>
     <string>com.apple.Automator.fileSystemObject</string>
     <key>serviceOutputTypeIdentifier</key><string>com.apple.Automator.nothing</string>
-    <key>serviceProcessesInput</key><integer>0</integer>
+    <key>serviceProcessesInput</key><false/>
+    <key>systemImageName</key><string>NSActionTemplate</string>
+    <key>useAutomaticInputType</key><false/>
     <key>workflowTypeIdentifier</key><string>com.apple.Automator.servicesMenu</string>
   </dict>
 </dict>
@@ -185,8 +222,14 @@ cat > "$SERVICE_DIR/Info.plist" <<'PLIST'
   <key>NSServices</key>
   <array>
     <dict>
-      <key>NSMenuItem</key><dict><key>default</key><string>videocrunch</string></dict>
+      <key>NSBackgroundColorName</key><string>background</string>
+      <key>NSIconName</key><string>NSActionTemplate</string>
+      <key>NSMenuItem</key><dict><key>default</key><string>VideoCrunch</string></dict>
       <key>NSMessage</key><string>runWorkflowAsService</string>
+      <key>NSRequiredContext</key>
+      <dict>
+        <key>NSApplicationIdentifier</key><string>com.apple.finder</string>
+      </dict>
       <key>NSSendFileTypes</key>
       <array>
         <string>public.folder</string>

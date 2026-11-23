@@ -7,11 +7,13 @@ import PackageDescription
 
 let package = Package(
     name: "VideoCrunch",
+    defaultLocalization: "en",
     platforms: [.macOS(.v14)],
     targets: [
         .executableTarget(
             name: "VideoCrunch",
-            path: "Sources/VideoCrunch"
+            path: "Sources/VideoCrunch",
+            resources: [.process("Resources")]
         ),
         .testTarget(
             name: "VideoCrunchTests",

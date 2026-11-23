@@ -55,11 +55,12 @@ final class DockProgressView: NSView {
 enum Notifier {
     static let category = "videocrunch.done"
     static let revealAction = "reveal"
+    static var isEnabled = true
 
     static func register(delegate: UNUserNotificationCenterDelegate) {
         let center = UNUserNotificationCenter.current()
         center.delegate = delegate
-        let reveal = UNNotificationAction(identifier: revealAction, title: "Im Finder zeigen")
+        let reveal = UNNotificationAction(identifier: revealAction, title: L("action.reveal_in_finder"))
         center.setNotificationCategories([
             UNNotificationCategory(identifier: category, actions: [reveal], intentIdentifiers: [])
         ])
@@ -70,11 +71,13 @@ enum Notifier {
     /// allowed for the app.
     @MainActor
     static func notify(title: String, body: String) {
-        guard !NSApp.isActive else { return }
+        guard isEnabled, !NSApp.isActive else { return }
         let center = UNUserNotificationCenter.current()
         center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
             guard granted else {
-                scriptNotification(title: title, body: body)
+                if !AppRuntime.isSandboxed {
+                    scriptNotification(title: title, body: body)
+                }
                 return
             }
             let content = UNMutableNotificationContent()
@@ -85,7 +88,7 @@ enum Notifier {
             UNUserNotificationCenter.current().add(
                 UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
             ) { error in
-                if error != nil {
+                if error != nil, !AppRuntime.isSandboxed {
                     scriptNotification(title: title, body: body)
                 }
             }
@@ -105,8 +108,8 @@ enum Notifier {
 /// "ca. 3 Min", "unter 1 Min", "ca. 1 Std 10 Min".
 func formatDuration(_ seconds: Double) -> String {
     let minutes = Int((seconds / 60).rounded())
-    if minutes < 1 { return "unter 1 Min" }
-    if minutes < 60 { return "ca. \(minutes) Min" }
+    if minutes < 1 { return L("duration.under_min") }
+    if minutes < 60 { return L("duration.minutes_fmt", minutes) }
     let rest = minutes % 60
-    return rest == 0 ? "ca. \(minutes / 60) Std" : "ca. \(minutes / 60) Std \(rest) Min"
+    return rest == 0 ? L("duration.hours_fmt", minutes / 60) : L("duration.hours_minutes_fmt", minutes / 60, rest)
 }

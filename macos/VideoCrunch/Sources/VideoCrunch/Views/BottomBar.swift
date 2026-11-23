@@ -11,13 +11,17 @@ struct BottomBar: View {
     private var bottomInfo: String? {
         switch vm.currentStep {
         case .candidateSelection:
-            return "\(vm.selectedCandidates.count) ausgewählt · ca. −\(formatMB(vm.selectedEstimatedSavedMB))"
+            return L("bottom.selection_fmt", vm.selectedCandidates.count, formatMB(vm.selectedEstimatedSavedMB))
         case .options where vm.isGif:
-            return vm.gifEstimate.map { "GIF ca. \(formatBytes($0.estimated_bytes)) · \($0.width) × \($0.height)" }
-                ?? (vm.isEstimatingGif ? "Schätze GIF-Größe …" : nil)
+            return vm.gifEstimate.map { L("bottom.gif_fmt", formatBytes($0.estimated_bytes), $0.width, $0.height) }
+                ?? (vm.isEstimatingGif ? L("bottom.gif_estimating") : nil)
+        case .options where vm.isTrimOnly:
+            return L("bottom.trim_only_fmt", formatMB(vm.selectedTotalAfterMB))
+        case .options where vm.isMerge:
+            return L("bottom.merge_fmt", vm.orderedMergeCandidates.count, formatMB(vm.selectedTotalMB))
         case .options:
-            let time = vm.selectedRuntimeSec.map { " · dauert \(formatDuration($0))" } ?? ""
-            return "Ergebnis ca. \(formatMB(vm.selectedTotalAfterMB)) · −\(formatMB(vm.selectedEstimatedSavedMB))" + time
+            let time = vm.selectedRuntimeSec.map { L("bottom.runtime_fmt", formatDuration($0)) } ?? ""
+            return L("bottom.options_fmt", formatMB(vm.selectedTotalAfterMB), formatMB(vm.selectedEstimatedSavedMB), time)
         default:
             return nil
         }
@@ -29,23 +33,15 @@ struct BottomBar: View {
                 Button(role: .destructive) {
                     vm.cancelEncoding()
                 } label: {
-                    Label("Abbrechen", systemImage: "stop.fill")
+                    Label(L("action.cancel"), systemImage: "stop.fill")
                 }
                 .controlSize(.large)
                 .disabled(!vm.isEncoding)
-            } else if vm.currentStep == .completed, !vm.targetURLs.isEmpty {
+            } else if vm.currentStep == .completed, !vm.revealableURLs.isEmpty {
                 Button {
-                    // Select what the run produced, not the sources it started from.
-                    let gif = vm.gifResult?.output_path.map { URL(fileURLWithPath: $0) }
-                    let encoded = vm.batchResults
-                        .filter { $0.status == "success" }
-                        .compactMap(\.output_path)
-                        .filter { FileManager.default.fileExists(atPath: $0) }
-                        .map { URL(fileURLWithPath: $0) }
-                    let selection = gif.map { [$0] } ?? (encoded.isEmpty ? vm.targetURLs : encoded)
-                    NSWorkspace.shared.activateFileViewerSelecting(selection)
+                    vm.revealCurrentInFinder()
                 } label: {
-                    Label("Im Finder zeigen", systemImage: "folder")
+                    Label(L("action.reveal_in_finder"), systemImage: "folder")
                 }
                 .controlSize(.large)
             }
@@ -65,7 +61,7 @@ struct BottomBar: View {
                 Button {
                     vm.proceedToOptions()
                 } label: {
-                    Label("Weiter", systemImage: "chevron.right")
+                    Label(L("action.continue"), systemImage: "chevron.right")
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
@@ -76,9 +72,13 @@ struct BottomBar: View {
                     vm.startEncoding()
                 } label: {
                     if vm.isGif {
-                        Label("GIF erstellen", systemImage: "photo.stack")
+                        Label(L("bottom.action.make_gif"), systemImage: "photo.stack")
+                    } else if vm.isTrimOnly {
+                        Label(L("bottom.action.trim_video"), systemImage: "scissors")
+                    } else if vm.isMerge {
+                        Label(L("bottom.action.merge"), systemImage: "film.stack")
                     } else {
-                        Label("Encode starten", systemImage: "play.fill")
+                        Label(L("bottom.action.start_encode"), systemImage: "play.fill")
                     }
                 }
                 .buttonStyle(.borderedProminent)
@@ -90,7 +90,7 @@ struct BottomBar: View {
                 Button {
                     vm.startOver()
                 } label: {
-                    Label("Neue Videos …", systemImage: "plus")
+                    Label(L("bottom.action.new_videos"), systemImage: "plus")
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
