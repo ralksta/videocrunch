@@ -1,0 +1,70 @@
+name: VideoCrunch
+options:
+  bundleIdPrefix: io.github.ralksta
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    ARCHS: arm64
+    ONLY_ACTIVE_ARCH: NO
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    DEVELOPMENT_TEAM: 7RGK779MTV
+    CODE_SIGN_STYLE: Automatic
+    ENABLE_HARDENED_RUNTIME: YES
+targets:
+  VideoCrunch:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources/VideoCrunch
+        excludes:
+          - "Resources/**"
+      - path: Sources/VideoCrunch/Resources/de.lproj/Localizable.strings
+      - path: Sources/VideoCrunch/Resources/en.lproj/Localizable.strings
+      - path: Sources/VideoCrunch/Resources/en-GB.lproj/Localizable.strings
+      - path: Sources/VideoCrunch/Resources/es.lproj/Localizable.strings
+      - path: Sources/VideoCrunch/Resources/fr.lproj/Localizable.strings
+      - path: Sources/VideoCrunch/Resources/it.lproj/Localizable.strings
+      - path: Sources/VideoCrunch/Resources/nl.lproj/Localizable.strings
+      - path: Sources/VideoCrunch/Resources/pl.lproj/Localizable.strings
+      - path: Sources/VideoCrunch/Resources/pt-PT.lproj/Localizable.strings
+      - path: Sources/VideoCrunch/Resources/pt-BR.lproj/Localizable.strings
+      - path: Sources/VideoCrunch/Resources/ja.lproj/Localizable.strings
+      - path: Assets.xcassets
+      - path: PrivacyInfo.xcprivacy
+    settings:
+      base:
+        PRODUCT_NAME: VideoCrunch
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.ralksta.videocrunch
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: Info.plist
+        CODE_SIGN_ENTITLEMENTS: VideoCrunch.entitlements
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        LD_RUNPATH_SEARCH_PATHS:
+          - "$(inherited)"
+          - "@executable_path/../Frameworks"
+    postBuildScripts:
+      - name: Embed VideoCrunch Engine & LGPL Runtime
+        script: |
+          if [ "${MAS_SKIP_POSTBUILD_EMBED:-0}" = "1" ]; then
+            exit 0
+          fi
+          bash "$SRCROOT/../scripts/embed_mas_payload.sh" "${TARGET_BUILD_DIR}/${WRAPPER_NAME}"
+        basedOnDependencyAnalysis: false
+  VideoCrunchTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests/VideoCrunchTests
+    dependencies:
+      - target: VideoCrunch
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/VideoCrunch.app/Contents/MacOS/VideoCrunch"
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) TESTING"

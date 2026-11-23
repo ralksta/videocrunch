@@ -17,3 +17,11 @@ macos/VideoCrunch/VideoCrunchUI
 # Swift package build output
 macos/VideoCrunch/.build/
 macos/VideoCrunch/.swiftpm/
+
+# Stage 2 Mac App Store vendor builds & staging bundles
+macos/Vendor/
+macos/build/
+macos/VideoCrunch/VideoCrunch.xcodeproj/
+
+# Local icon generation drafts
+macos/VideoCrunch/icon_candidates/
