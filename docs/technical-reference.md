@@ -115,7 +115,9 @@ NVENC's `p2`/`p5`/`p7`, libx265's `veryfast`/`medium`/`slow`).
 ```python
 '-allow_sw': '0'        # force hardware-only — abort if hardware unavailable
 '-realtime': '0'        # allow the encoder more time -> better compression
-'-profile:v': 'main'    # HEVC Main Profile — widest compatibility
+'-spatial_aq': '1'      # spatial adaptive quantization (toggled off by --preset fast)
+'-prio_speed': '0'      # favor compression efficiency over speed (1 for --preset fast)
+'-profile:v': 'main'    # HEVC Main Profile (main10 / main42210 for 10-bit/HDR sources)
 '-alpha_quality': '0.75'
 ```
 
@@ -278,7 +280,8 @@ typically needing 1-2 real full-file passes instead of 3-4. Disable with
 Source `pix_fmt`, `color_transfer`, and `color_primaries` are probed
 up front. When `is_hdr_or_10bit()` detects an HDR or 10-bit source and
 `video_mode == 'compress'`, `apply_hdr_adjustments()` switches the chosen
-profile to a main10 encode with the source's color tags (BT.2020/PQ/HLG)
+profile to a `main10` encode (or `main42210` / `p210le` on `hevc_videotoolbox`
+for 4:2:2 10-bit sources) with the source's color tags (BT.2020/PQ/HLG)
 passed through — encoders that don't support main10 skip the file with a
 clear reason rather than silently mistagging a downgraded encode as BT.709.
 
@@ -318,7 +321,7 @@ capture date, GPS coordinates and camera model.
 | Stream | Treatment |
 |:---|:---|
 | Video | `-map 0:v:0` |
-| Audio | every track mapped; the first gets the loudnorm chain (`-filter:a:0`), the rest are re-encoded flat. `--copy-audio` copies instead |
+| Audio | every track mapped; the first gets the loudnorm chain (`-filter:a:0`), the rest are re-encoded flat (using Apple's `aac_at` AudioToolbox encoder on macOS when available, `aac` elsewhere). `--copy-audio` copies instead |
 | Subtitles | text-based (`subrip`, `ass`, `webvtt`, …) converted to `mov_text` |
 | Data | never mapped — the mp4 muxer rejects most of them (iPhone timecode/metadata tracks, `mebx`); named in one note |
 

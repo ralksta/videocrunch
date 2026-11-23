@@ -150,8 +150,8 @@ forwards them to every per-file encode, reads each worker's verdict from its
 `--json-out` file rather than from its console output, and can write the
 whole batch's results with its own `--json-out`. `--events` replaces the
 table with one JSON object per line (`start`, `file_start`, `progress` with
-phase, pass, quality and percent, `file_done`, `summary`); the app reads
-those instead of the table. Sending it SIGTERM cancels
+phase, pass, quality, percent, plus live `speed` and `bitrate` when
+encoding, `file_done`, `summary`); the app reads those instead of the table. Sending it SIGTERM cancels
 the batch: running encodes stop and clean up, queued ones never start, and
 those files are reported as `cancelled`.
 
@@ -188,6 +188,27 @@ most). Writes `clip_25MB.mp4` next to the video; the original stays. A video
 already under the size is skipped, one too long for it says so with the
 longest length that would fit. Takes `--codec`, `--half-fps`, `--crop-bars`,
 `--no-audio`, `--ss`/`--to`, and `--json-out`/`--events` as in `batch.py`.
+
+### 6. `inspect_media.py` — stream details, pre-flight warnings and bitrate curve
+
+```bash
+python3 inspect_media.py clip.mov --json
+```
+
+Probes streams, metadata (camera, capture time, GPS, chapters), and per-packet
+bitrates (`samples_kbps`, min/avg/max, VBR/CBR, and the top bitrate hotspots
+checked during encoding), and lists beforehand what a re-encode would drop
+(e.g. `apple_apac`, `mebx`) or downgrade (Dolby Vision profile 8.x/5).
+
+### 7. `concat.py` — join compatible clips without re-encoding
+
+```bash
+python3 concat.py part1.mp4 part2.mp4 --events --json-out report.json
+```
+
+Verifies matching codec, resolution, and SDR/HDR state, then joins the clips
+with FFmpeg's `concat` demuxer (`-c copy`, no re-encoding) into
+`<first>_merged.mp4` (`<first>_merged 2.mp4` if taken). Originals stay untouched.
 
 ## How the quality search works
 
@@ -361,29 +382,37 @@ a filmstrip and two handles to cut the start and end before encoding (the
 original always stays; the savings estimate follows the cut). `batch.py`
 forwards `--ss`/`--to` per file for this. Playing loops the trimmed part. For
 a few seconds out of a long video: click the filmstrip to jump there, set
-the start and end at the playhead with I and O, and switch on the *Lupe*,
-which spreads 30 seconds around the selection over the whole strip.
+the start and end at the playhead with I and O, step frame-by-frame with `←`
+and `→` (`⇧←`/`⇧→` jumps 1 second), drag inside the yellow selection to slide
+the whole cut window across the clip, and switch on the *Lupe*, which spreads
+30 seconds around the selection over the whole strip.
 
 The selection list shows each video's thumbnail; the eye button or the space
-bar opens it in Quick Look. After a run, *Vergleichen* opens a window with the
-same frame of source and result behind a divider you drag — at the start,
-middle or end of the clip, fitted or at 100 % — so the result is judged by
-eye, not only by its SSIM. (It needs the original, so it is not offered when
-originals went to the trash.) *Neue Videos …* goes back to the start; ⌘Q
-quits. Back (⌘[), the current step and *Hinzufügen* sit in the title bar;
-the bar at the bottom always shows what the selection will come to — size,
-saving and, where history allows, how long it takes — next to the button that
-starts it. Run the installer while the app is closed — it refuses otherwise,
-rather than cutting off an encode.
+bar opens it in Quick Look, and the info button or `⌘I` opens the Media
+Inspector (`inspect_media.py`) with stream status, pre-encode warnings, and a
+bitrate curve. On the options page, *Vorlage* offers built-in quick presets as
+well as custom saved presets, and the app remembers the last used settings.
+With two or more compatible clips selected, *Zusammenfügen* (`concat.py`) lets
+you reorder them and join them losslessly without re-encoding. After a run,
+*Vergleichen* opens a window with the same frame of source and result behind a
+divider you drag — at the start, middle or end of the clip, fitted or at 100 %
+— so the result is judged by eye, not only by its SSIM. (It needs the original,
+so it is not offered when originals went to the trash.) *Neue Videos …* goes
+back to the start; ⌘Q quits. Back (⌘[), the current step and *Hinzufügen* sit
+in the title bar; the bar at the bottom always shows what the selection will
+come to — size, saving and, where history allows, how long it takes — next to
+the button that starts it. Run the installer while the app is closed — it
+refuses otherwise, rather than cutting off an encode.
 
 The app walks through the same steps as the command-line wizard: **Scan**
 (`scan.py --json`), **Auswahl** (pick files, with the expected savings per
-file), **Optionen** (target, codec, audio (original sound by default, loudness
-levelling or none on request), downscaling to 1080p, 30 fps, black bars,
-originals to the trash), **Encode** (`batch.py`, with live progress per file and a Cancel
-button that stops and cleans up) and **Fertig** (what each file saved, with a
-retry for files just under the quality floor). Started without a file, it
-asks for one.
+file), **Optionen** (presets, target, codec, audio (original sound by default,
+loudness levelling or none on request), downscaling to 1080p, 30 fps, black
+bars, originals to the trash, or merge for compatible clips), **Encode**
+(`batch.py`/`fit.py`/`concat.py`, with live progress, speed and bitrate per
+worker, a Log copy button and a Cancel button that stops and cleans up) and
+**Fertig** (what each file saved, with a retry for files just under the
+quality floor). Started without a file, it asks for one.
 
 The installer writes this checkout's path into the app's `Info.plist`, so the
 app runs the scripts from here. Move the repository, and run the installer
